@@ -150,6 +150,8 @@ export type CookingSession = {
   completed_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Set only by AI-initiated moves; drives the duplicate-relay guard. */
+  last_ai_step_move_at?: string | null;
 };
 
 export type InventoryTransaction = {

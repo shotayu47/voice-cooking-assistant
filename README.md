@@ -1,36 +1,153 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# 料理アシスタント — Voice Cooking Assistant
 
-## Getting Started
+冷蔵庫の中身を覚えていて、1工程ずつ料理を案内するパーソナルアシスタント。
+本リポジトリは **SPEC.md の Phase 1（テキスト MVP）と Phase 2（Realtime 音声）** の実装です。
 
-First, run the development server:
+## 設計の要点
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+在庫・調理進捗・会話は別々の状態として扱い、**永続状態は必ず Supabase に置く**。
+LLM のチャット履歴は真実の情報源にしない（SPEC §1.3 / §13）。
+
+```
+src/
+  app/
+    (app)/            サインイン後の画面（下部ナビ付き）
+    api/chat/         AI 1ターン分のエンドポイント（テキスト）
+    api/realtime/     音声セッションの発行とツール実行（Phase 2）
+    auth/callback/    マジックリンクの受け口
+    login/
+  components/         UI プリミティブとシェル
+  lib/
+    ai/               システムプロンプト・ツール定義・ツール実行ループ
+    cooking/          工程の状態遷移（純粋関数）＋セッションサービス
+    inventory/        数量計算・名寄せ（純粋関数）＋在庫サービス
+    recipes/          レシピの検証と保存
+    supabase/         SSR / ブラウザクライアント
+    voice/            Realtime WebRTC クライアント（Phase 2）
+  test/               Vitest 用のインメモリ Supabase スタブ
+  types/              ドメイン型
+supabase/migrations/  スキーマ・インデックス・RLS
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+DB アクセスは UI コンポーネントに書かず、`lib/*/service.ts` に閉じています。
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## セットアップ
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### 1. 環境変数
 
-## Learn More
+```bash
+cp .env.example .env.local
+```
 
-To learn more about Next.js, take a look at the following resources:
+| 変数 | 取得元 | 公開範囲 |
+|---|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | Supabase → Project Settings → API | クライアント可 |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | 同上 | クライアント可 |
+| `SUPABASE_SERVICE_ROLE_KEY` | 同上 | **サーバー専用** |
+| `OPENAI_API_KEY` | OpenAI dashboard | **サーバー専用** |
+| `OPENAI_MODEL` | 任意（既定 `gpt-4.1`） | サーバー専用 |
+| `OPENAI_REALTIME_MODEL` | 任意（既定 `gpt-realtime`） | サーバー専用 |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+`OPENAI_API_KEY` と `SUPABASE_SERVICE_ROLE_KEY` は `NEXT_PUBLIC_` を付けていないため、
+クライアントバンドルには入りません。AI 呼び出しは全て `src/app/api/chat/route.ts` 経由のサーバー実行です。
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### 2. データベース
 
-## Deploy on Vercel
+`supabase/migrations/0001_init.sql` を Supabase の SQL Editor に貼って実行するか、
+Supabase CLI を使う場合は:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+npx supabase link --project-ref <your-ref>
+npx supabase db push
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+マイグレーションは **0001 → 0002 の順に両方** 適用してください。
+0002 が未適用でもアプリは動きますが、サーバー側の重複実行防止が無効になります
+（サーバーログに `migration 0002 not applied` が出ます）。
+
+このマイグレーションで作られるもの:
+
+- SPEC §6 の全テーブル（+ チャット履歴用 `conversation_messages`）
+- 全ユーザー所有テーブルの RLS（`user_id = auth.uid()` / profiles は `id = auth.uid()`）
+- `auth.users` への INSERT で `profiles` を自動生成するトリガー
+- `current_step` を範囲内に閉じ込める CHECK 制約と、ユーザーごとに進行中セッションを1件に限る一意インデックス
+
+### 3. 認証設定
+
+Supabase → Authentication → URL Configuration で
+`http://localhost:3000/auth/callback` を Redirect URLs に追加してください（本番URLも同様）。
+メールテンプレートは既定のままで動きます（PKCE の `?code=` を受け取ります）。
+
+### 4. 起動
+
+```bash
+npm install
+npm run dev
+```
+
+## コマンド
+
+```bash
+npm run dev        # 開発サーバー
+npm run build      # 本番ビルド
+npm run typecheck  # tsc --noEmit
+npm run lint       # eslint
+npm test           # vitest（純粋ロジック＋サービス層。ネットワーク不要）
+npm run test:live  # 実 OpenAI API を叩く疎通チェック（.env.local が必要）
+npm run audit:rls  # 実 DB に対して RLS を検証（別ユーザーで read/write/delete を試行）
+npm run icons      # PWA アイコンを再生成
+```
+
+## Phase 2 — Realtime 音声
+
+チャット画面と調理画面の「音声で操作」から、ハンズフリーで会話できます。
+
+```
+iPhone / PWA
+  → POST /api/realtime/session   ← サーバーが ek_... の短命トークンを発行
+  → WebRTC（SDP を api.openai.com/v1/realtime/calls へ）
+  → データチャネル "oai-events" で function call を受信
+  → POST /api/realtime/tool      ← 実行はサーバー側（認証・RLS・監査つき）
+  → Supabase
+```
+
+**恒久 API キーはブラウザに出ません。** クライアントが受け取るのは短命トークンだけで、
+instructions とツール定義はトークン発行時にサーバー側で固定されるため、
+クライアントからアシスタントの行動規約を書き換えることはできません。
+
+音声とテキストは**同じバックエンドツール**を使います（`realtimeToolDefinitions()` は
+テキスト側の定義から生成され、テストで一致を強制）。したがって工程や在庫の真実は
+常に1つで、SPEC §21.1 の「Text and voice must not maintain separate truths」を満たします。
+
+音声由来の在庫変更は `inventory_transactions.source = 'ai_voice'` として記録されます。
+
+### 重複実行の防止
+
+同じ発話でツールが2回走ると、在庫が倍減ったり工程が2つ進んだりします。2層で防いでいます。
+
+| 層 | 対象 | 依存 |
+|---|---|---|
+| クライアント | 同じ `call_id` の再実行、1ターン1工程移動まで | なし（常時有効） |
+| サーバー | `ai_tool_calls` による冪等実行、AI発の工程移動を1.5秒デバウンス | migration 0002 |
+
+テキスト側は1ターン内で同一の変更系ツールを1回しか実行しません。
+UI のタップは `expectedStep` 付きの条件付き UPDATE なので、二重タップは0行マッチで無視されます。
+
+### 対応コマンド（SPEC §21.3）
+
+`今日なに作れる？` / `それ作る` / `次` / `できた` / `戻って` / `もう一回` /
+`何グラム？` / `火力いくつ？` / `あと何分？` / `これ焦げそう` /
+`玉ねぎ使い切った` / `卵あと2個` / `終了`
+
+## テスト方針
+
+火力・数量・工程のようなルールは全て純粋関数に切り出し、Vitest で直接検証しています。
+サービス層のテストは `src/test/fake-supabase.ts`（インメモリのクエリビルダ）を使い、
+実 DB なしで「在庫を減らすと必ず監査ログが1行増える」といった不変条件を確認します。
+
+RLS 自体は本物の Postgres でしか検証できないため、テストでは
+「サービスが必ず `user_id` で絞っている」ことを確認する形にしています。
+
+## 未実装（Phase 3 以降）
+
+レシート/バーコード/写真入力、買い物リスト、期限アラート、栄養計算。

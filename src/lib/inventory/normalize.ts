@@ -199,5 +199,34 @@ export function resolveInventoryItem(
   if (contains.length === 1) return { status: 'matched', item: contains[0] };
   if (contains.length > 1) return { status: 'ambiguous', candidates: contains };
 
+  // Tier 4 — generic term covering several specific cuts. 「鶏肉」 shares no
+  // substring with 「鶏もも肉」, so without this a very ordinary sentence
+  // ("鶏肉使った") is answered with "you don't have that" while two kinds of
+  // chicken sit in the fridge.
+  const generic = GENERIC_TERMS[canonicalKey] ?? GENERIC_TERMS[queryKey];
+  if (generic) {
+    const covered = items.filter((item) => keysFor(item).some((key) => generic.test(key)));
+    if (covered.length === 1) return { status: 'matched', item: covered[0] };
+    if (covered.length > 1) return { status: 'ambiguous', candidates: covered };
+  }
+
   return { status: 'not_found', candidates: [] };
 }
+
+/**
+ * Terms that name a category rather than an item. Deliberately a short, hand
+ * written list: a pattern that is too loose would quietly merge ingredients
+ * that are not the same thing, which SPEC §14 forbids. These can only ever
+ * produce candidates — resolving to one item still requires exactly one hit.
+ */
+const GENERIC_TERMS: Record<string, RegExp> = {
+  鶏肉: /^鶏/,
+  豚肉: /^豚/,
+  牛肉: /^牛/,
+  ひき肉: /(ひき肉|挽肉|ミンチ)/,
+  魚: /(魚|鮭|鯖|さば|さけ|たら|鱈|ぶり|鰤)/,
+  ねぎ: /(ねぎ|ネギ)/,
+  きのこ: /(きのこ|しめじ|えのき|まいたけ|しいたけ|エリンギ)/,
+  チーズ: /チーズ/,
+  牛乳: /(牛乳|ミルク)/,
+};

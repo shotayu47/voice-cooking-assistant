@@ -1,6 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 
+import { getSupabaseAnonKey, getSupabaseUrl } from '@/lib/supabase/env';
+
 const PUBLIC_PATHS = ['/login', '/auth/callback', '/auth/error'];
 
 /**
@@ -8,13 +10,10 @@ const PUBLIC_PATHS = ['/login', '/auth/callback', '/auth/error'];
  * behind auth. RLS is the real boundary; this just avoids rendering empty
  * shells to signed-out visitors.
  */
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   let response = NextResponse.next({ request });
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
+  const supabase = createServerClient(getSupabaseUrl(), getSupabaseAnonKey(), {
       cookies: {
         getAll() {
           return request.cookies.getAll();
@@ -42,6 +41,13 @@ export async function middleware(request: NextRequest) {
   );
 
   if (!user && !isPublic) {
+    // API callers must get a status they can branch on. Redirecting them to
+    // the login page would hand `fetch` an HTML body with a 200, which reads
+    // as success to the voice and chat clients.
+    if (pathname.startsWith('/api/')) {
+      return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
+    }
+
     const url = request.nextUrl.clone();
     url.pathname = '/login';
     url.searchParams.set('next', pathname);

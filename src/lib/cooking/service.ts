@@ -5,8 +5,21 @@ import { ServiceError, type ServiceContext } from '@/lib/inventory/service';
 import { getRecipe, toRecipeSnapshot } from '@/lib/recipes/service';
 import { advanceStep, isFinalStep, previousStep, stepAt } from './steps';
 
-const SESSION_COLUMNS =
-  'id, user_id, recipe_id, recipe_snapshot, current_step, total_steps, status, started_at, completed_at, created_at, updated_at';
+/**
+ * `*` rather than an explicit list so the code runs against a database where
+ * migration 0002 has not been applied yet. Naming `last_ai_step_move_at`
+ * explicitly would make every cooking query fail with 42703 on an un-migrated
+ * database — a broken cooking screen is a far worse outcome than a duplicate
+ * guard that is temporarily inactive.
+ */
+const SESSION_COLUMNS = '*';
+
+/**
+ * How long after an AI-initiated step move a second one is treated as a
+ * duplicate relay rather than a new instruction. A person saying 「次」 twice
+ * on purpose pauses far longer than this; a duplicated event does not.
+ */
+const AI_STEP_MOVE_DEBOUNCE_MS = 1500;
 
 const OPEN_STATUSES: CookingSessionStatus[] = ['active', 'paused'];
 
@@ -132,6 +145,7 @@ export async function moveStep(
   sessionId: string,
   direction: 'next' | 'previous',
   expectedStep?: number,
+  options: { aiInitiated?: boolean } = {},
 ): Promise<StepView> {
   const session = await requireSession(ctx, sessionId);
 
@@ -144,6 +158,22 @@ export async function moveStep(
     return toStepView(session);
   }
 
+  // A voice tool call carries no expected step, so a relay that is retried
+  // with a fresh call_id would otherwise move a second time. One utterance,
+  // one step.
+  const hasMoveMarker = 'last_ai_step_move_at' in session;
+  if (options.aiInitiated && !hasMoveMarker) {
+    console.error(
+      '[cooking] migration 0002 not applied — server-side duplicate step-move guard is INACTIVE',
+    );
+  }
+  if (options.aiInitiated && session.last_ai_step_move_at) {
+    const sinceLastMove = Date.now() - new Date(session.last_ai_step_move_at).getTime();
+    if (sinceLastMove >= 0 && sinceLastMove < AI_STEP_MOVE_DEBOUNCE_MS) {
+      return toStepView(session);
+    }
+  }
+
   const transition =
     direction === 'next'
       ? advanceStep(session.current_step, session.total_steps)
@@ -153,7 +183,12 @@ export async function moveStep(
 
   const { data, error } = await ctx.supabase
     .from('cooking_sessions')
-    .update({ current_step: transition.currentStep })
+    .update({
+      current_step: transition.currentStep,
+      ...(options.aiInitiated && hasMoveMarker
+        ? { last_ai_step_move_at: new Date().toISOString() }
+        : {}),
+    })
     .eq('user_id', ctx.userId)
     .eq('id', sessionId)
     .eq('current_step', session.current_step)
@@ -168,11 +203,23 @@ export async function moveStep(
   return toStepView(data as CookingSession);
 }
 
+const TERMINAL_STATUSES: CookingSessionStatus[] = ['completed', 'cancelled'];
+
 export async function updateStatus(
   ctx: ServiceContext,
   sessionId: string,
   status: CookingSessionStatus,
 ): Promise<CookingSession> {
+  const current = await requireSession(ctx, sessionId);
+
+  // Finished is finished. Without this, 「一時停止して」 said after 「終了」 —
+  // or a replayed finish_cooking_session — would put a completed dish back on
+  // the home screen as the active cook.
+  if (TERMINAL_STATUSES.includes(current.status)) {
+    if (current.status === status) return current;
+    throw new ServiceError('この料理はすでに終了しています');
+  }
+
   const { data, error } = await ctx.supabase
     .from('cooking_sessions')
     .update({

@@ -1,6 +1,9 @@
 import { cookies } from 'next/headers';
 import { createServerClient } from '@supabase/ssr';
 
+import { getSupabaseAnonKey, getSupabaseUrl } from './env';
+import { timeoutFetch } from './fetch';
+
 /**
  * Server-side Supabase client bound to the request's auth cookies.
  *
@@ -11,10 +14,8 @@ import { createServerClient } from '@supabase/ssr';
 export async function createClient() {
   const cookieStore = await cookies();
 
-  return createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
+  return createServerClient(getSupabaseUrl(), getSupabaseAnonKey(), {
+      global: { fetch: timeoutFetch },
       cookies: {
         getAll() {
           return cookieStore.getAll();
@@ -57,4 +58,10 @@ export class UnauthorizedError extends Error {
     super('Not authenticated');
     this.name = 'UnauthorizedError';
   }
+}
+
+/** The `{ supabase, userId }` pair every service function takes. */
+export async function getServiceContext() {
+  const { supabase, user } = await requireUser();
+  return { ctx: { supabase, userId: user.id }, user };
 }

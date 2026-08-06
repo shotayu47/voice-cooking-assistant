@@ -32,6 +32,7 @@ create table if not exists public.profiles (
   updated_at timestamptz default now()
 );
 
+drop trigger if exists profiles_set_updated_at on public.profiles;
 create trigger profiles_set_updated_at
 before update on public.profiles
 for each row execute function public.set_updated_at();
@@ -113,6 +114,7 @@ on public.inventory_items(user_id, expiry_date);
 create index if not exists inventory_items_normalized_name_idx
 on public.inventory_items(user_id, normalized_name);
 
+drop trigger if exists inventory_items_set_updated_at on public.inventory_items;
 create trigger inventory_items_set_updated_at
 before update on public.inventory_items
 for each row execute function public.set_updated_at();
@@ -146,6 +148,7 @@ create table if not exists public.recipes (
 create index if not exists recipes_user_id_idx
 on public.recipes(user_id, created_at desc);
 
+drop trigger if exists recipes_set_updated_at on public.recipes;
 create trigger recipes_set_updated_at
 before update on public.recipes
 for each row execute function public.set_updated_at();
@@ -194,6 +197,7 @@ create unique index if not exists cooking_sessions_one_open_per_user_idx
 on public.cooking_sessions(user_id)
 where status in ('active', 'paused');
 
+drop trigger if exists cooking_sessions_set_updated_at on public.cooking_sessions;
 create trigger cooking_sessions_set_updated_at
 before update on public.cooking_sessions
 for each row execute function public.set_updated_at();
@@ -259,6 +263,7 @@ create table if not exists public.conversation_sessions (
 create index if not exists conversation_sessions_user_id_idx
 on public.conversation_sessions(user_id, created_at desc);
 
+drop trigger if exists conversation_sessions_set_updated_at on public.conversation_sessions;
 create trigger conversation_sessions_set_updated_at
 before update on public.conversation_sessions
 for each row execute function public.set_updated_at();
@@ -271,6 +276,10 @@ create table if not exists public.conversation_messages (
     references public.conversation_sessions(id) on delete cascade,
   user_id uuid not null references auth.users(id) on delete cascade,
 
+  -- Replay order must be exact: a tool result that precedes its own call is a
+  -- protocol error, and timestamps can tie at millisecond resolution.
+  seq bigint generated always as identity,
+
   role text not null check (role in ('user', 'assistant', 'tool')),
   content text,
   tool_calls jsonb,
@@ -280,7 +289,7 @@ create table if not exists public.conversation_messages (
 );
 
 create index if not exists conversation_messages_session_idx
-on public.conversation_messages(conversation_session_id, created_at);
+on public.conversation_messages(conversation_session_id, seq);
 
 -- ---------------------------------------------------------------------------
 -- 7. Row Level Security
@@ -293,6 +302,34 @@ alter table public.cooking_sessions       enable row level security;
 alter table public.inventory_transactions enable row level security;
 alter table public.conversation_sessions  enable row level security;
 alter table public.conversation_messages  enable row level security;
+
+-- Postgres has no `create policy if not exists`, so drop first. This keeps the
+-- file safe to paste into the SQL editor more than once.
+do $$
+declare
+  policy_row record;
+begin
+  for policy_row in
+    select tablename, policyname
+    from pg_policies
+    where schemaname = 'public'
+      and tablename in (
+        'profiles',
+        'inventory_items',
+        'recipes',
+        'cooking_sessions',
+        'inventory_transactions',
+        'conversation_sessions',
+        'conversation_messages'
+      )
+  loop
+    execute format(
+      'drop policy if exists %I on public.%I',
+      policy_row.policyname,
+      policy_row.tablename
+    );
+  end loop;
+end $$;
 
 -- profiles: id = auth.uid()
 create policy "profiles_select_own" on public.profiles
