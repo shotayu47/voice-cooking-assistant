@@ -26,6 +26,8 @@ import {
   updateStatus,
 } from '@/lib/cooking/service';
 import { isAvailable } from '@/lib/inventory/quantity';
+import { freshnessOf } from '@/lib/inventory/freshness';
+import type { InventoryItem } from '@/types/domain';
 
 /**
  * Tool definitions (SPEC §8).
@@ -561,7 +563,10 @@ async function dispatch(
             difficulty: args.difficulty ?? null,
           },
           available_items: usable.map(publicItem),
-          expiring_soon: expiring.map(publicItem),
+          expiring_soon: expiring.map(({ item, freshness }) => ({
+            ...publicItem(item),
+            urgency: freshness.label,
+          })),
           ranking_guidance: [
             '在庫だけで完結する料理を最優先',
             '賞味期限が近い食材を使う料理を次に優先',
@@ -636,16 +641,14 @@ async function dispatch(
   }
 }
 
-function publicItem(item: {
-  id: string;
-  name: string;
-  category: string | null;
-  quantity: number | null;
-  unit: string | null;
-  quantity_state: string;
-  storage_location: string | null;
-  expiry_date: string | null;
-}) {
+/**
+ * What the model is allowed to see about an item. Includes the freshness
+ * summary so it can prioritise 期限が近い食材 without doing date arithmetic —
+ * and so it can tell a printed date from the app's estimate.
+ */
+function publicItem(item: InventoryItem) {
+  const freshness = freshnessOf(item);
+
   return {
     id: item.id,
     name: item.name,
@@ -655,6 +658,13 @@ function publicItem(item: {
     quantity_state: item.quantity_state,
     storage_location: item.storage_location,
     expiry_date: item.expiry_date,
+    ...(freshness
+      ? {
+          days_left: freshness.daysLeft,
+          expiry_kind: freshness.kind,
+          expiry_is_estimated: freshness.estimated,
+        }
+      : {}),
   };
 }
 

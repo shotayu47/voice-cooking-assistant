@@ -5,9 +5,19 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
   InventoryItem,
   QuantityState,
+  StorageLocation,
   TransactionAction,
   TransactionSource,
 } from '@/types/domain';
+import {
+  addDays,
+  estimateExpiry,
+  freshnessOf,
+  todayIso,
+  type ExpiryKind,
+  type ExpirySource,
+  type Freshness,
+} from './freshness';
 import { timed } from '@/lib/perf';
 import { normalizeIngredientName, resolveInventoryItem } from './normalize';
 import {
@@ -36,8 +46,57 @@ export class ServiceError extends Error {
   }
 }
 
-const ITEM_COLUMNS =
-  'id, user_id, name, normalized_name, category, quantity, unit, quantity_state, storage_location, expiry_date, opened, notes, created_at, updated_at';
+/**
+ * `*` rather than an explicit list so the code keeps running against a
+ * database where migration 0003 has not been applied yet — naming the new
+ * expiry columns would make every inventory query fail with 42703.
+ */
+const ITEM_COLUMNS = '*';
+
+/**
+ * Fill in `expiry_date` when the user did not give one, and record where the
+ * date came from. An estimate must always be labelled: `expiry_source` is what
+ * lets the UI show 「推定あと3日」 instead of implying the package said so.
+ */
+function withExpiryEstimate(
+  fields: {
+    name: string;
+    category?: string | null;
+    storage_location?: StorageLocation | null;
+    expiry_date?: string | null;
+    expiry_kind?: ExpiryKind | null;
+    purchased_at?: string | null;
+    opened_at?: string | null;
+    opened?: boolean | null;
+  },
+): { expiry_date: string | null; expiry_kind: ExpiryKind | null; expiry_source: ExpirySource } {
+  if (fields.expiry_date) {
+    return {
+      expiry_date: fields.expiry_date,
+      expiry_kind: fields.expiry_kind ?? null,
+      expiry_source: 'user',
+    };
+  }
+
+  const estimate = estimateExpiry({
+    name: fields.name,
+    category: fields.category ?? null,
+    storageLocation: fields.storage_location ?? null,
+    purchasedAt: fields.purchased_at,
+    openedAt: fields.opened_at,
+    opened: fields.opened,
+  });
+
+  if (!estimate) {
+    return { expiry_date: null, expiry_kind: fields.expiry_kind ?? null, expiry_source: 'unknown' };
+  }
+
+  return {
+    expiry_date: estimate.date,
+    expiry_kind: fields.expiry_kind ?? estimate.kind,
+    expiry_source: 'estimated',
+  };
+}
 
 export async function listInventory(
   ctx: ServiceContext,
@@ -80,6 +139,20 @@ export async function createInventoryItem(
 ): Promise<InventoryItem> {
   const parsed = createInventoryItemSchema.parse(input);
 
+  // Most items are registered with a name and nothing else, so the expiry is
+  // estimated here rather than asked for.
+  const purchasedAt = parsed.purchased_at ?? todayIso();
+  const expiry = withExpiryEstimate({
+    name: parsed.name,
+    category: parsed.category,
+    storage_location: parsed.storage_location,
+    expiry_date: parsed.expiry_date,
+    expiry_kind: parsed.expiry_kind,
+    purchased_at: purchasedAt,
+    opened_at: parsed.opened_at,
+    opened: parsed.opened,
+  });
+
   const { data, error } = await ctx.supabase
     .from('inventory_items')
     .insert({
@@ -91,9 +164,11 @@ export async function createInventoryItem(
       unit: parsed.unit ?? null,
       quantity_state: parsed.quantity_state,
       storage_location: parsed.storage_location ?? null,
-      expiry_date: parsed.expiry_date ?? null,
       opened: parsed.opened ?? false,
       notes: parsed.notes ?? null,
+      purchased_at: purchasedAt,
+      opened_at: parsed.opened_at ?? (parsed.opened ? purchasedAt : null),
+      ...expiry,
     })
     .select(ITEM_COLUMNS)
     .single();
@@ -136,8 +211,42 @@ export async function updateInventoryItem(
     'expiry_date',
     'opened',
     'notes',
+    'purchased_at',
+    'opened_at',
+    'expiry_kind',
   ] as const) {
     if (parsed[key] !== undefined) update[key] = parsed[key];
+  }
+
+  // Opening something usually shortens its life, so record when it happened.
+  if (parsed.opened === true && !previous.opened && parsed.opened_at === undefined) {
+    update.opened_at = todayIso();
+  }
+
+  if (parsed.expiry_date !== undefined && parsed.expiry_date !== null) {
+    // A date the user typed is fact from now on.
+    update.expiry_source = 'user';
+  } else if (
+    // Storage or opened state changed and the current date was only a guess —
+    // re-estimate rather than leave a stale one.
+    previous.expiry_source === 'estimated' &&
+    (parsed.storage_location !== undefined ||
+      parsed.opened !== undefined ||
+      parsed.purchased_at !== undefined ||
+      parsed.name !== undefined)
+  ) {
+    const merged = { ...previous, ...update } as InventoryItem;
+    const re = withExpiryEstimate({
+      name: merged.name,
+      category: merged.category,
+      storage_location: merged.storage_location,
+      expiry_date: null,
+      expiry_kind: merged.expiry_kind,
+      purchased_at: merged.purchased_at,
+      opened_at: (update.opened_at as string | undefined) ?? merged.opened_at,
+      opened: merged.opened,
+    });
+    Object.assign(update, re);
   }
 
   if (Object.keys(update).length === 0) return previous;
@@ -301,10 +410,22 @@ export async function listTransactions(ctx: ServiceContext, limit = 50) {
   return data ?? [];
 }
 
-/** Items expiring within `days`, soonest first. Drives the home screen. */
-export async function listExpiringSoon(ctx: ServiceContext, days = 3) {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() + days);
+export type UrgentItem = { item: InventoryItem; freshness: Freshness };
+
+/**
+ * 「早めに使う食材」 — what should be eaten first (PHASE 1).
+ *
+ * Includes items whose date is only an estimate; the caller renders the
+ * `estimated` flag so a guess is never shown as if it were printed on the
+ * package. Already-expired items are included and sort first — hiding them
+ * would be the one case where silence is actively unhelpful.
+ */
+export async function listExpiringSoon(
+  ctx: ServiceContext,
+  days = 3,
+  limit = 10,
+): Promise<UrgentItem[]> {
+  const today = todayIso();
 
   const { data, error } = await ctx.supabase
     .from('inventory_items')
@@ -312,12 +433,16 @@ export async function listExpiringSoon(ctx: ServiceContext, days = 3) {
     .eq('user_id', ctx.userId)
     .neq('quantity_state', 'empty')
     .not('expiry_date', 'is', null)
-    .lte('expiry_date', cutoff.toISOString().slice(0, 10))
+    .lte('expiry_date', addDays(today, days))
     .order('expiry_date', { ascending: true })
-    .limit(10);
+    .limit(limit);
 
   if (error) throw new ServiceError(error.message);
-  return ((data ?? []) as InventoryItem[]).filter(isAvailable);
+
+  return ((data ?? []) as InventoryItem[])
+    .filter(isAvailable)
+    .map((item) => ({ item, freshness: freshnessOf(item, today) }))
+    .filter((entry): entry is UrgentItem => entry.freshness !== null);
 }
 
 type LogInput = {

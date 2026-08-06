@@ -5,6 +5,8 @@ import { useState, useTransition } from 'react';
 
 import { Chip } from '@/components/ui/surfaces';
 import { cn } from '@/lib/cn';
+import { FreshnessText } from '@/components/ui/freshness-badge';
+import { freshnessOf } from '@/lib/inventory/freshness';
 import { QUANTITY_STATE_LABELS, STORAGE_LABELS } from '@/lib/labels';
 import type { InventoryItem, QuantityState, StorageLocation } from '@/types/domain';
 
@@ -24,6 +26,7 @@ export function InventoryRow({ item }: { item: InventoryItem }) {
   const [error, setError] = useState<string | null>(null);
 
   const empty = item.quantity_state === 'empty';
+  const freshness = freshnessOf(item);
 
   function run(action: () => Promise<{ status: string; reason?: string }>) {
     setError(null);
@@ -58,7 +61,7 @@ export function InventoryRow({ item }: { item: InventoryItem }) {
               {item.storage_location ? (
                 <span>{STORAGE_LABELS[item.storage_location as StorageLocation]}</span>
               ) : null}
-              {item.expiry_date ? <ExpiryLabel date={item.expiry_date} /> : null}
+              {freshness ? <FreshnessText freshness={freshness} /> : null}
             </span>
           </span>
 
@@ -155,21 +158,3 @@ function QuickButton({
   );
 }
 
-function ExpiryLabel({ date }: { date: string }) {
-  const days = daysUntil(date);
-  if (days === null) return <span>{date}</span>;
-
-  if (days < 0) return <span className="text-danger">期限切れ</span>;
-  if (days === 0) return <span className="text-danger">今日まで</span>;
-  if (days <= 3) return <span className="text-warn">あと{days}日</span>;
-  return <span>{date}</span>;
-}
-
-function daysUntil(date: string): number | null {
-  const target = new Date(`${date}T00:00:00`);
-  if (Number.isNaN(target.getTime())) return null;
-
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  return Math.round((target.getTime() - today.getTime()) / 86_400_000);
-}

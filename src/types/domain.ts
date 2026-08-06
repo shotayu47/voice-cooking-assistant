@@ -95,6 +95,15 @@ export type InventoryItem = {
   notes: string | null;
   created_at: string;
   updated_at: string;
+
+  // PHASE 1 — expiry tracking (migration 0003). Optional so the code still
+  // runs against a database where that migration has not been applied.
+  purchased_at?: string | null;
+  opened_at?: string | null;
+  /** 消費期限 (use_by) vs 賞味期限 (best_before). */
+  expiry_kind?: 'use_by' | 'best_before' | null;
+  /** Whether `expiry_date` was given by the user or estimated by the app. */
+  expiry_source?: 'user' | 'estimated' | 'unknown' | null;
 };
 
 /** SPEC §9 — recipe ingredient. */

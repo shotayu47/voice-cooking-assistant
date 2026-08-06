@@ -18,6 +18,7 @@ import {
   STORAGE_LOCATIONS,
   type QuantityState,
 } from '@/types/domain';
+import { EXPIRY_KINDS } from '@/lib/inventory/freshness';
 
 export type FormState = { error?: string };
 
@@ -50,6 +51,10 @@ function readItemForm(formData: FormData) {
     expiry_date: optional(formData.get('expiry_date')),
     opened: formData.get('opened') === 'on',
     notes: optional(formData.get('notes')),
+    // PHASE 1 — expiry tracking.
+    purchased_at: optional(formData.get('purchased_at')),
+    opened_at: optional(formData.get('opened_at')),
+    expiry_kind: pickEnum(optional(formData.get('expiry_kind')), EXPIRY_KINDS),
   };
 }
 

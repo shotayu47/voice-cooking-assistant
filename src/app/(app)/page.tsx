@@ -1,7 +1,8 @@
 import Link from 'next/link';
 
 import { ButtonLink } from '@/components/ui/button';
-import { Card, Chip, SectionTitle } from '@/components/ui/surfaces';
+import { Card, SectionTitle } from '@/components/ui/surfaces';
+import { FreshnessBadge } from '@/components/ui/freshness-badge';
 import { listExpiringSoon, listInventory } from '@/lib/inventory/service';
 import { getOpenSession, listHistory } from '@/lib/cooking/service';
 import { getServiceContext } from '@/lib/supabase/server';
@@ -13,7 +14,7 @@ export default async function HomePage() {
 
   const [items, expiring, openSession, history] = await Promise.all([
     listInventory(ctx, { includeEmpty: true }),
-    listExpiringSoon(ctx, 3),
+    listExpiringSoon(ctx, 3, 5),
     getOpenSession(ctx),
     listHistory(ctx, 5),
   ]);
@@ -82,17 +83,31 @@ export default async function HomePage() {
 
       {expiring.length > 0 ? (
         <section className="mt-6">
-          <SectionTitle>期限が近い食材</SectionTitle>
-          <ul className="flex flex-wrap gap-2">
-            {expiring.map((item) => (
-              <li key={item.id}>
-                <Chip tone="warn">
-                  {item.name}
-                  {item.expiry_date ? ` · ${item.expiry_date.slice(5)}` : ''}
-                </Chip>
+          <SectionTitle
+            action={
+              <Link href="/chat" className="text-xs text-accent">
+                これで作る
+              </Link>
+            }
+          >
+            早めに使う食材
+          </SectionTitle>
+          <ul className="overflow-hidden rounded-card border border-line">
+            {expiring.map(({ item, freshness }) => (
+              <li
+                key={item.id}
+                className="flex min-h-14 items-center gap-3 border-b border-line bg-surface px-4 py-2 last:border-b-0"
+              >
+                <span className="min-w-0 flex-1 truncate">{item.name}</span>
+                <FreshnessBadge freshness={freshness} />
               </li>
             ))}
           </ul>
+          {expiring.some(({ freshness }) => freshness.estimated) ? (
+            <p className="mt-1.5 px-1 text-xs text-faint">
+              「推定」はアプリの目安です。実際の表示を確認してください。
+            </p>
+          ) : null}
         </section>
       ) : null}
 

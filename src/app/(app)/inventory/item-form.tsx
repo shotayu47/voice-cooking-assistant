@@ -29,6 +29,10 @@ export function ItemForm({
 }) {
   const [state, formAction, pending] = useActionState(action, {} as FormState);
 
+  // An estimated date is shown as a placeholder rather than a value: leaving
+  // the field untouched must not silently promote the guess to a fact.
+  const isEstimated = item?.expiry_source === 'estimated' && !!item.expiry_date;
+
   return (
     <form action={formAction} className="space-y-5">
       {item ? <input type="hidden" name="id" value={item.id} /> : null}
@@ -98,9 +102,38 @@ export function ItemForm({
         </Select>
       </Field>
 
-      <Field label="賞味期限（任意）">
-        <Input name="expiry_date" type="date" defaultValue={item?.expiry_date ?? ''} />
+      <Field
+        label="期限（任意）"
+        hint={
+          isEstimated
+            ? 'いまはアプリの推定値です。パッケージの日付を入れると確定になります。'
+            : '未入力なら食材と保存場所から目安を自動で設定します'
+        }
+      >
+        <Input
+          name="expiry_date"
+          type="date"
+          defaultValue={isEstimated ? '' : (item?.expiry_date ?? '')}
+          placeholder={isEstimated ? item?.expiry_date ?? '' : undefined}
+        />
       </Field>
+
+      <Field label="期限の種類（任意）">
+        <Select name="expiry_kind" defaultValue={item?.expiry_kind ?? ''}>
+          <option value="">未設定</option>
+          <option value="use_by">消費期限（安全に食べられる期限）</option>
+          <option value="best_before">賞味期限（おいしく食べられる期限）</option>
+        </Select>
+      </Field>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="購入日（任意）">
+          <Input name="purchased_at" type="date" defaultValue={item?.purchased_at ?? ''} />
+        </Field>
+        <Field label="開封日（任意）">
+          <Input name="opened_at" type="date" defaultValue={item?.opened_at ?? ''} />
+        </Field>
+      </div>
 
       <label className="flex min-h-12 items-center gap-3 rounded-xl border border-line bg-surface px-3">
         <input
