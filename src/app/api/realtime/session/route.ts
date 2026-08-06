@@ -23,7 +23,7 @@ export async function POST() {
   try {
     const context = await getServiceContext();
     ctx = context.ctx;
-    userId = context.user.id;
+    userId = context.user.userId;
   } catch (error) {
     if (error instanceof UnauthorizedError) {
       return NextResponse.json({ error: 'unauthorized' }, { status: 401 });

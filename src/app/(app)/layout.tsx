@@ -1,23 +1,22 @@
-import { redirect } from 'next/navigation';
-
 import { BottomNav } from '@/components/bottom-nav';
-import { createClient } from '@/lib/supabase/server';
 
 /**
- * Auth gate for every signed-in page. The proxy already redirects anonymous
- * requests; this is the second check so a page can never render without a
- * user, and RLS is the third.
+ * Shell for every signed-in page.
+ *
+ * Deliberately does no auth work. It used to `await getUser()` here, which
+ * cost an Auth round trip on every navigation *and* held `{children}` behind
+ * it — a layout's top-level await blocks the first streamed chunk for the
+ * whole segment.
+ *
+ * Access is enforced where it belongs and without duplication:
+ *   1. `proxy.ts` verifies the JWT and redirects anonymous requests.
+ *   2. Each page's `getServiceContext()` re-verifies before reading data, so a
+ *      page can never render with an unauthenticated context.
+ *   3. RLS is the final boundary in the database.
  */
-export default async function AppLayout({
+export default function AppLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) redirect('/login');
-
   return (
     <>
       {children}

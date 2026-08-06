@@ -8,6 +8,7 @@ import type {
   TransactionAction,
   TransactionSource,
 } from '@/types/domain';
+import { timed } from '@/lib/perf';
 import { normalizeIngredientName, resolveInventoryItem } from './normalize';
 import {
   applyConsumption,
@@ -52,7 +53,7 @@ export async function listInventory(
   if (options.category) query = query.eq('category', options.category);
   if (!options.includeEmpty) query = query.neq('quantity_state', 'empty');
 
-  const { data, error } = await query;
+  const { data, error } = await timed('db:listInventory', async () => query);
   if (error) throw new ServiceError(error.message);
   return (data ?? []) as InventoryItem[];
 }

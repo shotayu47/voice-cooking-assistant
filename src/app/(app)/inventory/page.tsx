@@ -4,6 +4,7 @@ import { PageShell } from '@/components/page-shell';
 import { listInventory } from '@/lib/inventory/service';
 import { getServiceContext } from '@/lib/supabase/server';
 import { CATEGORY_ORDER, categoryLabel } from '@/lib/labels';
+import { mark, now } from '@/lib/perf';
 import type { Category, InventoryItem } from '@/types/domain';
 
 import { InventoryRow } from './inventory-row';
@@ -11,9 +12,11 @@ import { InventoryRow } from './inventory-row';
 export const metadata = { title: '在庫 | 料理アシスタント' };
 
 export default async function InventoryPage() {
+  const pageStart = now();
   const { ctx } = await getServiceContext();
   // Empty items stay visible here so the user can top them back up.
   const items = await listInventory(ctx, { includeEmpty: true });
+  mark('page:inventory TOTAL', pageStart);
 
   const groups = groupByCategory(items);
 

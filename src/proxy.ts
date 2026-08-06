@@ -2,13 +2,22 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
 
 import { getSupabaseAnonKey, getSupabaseUrl } from '@/lib/supabase/env';
+import { timed } from '@/lib/perf';
 
 const PUBLIC_PATHS = ['/login', '/auth/callback', '/auth/error'];
 
 /**
  * Refreshes the Supabase session cookie on every request and gates the app
- * behind auth. RLS is the real boundary; this just avoids rendering empty
- * shells to signed-out visitors.
+ * behind auth.
+ *
+ * Uses `getClaims()`, which verifies the JWT signature locally against the
+ * project's published JWKS (tokens are ES256) instead of asking the Auth
+ * server. That keeps this a real authorization check while removing a network
+ * round trip from every single navigation. `getSession()` would not be
+ * acceptable here — it decodes the cookie without verifying it.
+ *
+ * Cookie refresh is preserved: `getClaims()` reads the session first, which
+ * renews an expired token and writes the new cookies through `setAll`.
  */
 export async function proxy(request: NextRequest) {
   let response = NextResponse.next({ request });
@@ -31,16 +40,15 @@ export async function proxy(request: NextRequest) {
     },
   );
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data } = await timed('proxy:auth', () => supabase.auth.getClaims());
+  const isAuthenticated = Boolean(data?.claims?.sub);
 
   const { pathname } = request.nextUrl;
   const isPublic = PUBLIC_PATHS.some(
     (path) => pathname === path || pathname.startsWith(`${path}/`),
   );
 
-  if (!user && !isPublic) {
+  if (!isAuthenticated && !isPublic) {
     // API callers must get a status they can branch on. Redirecting them to
     // the login page would hand `fetch` an HTML body with a 200, which reads
     // as success to the voice and chat clients.
@@ -54,7 +62,7 @@ export async function proxy(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  if (user && pathname === '/login') {
+  if (isAuthenticated && pathname === '/login') {
     const url = request.nextUrl.clone();
     url.pathname = '/';
     url.search = '';
