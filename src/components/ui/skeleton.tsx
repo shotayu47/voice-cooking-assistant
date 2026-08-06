@@ -15,7 +15,7 @@ export function Skeleton({ className }: { className?: string }) {
 export function SkeletonHeader({ title }: { title: string }) {
   return (
     <header
-      className="sticky top-0 z-30 flex min-h-14 items-center gap-2 border-b border-line bg-bg/95 px-3 backdrop-blur"
+      className="sticky top-0 z-30 flex min-h-14 items-center gap-2 border-b border-line bg-bg px-3"
       style={{ paddingTop: 'env(safe-area-inset-top)' }}
     >
       <h1 className="flex-1 truncate px-1 text-base font-semibold">{title}</h1>

@@ -95,7 +95,7 @@ export function CookingView({
   }
 
   return (
-    <div className="mx-auto flex min-h-dvh w-full max-w-md flex-col">
+    <div className="mx-auto flex min-h-full w-full max-w-md flex-col">
       <header
         className="flex min-h-14 items-center gap-3 px-4"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}

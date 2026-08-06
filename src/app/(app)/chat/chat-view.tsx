@@ -86,9 +86,13 @@ export function ChatView({
   }
 
   return (
-    <div className="mx-auto w-full max-w-md">
+    /*
+     * Fills the shell's content area and scrolls internally, so the composer
+     * sits directly above the nav without being positioned against it.
+     */
+    <div className="mx-auto flex h-full w-full max-w-md flex-col">
       <header
-        className="sticky top-0 z-30 flex min-h-14 items-center gap-2 border-b border-line bg-bg/95 px-4 backdrop-blur"
+        className="flex min-h-14 shrink-0 items-center gap-2 border-b border-line bg-bg px-4"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
         <h1 className="flex-1 text-base font-semibold">AIに相談</h1>
@@ -103,12 +107,12 @@ export function ChatView({
       </header>
 
       {cookingTitle ? (
-        <p className="border-b border-line bg-surface px-4 py-2 text-xs text-muted">
+        <p className="shrink-0 border-b border-line bg-surface px-4 py-2 text-xs text-muted">
           調理中: <span className="text-fg">{cookingTitle}</span>
         </p>
       ) : null}
 
-      <div className="space-y-3 px-4 py-4 pb-40">
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-4 py-4">
         {messages.length === 0 ? (
           <div className="pt-6">
             <p className="text-center text-sm text-faint">
@@ -160,8 +164,7 @@ export function ChatView({
           event.preventDefault();
           void send(input);
         }}
-        className="fixed inset-x-0 z-30 mx-auto flex max-w-md gap-2 border-t border-line bg-bg/95 px-3 py-2 backdrop-blur"
-        style={{ bottom: 'calc(64px + env(safe-area-inset-bottom))' }}
+        className="flex shrink-0 gap-2 border-t border-line bg-bg px-3 py-2"
       >
         <input
           value={input}

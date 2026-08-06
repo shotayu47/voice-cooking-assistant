@@ -37,6 +37,7 @@ html {
   background: var(--color-bg);
   /* iOS: keep the rubber-band overscroll black instead of white. */
   -webkit-text-size-adjust: 100%;
+  height: 100%;
 }
 
 body {
@@ -44,8 +45,7 @@ body {
   color: var(--color-fg);
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
-  /* Room for the fixed bottom nav plus the home indicator. */
-  padding-bottom: calc(64px + env(safe-area-inset-bottom));
+  min-height: 100%;
 }
 
 /* Wet or hurried hands: no text selection flicker, no tap highlight box. */

@@ -6,15 +6,15 @@ import { Skeleton } from '@/components/ui/skeleton';
  */
 export default function Loading() {
   return (
-    <div className="mx-auto w-full max-w-md">
+    <div className="mx-auto flex h-full w-full max-w-md flex-col">
       <header
-        className="sticky top-0 z-30 flex min-h-14 items-center gap-2 border-b border-line bg-bg/95 px-4 backdrop-blur"
+        className="flex min-h-14 shrink-0 items-center gap-2 border-b border-line bg-bg px-4"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
         <h1 className="flex-1 text-base font-semibold">AIに相談</h1>
       </header>
 
-      <div className="space-y-3 px-4 py-4">
+      <div className="min-h-0 flex-1 space-y-3 px-4 py-4">
         <div className="flex justify-end">
           <Skeleton className="h-11 w-2/3 rounded-2xl" />
         </div>
