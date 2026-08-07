@@ -203,13 +203,27 @@ export async function runTurn(
   const appliedMutations = new Map<string, unknown>();
 
   for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
-    const completion = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages,
-      tools: TOOL_DEFINITIONS,
-      tool_choice: 'auto',
-      temperature: 0.4,
-    });
+    let completion;
+    try {
+      completion = await openai.chat.completions.create({
+        model: CHAT_MODEL,
+        messages,
+        tools: TOOL_DEFINITIONS,
+        tool_choice: 'auto',
+        temperature: 0.4,
+      });
+    } catch (error) {
+      // The model call failed — but tools that already ran have committed
+      // real changes. Throwing here would show a generic error while the
+      // inventory silently moved, and a retry would apply it a second time.
+      // Report what actually happened instead.
+      if (toolsUsed.length > 0) {
+        const reply = describeCompletedWork(toolsUsed, inventoryChanged);
+        await persistMessage(ctx, input.conversationId, { role: 'assistant', content: reply });
+        return { reply, toolsUsed, inventoryChanged, cookingSessionId };
+      }
+      throw error;
+    }
 
     const choice = completion.choices[0]?.message;
     if (!choice) throw new ServiceError('AIから応答がありませんでした');
@@ -283,6 +297,27 @@ export async function runTurn(
   const fallback = 'うまくまとめられませんでした。もう一度、短く言い直してもらえますか。';
   await persistMessage(ctx, input.conversationId, { role: 'assistant', content: fallback });
   return { reply: fallback, toolsUsed, inventoryChanged, cookingSessionId };
+}
+
+/**
+ * Plain-language account of what a turn managed to do before the model call
+ * failed. Deliberately concrete about the inventory: the point is that the
+ * user knows not to say it again.
+ */
+function describeCompletedWork(toolsUsed: string[], inventoryChanged: boolean): string {
+  if (inventoryChanged) {
+    return [
+      '在庫の変更は反映されましたが、返答の生成に失敗しました。',
+      '同じ操作をもう一度言うと二重に反映されるので、在庫画面で結果を確認してください。',
+    ].join('\n');
+  }
+
+  const stepMoved = toolsUsed.some(isStepMove);
+  if (stepMoved) {
+    return '工程は進みましたが、返答の生成に失敗しました。画面を再読み込みしてください。';
+  }
+
+  return '返答の生成に失敗しました。もう一度お試しください。在庫は変更されていません。';
 }
 
 function isStepMove(name: string): boolean {

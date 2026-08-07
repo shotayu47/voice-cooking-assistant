@@ -33,6 +33,14 @@ export type ConsumeInput = {
   amount?: number | null;
   unit?: string | null;
   consumeAll?: boolean;
+  /**
+   * 「卵あと2個」 — how much is left, stated directly. This is an observation
+   * about the current state, not an amount used, so it sets rather than
+   * subtracts.
+   */
+  remaining?: number | null;
+  /** 「キャベツ半分使った」 — the share that was used, 0 < f <= 1. */
+  fraction?: number | null;
 };
 
 export type ConsumeOutcome =
@@ -66,6 +74,65 @@ export function applyConsumption(
     };
   }
 
+  // 「あと2個」 — the user is telling us the level, not the usage. Trust it
+  // even when it is higher than we thought: they are looking at the fridge
+  // and we are not.
+  if (input.remaining !== null && input.remaining !== undefined) {
+    const remaining = input.remaining;
+    if (!Number.isFinite(remaining) || remaining < 0) {
+      return { status: 'needs_clarification', reason: '残量は0以上の数で指定してください。' };
+    }
+
+    const unitMismatch = unitConflict(snapshot, input);
+    if (unitMismatch) return unitMismatch;
+
+    const next = roundQuantity(remaining);
+    return {
+      status: 'applied',
+      action: 'set_quantity',
+      quantity: next,
+      quantity_state: deriveQuantityState(next, snapshot.quantity_state),
+      quantityDelta: snapshot.quantity === null ? null : roundQuantity(next - snapshot.quantity),
+    };
+  }
+
+  // 「半分使った」 — a share of whatever is currently there.
+  if (input.fraction !== null && input.fraction !== undefined) {
+    const fraction = input.fraction;
+    if (!Number.isFinite(fraction) || fraction <= 0 || fraction > 1) {
+      return {
+        status: 'needs_clarification',
+        reason: '割合は0より大きく1以下で指定してください（半分なら0.5）。',
+      };
+    }
+
+    if (snapshot.quantity === null) {
+      // Half of an unknown amount is still unknown. Move the fuzzy state
+      // rather than inventing a number.
+      return {
+        status: 'applied',
+        action: 'set_state',
+        quantity: null,
+        quantity_state:
+          fraction >= 1
+            ? 'empty'
+            : snapshot.quantity_state === 'plenty'
+              ? 'available'
+              : 'low',
+        quantityDelta: null,
+      };
+    }
+
+    const next = Math.max(0, roundQuantity(snapshot.quantity * (1 - fraction)));
+    return {
+      status: 'applied',
+      action: 'decrease',
+      quantity: next,
+      quantity_state: deriveQuantityState(next, snapshot.quantity_state),
+      quantityDelta: roundQuantity(next - snapshot.quantity),
+    };
+  }
+
   const amount = input.amount ?? null;
 
   if (amount === null) {
@@ -96,17 +163,8 @@ export function applyConsumption(
     };
   }
 
-  if (
-    input.unit &&
-    snapshot.unit &&
-    input.unit.trim() !== '' &&
-    input.unit.trim() !== snapshot.unit.trim()
-  ) {
-    return {
-      status: 'needs_clarification',
-      reason: `単位が一致しません（在庫: ${snapshot.unit} / 指定: ${input.unit}）。`,
-    };
-  }
+  const unitMismatch = unitConflict(snapshot, input);
+  if (unitMismatch) return unitMismatch;
 
   const next = Math.max(0, roundQuantity(snapshot.quantity - amount));
 
@@ -166,6 +224,28 @@ export function applyStateChange(
     quantity_state: state,
     quantityDelta: null,
   };
+}
+
+/**
+ * Refuse to mix units. Subtracting 200ml from something measured in 個 would
+ * silently produce a nonsense number, so ask instead.
+ */
+function unitConflict(
+  snapshot: QuantitySnapshot,
+  input: ConsumeInput,
+): Extract<ConsumeOutcome, { status: 'needs_clarification' }> | null {
+  if (
+    input.unit &&
+    snapshot.unit &&
+    input.unit.trim() !== '' &&
+    input.unit.trim() !== snapshot.unit.trim()
+  ) {
+    return {
+      status: 'needs_clarification',
+      reason: `単位が一致しません（在庫: ${snapshot.unit} / 指定: ${input.unit}）。`,
+    };
+  }
+  return null;
 }
 
 /** Trim binary-float noise (0.1 + 0.2) without losing real precision. */

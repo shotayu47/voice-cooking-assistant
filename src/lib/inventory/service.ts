@@ -350,7 +350,16 @@ async function commitOutcome(
 
 export async function consumeInventoryItem(
   ctx: ServiceContext,
-  input: { itemId: string; amount?: number | null; unit?: string | null; consumeAll?: boolean },
+  input: {
+    itemId: string;
+    amount?: number | null;
+    unit?: string | null;
+    consumeAll?: boolean;
+    /** 「卵あと2個」 — sets the level rather than subtracting. */
+    remaining?: number | null;
+    /** 「半分使った」 — the share used, 0 < f <= 1. */
+    fraction?: number | null;
+  },
   source: TransactionSource = 'manual',
 ): Promise<MutationResult> {
   const previous = await getInventoryItem(ctx, input.itemId);
@@ -360,6 +369,8 @@ export async function consumeInventoryItem(
     amount: input.amount,
     unit: input.unit,
     consumeAll: input.consumeAll,
+    remaining: input.remaining,
+    fraction: input.fraction,
   });
 
   return commitOutcome(ctx, previous, outcome, source);

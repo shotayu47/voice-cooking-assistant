@@ -14,7 +14,10 @@ export function getOpenAI(): OpenAI {
   if (!apiKey) {
     throw new Error('OPENAI_API_KEY is not configured');
   }
-  return new OpenAI({ apiKey, timeout: 45_000, maxRetries: 1 });
+  // Two retries rather than one: a tool loop makes several calls in quick
+  // succession and can trip the per-minute token limit, which the API asks us
+  // to retry after a few hundred milliseconds.
+  return new OpenAI({ apiKey, timeout: 45_000, maxRetries: 2 });
 }
 
 // `OPENAI_MODEL=` (empty) in .env.local must fall back too, hence || not ??.

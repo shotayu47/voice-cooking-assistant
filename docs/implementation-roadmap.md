@@ -18,12 +18,28 @@
 |---|---|
 | GitHub | `shotayu47/voice-cooking-assistant` |
 | 本番ブランチ | `main` |
-| Vercel 連携 | ユーザー申告で**連携済み** |
-| Production URL | **未記録** — 判明したらここに追記すること |
+| Vercel 連携 | ✅ **確認済み** — push ごとに GitHub Deployment が作られ success |
+| iPhone で開く URL | `https://voice-cooking-assistant-focb.vercel.app`（200 で配信を実測） |
 
-Vercel の接続はリポジトリからは判別できません（`.vercel` は `vercel link` を
-実行した環境にしか作られない）。Production URL が分かり次第ここに書き、
-監視タスクが実際に HTTP で叩けるようにしてください。**URL を推測しないこと。**
+確認方法（推測禁止・実測のみ）: GitHub Deployments API。Vercel は push ごとに
+GitHub Deployment を作るので、そこに実際の deployment URL と state が載る。
+
+```bash
+curl -s https://api.github.com/repos/shotayu47/voice-cooking-assistant/deployments
+```
+
+### ⚠️ Vercel プロジェクトが2つある
+
+同じリポジトリから**2つの Vercel プロジェクトが二重にデプロイ**している。
+
+| プロジェクト | 最新コミット | 公開URL |
+|---|---|---|
+| `voice-cooking-assistant` | 最新に追従 | 302（認証壁）・`voice-cooking-assistant.vercel.app` は404 |
+| `voice-cooking-assistant-focb` | やや遅れることがある | **200 で公開中**（これが実際に開ける方） |
+
+弊害: push ごとにビルドが2回走る／どちらが本番か曖昧／最新コードを持つ方が
+公開されていない。**Vercel ダッシュボードで片方を削除**するか、最新に追従する
+方にドメインエイリアスを付けるのが望ましい（ユーザー操作が必要）。
 
 必要な環境変数（Vercel 側にも同じものを設定。値はここに書かない）:
 
@@ -43,7 +59,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | # | 機能 | 状態 | Commit | Push | Migration | 適用 |
 |---|---|---|---|---|---|---|
 | 1 | 消費期限・賞味期限管理 | **COMPLETE** | `24f5980` | yes | `0003_expiry_tracking.sql` | ✅ 適用済み |
-| 2 | 在庫残量の自然言語更新 | NOT_STARTED | — | — | — | — |
+| 2 | 在庫残量の自然言語更新 | **COMPLETE** | `TBD2` | yes | なし | — |
 | 3 | 「今あるもので何作れる？」強化 | NOT_STARTED | — | — | — | — |
 | 4 | 食材・調味料の代替提案 | NOT_STARTED | — | — | — | — |
 | 5 | 調理セッション・工程状態管理 | NOT_STARTED | — | — | — | — |
@@ -137,18 +153,46 @@ npm run test:live   # backfill も含まれる
 
 ---
 
-## 次に実装する PHASE
+## PHASE 2 — 在庫残量の自然言語更新
 
-**PHASE 2 — 在庫残量の自然言語更新**
+**Status: COMPLETE**
 
-再開手順:
-1. `src/lib/inventory/quantity.ts` を読む（`applyConsumption` が中心）
-2. 不足している解釈を追加:
-   - 「卵あと2個」= 残量の絶対指定 → 減算ではなく set
-   - 「キャベツ半分使った」= 割合指定 → `quantity * 0.5` を消費
-3. `src/lib/ai/tools.ts` の `consume_inventory_item` に `remaining` / `fraction` を追加
-4. 既存の音声経路（`/api/realtime/tool`）に統合。**新しい AI 系統を作らない**
-5. 曖昧な場合は既存の `needs_clarification` を返す
+既存の `consume_inventory_item` / `find_inventory_item` / Realtime tool calling /
+冪等台帳 / 監査ログをそのまま再利用し、**新しい AI 経路は作っていない**。
+既存の `applyConsumption` に2つの言い方を足しただけ。
+
+### 追加した解釈
+
+| 言い方 | パラメータ | 動作 |
+|---|---|---|
+| 「あと2個」「残り300g」 | `remaining` | 減算ではなく**残量を設定**。上方修正も許可（冷蔵庫を見ているのはユーザー） |
+| 「半分使った」「3分の1使った」 | `fraction` | 現在量の割合を消費。数量不明なら**数字をでっち上げず**あいまい状態を下げる |
+
+優先順位: `consume_all` > `remaining` > `fraction` > `amount`。
+単位不一致は全経路で `needs_clarification`（200ml を 個 から引かせない）。
+
+### 実データ検証（済み）
+
+- 「卵あと2個」→ 3個 → **2個**（`set_quantity`、delta -1）
+- 「キャベツ半分使った」→ 1玉 → **0.5玉**（`decrease`、delta -0.5）
+- 回帰: 「醤油使った」（量不明）は従来どおり拒否し在庫を変更しない
+- 監査ログに `set_quantity` / `decrease` が `ai_text` で記録される
+
+### 実テストで見つけて直したバグ
+
+OpenAI の **429（TPM 制限）** でターンが 500 になる際、**ツールは既に実行済み**
+＝在庫は減っているのに、ユーザーには一般的なエラーしか出ていなかった。
+そのまま再送すると**二重に減算**される。
+
+修正: 補完呼び出しが失敗しても、既にツールが走っていれば例外を投げず、
+「在庫の変更は反映されました。同じ操作を繰り返すと二重になります」と
+事実を返すようにした。あわせて `maxRetries` を 2 に引き上げ（ツールループは
+短時間に複数回呼ぶため TPM に当たりやすい）。
+
+### テスト
+
+`quantity.test.ts` に14件追加（残量指定・割合指定・優先順位・境界・単位不一致）。
+合計 136件。
 
 ---
 
@@ -182,9 +226,28 @@ PC をスリープさせず Claude アプリを開いたままにしておけば
 
 ## 未解決事項
 
-- Vercel の Production URL が未記録。判明したら「デプロイ構成」に追記し、
-  監視タスクが実際に HTTP で疎通確認できるようにすること
+- Vercel プロジェクトが2つあり二重ビルドしている。最新を持つ方が非公開、
+  公開されている方が遅れることがある。ダッシュボードで整理が必要（ユーザー操作）
 - ブラウザペインは `visibilityState: hidden` で `requestAnimationFrame` が
   発火しないため、Suspense の再表示と prefetch が検証できない。実機確認が必要。
 - 曖昧な食材指定（「鶏肉」で鶏もも肉と鶏むね肉がある）の最終防御は AI の
   自己申告に依存。監査ログで検出・修正可能。
+
+---
+
+## 次に実装する PHASE
+
+**PHASE 3 — 「今あるもので何作れる？」強化**
+
+再開手順:
+1. `src/lib/ai/tools.ts` の `search_meal_candidates` を読む（現在は在庫を返すだけ）
+2. 料理候補を次の分類で返せるようにする:
+   - 今あるものだけで作れる
+   - 調味料だけ追加すれば作れる
+   - あと1品あれば作れる
+   - あと2〜3品買えば作れる
+   - 期限が近い食材を優先して消費できる
+3. 「冷蔵庫整理」モードを追加（`days_left` が小さい食材と余り物を優先）
+4. AI へ渡す在庫は**必要な情報だけ**に絞る（`publicItem` は既に整理済み）
+5. 構造化出力（Zod で validate）してから UI に渡す
+6. 新規テーブルは不要な想定。DB 変更なしで実装できるか先に検討すること

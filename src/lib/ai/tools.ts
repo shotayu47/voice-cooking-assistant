@@ -149,7 +149,13 @@ export const TOOL_DEFINITIONS: ChatCompletionTool[] = [
     function: {
       name: 'consume_inventory_item',
       description:
-        '食材を使った分だけ在庫を減らす。「使い切った」なら consume_all: true。使用量が不明な場合は amount を null にする（勝手な数量を作らないこと）。spoken_name にはユーザーが実際に言った食材名をそのまま入れること（サーバーが対象の取り違えを検証します）。',
+        `在庫の残量を更新する。ユーザーの言い方に応じて4つの指定方法から1つだけ選ぶこと。
+・「全部使った」「使い切った」→ consume_all: true
+・「2個使った」「300g使った」→ amount に使用量
+・「あと2個」「残り300g」→ remaining に残っている量（減算ではなく残量そのもの）
+・「半分使った」「3分の1使った」→ fraction に使った割合（半分なら0.5）
+使用量も残量も割合も分からない場合は、すべて null にすること（勝手な数量を作らない）。
+spoken_name にはユーザーが実際に言った食材名をそのまま入れること（サーバーが対象の取り違えを検証します）。`,
       parameters: {
         type: 'object',
         properties: {
@@ -158,11 +164,27 @@ export const TOOL_DEFINITIONS: ChatCompletionTool[] = [
             type: 'string',
             description: 'ユーザーが言った食材名そのまま（例:「鶏肉」）。言い換えないこと。',
           },
-          amount: { type: ['number', 'null'], description: '使用量。不明なら null' },
+          amount: { type: ['number', 'null'], description: '使った量。不明なら null' },
+          remaining: {
+            type: ['number', 'null'],
+            description: '「あと2個」のように残量を言われた場合の残量。それ以外は null',
+          },
+          fraction: {
+            type: ['number', 'null'],
+            description: '「半分使った」なら0.5、「3分の1使った」なら0.33。それ以外は null',
+          },
           unit: { type: ['string', 'null'] },
           consume_all: { type: 'boolean', description: '全部使い切った場合 true' },
         },
-        required: ['item_id', 'spoken_name', 'amount', 'unit', 'consume_all'],
+        required: [
+          'item_id',
+          'spoken_name',
+          'amount',
+          'remaining',
+          'fraction',
+          'unit',
+          'consume_all',
+        ],
         additionalProperties: false,
       },
     },
@@ -526,6 +548,8 @@ async function dispatch(
         {
           itemId: String(args.item_id),
           amount: (args.amount as number | null) ?? null,
+          remaining: (args.remaining as number | null) ?? null,
+          fraction: (args.fraction as number | null) ?? null,
           unit: (args.unit as string | null) ?? null,
           consumeAll: Boolean(args.consume_all),
         },

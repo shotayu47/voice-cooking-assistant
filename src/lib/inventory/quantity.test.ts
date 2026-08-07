@@ -78,6 +78,123 @@ describe('quantity reduction', () => {
   });
 });
 
+// PHASE 2 — the two phrasings people actually use.
+describe('remaining ("卵あと2個")', () => {
+  it('sets the level instead of subtracting', () => {
+    const result = applyConsumption(
+      snapshot({ quantity: 6, unit: '個' }),
+      { remaining: 2, unit: '個' },
+    );
+
+    expect(result).toMatchObject({
+      status: 'applied',
+      action: 'set_quantity',
+      quantity: 2,
+      quantityDelta: -4,
+    });
+  });
+
+  it('accepts a correction upward — they can see the fridge and we cannot', () => {
+    const result = applyConsumption(snapshot({ quantity: 2 }), { remaining: 5 });
+    expect(result).toMatchObject({ quantity: 5, quantityDelta: 3 });
+  });
+
+  it('treats「あと0個」as empty', () => {
+    const result = applyConsumption(snapshot({ quantity: 3 }), { remaining: 0 });
+    expect(result).toMatchObject({ quantity: 0, quantity_state: 'empty' });
+  });
+
+  it('records the level even when the previous quantity was unknown', () => {
+    const result = applyConsumption(snapshot({ quantity: null }), { remaining: 2 });
+    expect(result).toMatchObject({ quantity: 2, quantityDelta: null });
+  });
+
+  it('rejects a negative remaining', () => {
+    expect(applyConsumption(snapshot({ quantity: 3 }), { remaining: -1 }).status).toBe(
+      'needs_clarification',
+    );
+  });
+
+  it('still refuses a mismatched unit', () => {
+    const result = applyConsumption(
+      snapshot({ quantity: 500, unit: 'g' }),
+      { remaining: 2, unit: '個' },
+    );
+    expect(result.status).toBe('needs_clarification');
+  });
+});
+
+describe('fraction ("キャベツ半分使った")', () => {
+  it('consumes the given share of what is there', () => {
+    const result = applyConsumption(snapshot({ quantity: 1, unit: '玉' }), { fraction: 0.5 });
+    expect(result).toMatchObject({
+      status: 'applied',
+      action: 'decrease',
+      quantity: 0.5,
+      quantityDelta: -0.5,
+    });
+  });
+
+  it('handles a third', () => {
+    const result = applyConsumption(snapshot({ quantity: 300, unit: 'g' }), { fraction: 1 / 3 });
+    expect(result.status === 'applied' && result.quantity).toBe(200);
+  });
+
+  it('empties the item when the whole lot was used', () => {
+    const result = applyConsumption(snapshot({ quantity: 2 }), { fraction: 1 });
+    expect(result).toMatchObject({ quantity: 0, quantity_state: 'empty' });
+  });
+
+  it('moves the fuzzy state rather than inventing a number when the quantity is unknown', () => {
+    const result = applyConsumption(
+      snapshot({ quantity: null, quantity_state: 'plenty' }),
+      { fraction: 0.5 },
+    );
+
+    expect(result).toMatchObject({
+      status: 'applied',
+      action: 'set_state',
+      quantity: null,
+      quantity_state: 'available',
+    });
+  });
+
+  it('rejects a share outside 0–1', () => {
+    expect(applyConsumption(snapshot({ quantity: 4 }), { fraction: 0 }).status).toBe(
+      'needs_clarification',
+    );
+    expect(applyConsumption(snapshot({ quantity: 4 }), { fraction: 1.5 }).status).toBe(
+      'needs_clarification',
+    );
+  });
+});
+
+describe('precedence between the phrasings', () => {
+  it('consume_all wins over everything', () => {
+    const result = applyConsumption(snapshot({ quantity: 8 }), {
+      consumeAll: true,
+      remaining: 5,
+      fraction: 0.5,
+      amount: 2,
+    });
+    expect(result).toMatchObject({ quantity: 0, action: 'consume_all' });
+  });
+
+  it('remaining wins over fraction and amount', () => {
+    const result = applyConsumption(snapshot({ quantity: 8 }), {
+      remaining: 5,
+      fraction: 0.5,
+      amount: 2,
+    });
+    expect(result).toMatchObject({ quantity: 5, action: 'set_quantity' });
+  });
+
+  it('fraction wins over amount', () => {
+    const result = applyConsumption(snapshot({ quantity: 8 }), { fraction: 0.5, amount: 2 });
+    expect(result).toMatchObject({ quantity: 4 });
+  });
+});
+
 describe('consume-all', () => {
   it('empties an item with a tracked quantity', () => {
     const result = applyConsumption(
