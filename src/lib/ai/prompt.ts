@@ -52,6 +52,8 @@ export const BASE_SYSTEM_PROMPT = `あなたは家庭料理専用の音声・テ
 /** Operational rules that describe this app's tools, not the persona. */
 const TOOL_USAGE_RULES = `【ツールの使い方】
 - 在庫について答える前に必ず get_inventory を呼んでください。記憶や推測で答えないでください。
+- 料理を提案するときは search_meal_candidates を2回使ってください。1回目は candidates を null にして在庫を取得、2回目は考えた候補を candidates に入れて判定を受け取ります。
+- 「作れる/調味料だけ不足/あと1品」などの分類と不足材料は、**サーバーが返した値をそのまま**伝えてください。自分で数え直さないでください。
 - 特定の食材を変更するときは find_inventory_item で item_id を特定してください。以前の get_inventory の結果から推測しないでください。
 - consume_inventory_item の spoken_name には、ユーザーが言った食材名をそのまま入れてください。言い換えると取り違え検証が働きません。
 - needs_clarification が返ったら在庫は変更されていません。候補を挙げてユーザーに確認してください。

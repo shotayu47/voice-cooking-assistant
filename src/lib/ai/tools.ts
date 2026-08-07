@@ -33,6 +33,7 @@ import {
   STAPLE_SEASONINGS,
   surplusItems,
 } from '@/lib/meals/classification';
+import { evaluateCandidates, MISSING_REASON_LABELS } from '@/lib/meals/evaluate';
 import type { InventoryItem } from '@/types/domain';
 
 /**
@@ -200,7 +201,12 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
     function: {
       name: 'search_meal_candidates',
       description:
-        '献立を考えるための材料コンテキスト（利用可能な在庫・期限が近い食材・余っている食材・不足している基礎調味料・候補の分類基準）を取得する。この結果の classification_guide に従って、候補ごとに分類ラベルを必ず1つ付けること。3〜5件組み立てること。',
+        `献立を考えるためのツール。2段階で使う。
+1回目: candidates を null にして呼ぶ → 在庫・期限が近い食材・余っている食材が返る。
+2回目: それを見て考えた候補3〜5件を candidates に入れて呼ぶ → サーバーが実際の在庫と
+照合し、分類（作れる/調味料だけ不足/あと1品…）と不足材料を確定して返す。
+**分類と不足材料は必ず2回目の結果をそのまま伝えること。自分で数え直さないこと。**
+サーバーの判定と自分の見立てが違う場合は、サーバーの判定が正しい。`,
       parameters: {
         type: 'object',
         properties: {
@@ -214,8 +220,38 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
             description:
               'ユーザーが「冷蔵庫整理」「余ってるもの使いたい」のように言った場合のみ fridge_cleanup を指定する。それ以外は null。',
           },
+          candidates: {
+            type: ['array', 'null'],
+            description:
+              '判定してほしい料理候補。1回目の呼び出しでは null。2回目に3〜5件入れる。',
+            items: {
+              type: 'object',
+              properties: {
+                title: { type: 'string', description: '料理名' },
+                required_ingredients: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'これが無いと作れない材料。調味料も含めてすべて挙げること。',
+                },
+                optional_ingredients: {
+                  type: ['array', 'null'],
+                  items: { type: 'string' },
+                  description: 'あれば良い程度の材料。不足として数えない。',
+                },
+              },
+              required: ['title', 'required_ingredients', 'optional_ingredients'],
+              additionalProperties: false,
+            },
+          },
         },
-        required: ['max_minutes', 'meal_type', 'style', 'difficulty', 'mode'],
+        required: [
+          'max_minutes',
+          'meal_type',
+          'style',
+          'difficulty',
+          'mode',
+          'candidates',
+        ],
         additionalProperties: false,
       },
     },
@@ -382,6 +418,15 @@ export function realtimeToolDefinitions() {
       : [],
   );
 }
+
+/** Shape the model must submit for a candidate. Validated before use. */
+const candidateSubmissionSchema = z.array(
+  z.object({
+    title: z.string().trim().min(1).max(100),
+    required_ingredients: z.array(z.string().trim().min(1).max(100)).max(30),
+    optional_ingredients: z.array(z.string().trim().min(1).max(100)).max(30).nullable().optional(),
+  }),
+).max(10);
 
 export type ToolOutcome = {
   result: unknown;
@@ -595,6 +640,56 @@ async function dispatch(
       ]);
       const usable = items.filter(isAvailable);
 
+      // Second call: the model has proposed dishes. Whether each is actually
+      // makeable is a fact about the fridge, so it is decided here — the
+      // model's own count is not consulted.
+      const submitted = Array.isArray(args.candidates) ? args.candidates : null;
+      if (submitted && submitted.length > 0) {
+        const parsed = candidateSubmissionSchema.safeParse(submitted);
+        if (!parsed.success) {
+          return {
+            result: {
+              error: 'invalid_candidates',
+              message: '候補の形式が不正です。title と required_ingredients を入れてください。',
+            },
+          };
+        }
+
+        const verdicts = evaluateCandidates(
+          parsed.data.map((candidate) => ({
+            title: candidate.title,
+            requiredIngredients: candidate.required_ingredients,
+            optionalIngredients: candidate.optional_ingredients ?? undefined,
+          })),
+          items,
+          { expiring: expiring.map(({ item }) => item), mode },
+        );
+
+        return {
+          result: {
+            mode,
+            evaluated_candidates: verdicts.map((verdict) => ({
+              title: verdict.title,
+              bucket: verdict.bucket,
+              bucket_label: verdict.bucketLabel,
+              missing: verdict.missing.map((entry) => ({
+                name: entry.name,
+                reason: entry.reason,
+                reason_label: MISSING_REASON_LABELS[entry.reason],
+                is_staple: entry.isStaple,
+              })),
+              on_hand: verdict.onHand,
+              uses_expiring: verdict.usesExpiring,
+              expiring_used: verdict.expiringUsed,
+            })),
+            note:
+              'この分類と不足材料はサーバーが実在庫と照合して確定したものです。' +
+              'そのまま伝えてください。数え直したり、別の分類を付けたりしないでください。' +
+              'not_feasible の候補は提案しないでください。並び順は提案順の推奨です。',
+          },
+        };
+      }
+
       const rankingGuidance =
         mode === 'fridge_cleanup'
           ? [
@@ -630,10 +725,9 @@ async function dispatch(
             buckets: MEAL_CANDIDATE_BUCKET_LABELS,
             staple_seasonings: STAPLE_SEASONINGS,
             instructions:
-              '候補ごとに、不足している必須材料の名前を数えること。missing_staples に載っている基礎調味料はカウントに含めない。' +
-              '残りの不足数が0なら fully_stocked、不足がすべて基礎調味料だけなら staples_only、非調味料の不足が1つなら one_missing、' +
-              '2〜3つなら few_missing、4つ以上なら not_feasible として、buckets のラベルをユーザーに明示すること。' +
-              'not_feasible の候補は提案しない。expiring_soon の食材を使う候補には、期限が近い食材を消費できる旨も添えること。',
+              'この一覧をもとに候補を3〜5件考え、search_meal_candidates を candidates 付きで' +
+              'もう一度呼んでください。分類と不足材料はサーバーが確定して返します。' +
+              '自分で分類せず、返ってきた bucket_label と missing をそのまま伝えてください。',
           },
           ranking_guidance: rankingGuidance,
           note: 'この一覧に無い食材は在庫にありません。あると仮定しないでください。',
