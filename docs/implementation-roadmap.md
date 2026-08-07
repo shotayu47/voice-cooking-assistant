@@ -18,13 +18,14 @@
 |---|---|
 | GitHub | `shotayu47/voice-cooking-assistant` |
 | 本番ブランチ | `main` |
-| Vercel 連携 | **未確認**（リポジトリに `vercel.json` / `.github/workflows` なし） |
+| Vercel 連携 | ユーザー申告で**連携済み** |
+| Production URL | **未記録** — 判明したらここに追記すること |
 
-⚠️ Vercel が `main` に接続されているかはリポジトリ側からは判別できません。
-接続済みなら push で自動デプロイされます。未接続の場合は Vercel で
-リポジトリを import し、環境変数（下記）を設定してください。
+Vercel の接続はリポジトリからは判別できません（`.vercel` は `vercel link` を
+実行した環境にしか作られない）。Production URL が分かり次第ここに書き、
+監視タスクが実際に HTTP で叩けるようにしてください。**URL を推測しないこと。**
 
-必要な環境変数（値は設定画面で入力。ここには書かない）:
+必要な環境変数（Vercel 側にも同じものを設定。値はここに書かない）:
 
 ```
 NEXT_PUBLIC_SUPABASE_URL
@@ -41,7 +42,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 
 | # | 機能 | 状態 | Commit | Push | Migration | 適用 |
 |---|---|---|---|---|---|---|
-| 1 | 消費期限・賞味期限管理 | **COMPLETE** | `24f5980` | yes | `0003_expiry_tracking.sql` | ⚠️ **要手動実行** |
+| 1 | 消費期限・賞味期限管理 | **COMPLETE** | `24f5980` | yes | `0003_expiry_tracking.sql` | ✅ 適用済み |
 | 2 | 在庫残量の自然言語更新 | NOT_STARTED | — | — | — | — |
 | 3 | 「今あるもので何作れる？」強化 | NOT_STARTED | — | — | — | — |
 | 4 | 食材・調味料の代替提案 | NOT_STARTED | — | — | — | — |
@@ -112,13 +113,27 @@ PHASE 2 と 5 は**既存実装でほぼ達成済み**です。着手時は作�
 `src/lib/inventory/freshness.test.ts` — 19件（推定・別名解決・開封後短縮・
 期限種別・不明食材で null・推定ラベル・日付演算）
 
-### 手動対応が必要
+### migration
 
-⚠️ **Supabase SQL Editor で `supabase/migrations/0003_expiry_tracking.sql` を実行**
+✅ `0003_expiry_tracking.sql` は Supabase に**適用済み**（カラム4種・CHECK制約とも実測確認）。
 
-未実行の場合の挙動: アプリは**壊れないが**期限推定が保存されず、
-「早めに使う食材」が既存の手入力分しか出ない（`select *` を使っているため
-カラム欠如でクエリは失敗しない）。実行後に反映される。
+既存行のバックフィルも実施済み（`src/lib/inventory/backfill-expiry.check.ts`）。
+推定ロジックはアプリと同じものを使うので、賞味期限テーブルの真実は1箇所のまま。
+再実行しても安全（日付が入っている行には触れない）。
+
+```bash
+npm run test:live   # backfill も含まれる
+```
+
+### 実データでの動作確認（済み）
+
+- `add_inventory_item` で 鶏もも肉（冷蔵）を登録 →
+  `expiry_date: 2026-08-09 / days_left: 2 / expiry_kind: use_by / estimated: true`
+- ホーム画面が「早めに使う食材」に**推定あと2日**と注意書きを表示
+- AI に「期限が近いものから使いたい」→ 期限順に並べ、消費期限/賞味期限を区別し、
+  推定を「推定」と明示、期限情報の無い食材はそう答えた
+- 醤油は開封済みのため 365日ではなく**開封後60日**で推定された
+- 片栗粉は推定根拠が無いため**推定していない**（でっち上げない設計どおり）
 
 ---
 
@@ -137,9 +152,38 @@ PHASE 2 と 5 は**既存実装でほぼ達成済み**です。着手時は作�
 
 ---
 
+## 自動実行タスク
+
+Claude デスクトップアプリの Scheduled Tasks に2件登録済み。どちらも 0/5/10/15/20時。
+
+| タスク | 用途 | 書き込み |
+|---|---|---|
+| `check-cooking-assistant-deployment` | 監視のみ（git / build / Vercel / migration / roadmap） | しない |
+| `continue-cooking-assistant-development` | 次の未完了 PHASE を1つ実装 → 品質ゲート → commit → push | する |
+
+### ⚠️ 重要な制約：クラウドだけでは動かない
+
+Scheduled Tasks は **Claude アプリが起動している間にのみ実行**されます。
+実行時刻にアプリが閉じていた場合は、**次回アプリ起動時**に実行されます。
+
+つまり「PC を閉じたままクラウド側だけで実装が進む」ことは**ありません**。
+PC をスリープさせず Claude アプリを開いたままにしておけば、使用制限の解除後に
+自動で次の PHASE へ進みます。
+
+`continue-cooking-assistant-development` の絶対条件（タスク prompt に明記済み）:
+
+- `.env*` や鍵を commit しない（staged diff を毎回シークレットスキャン）
+- typecheck / lint / test / build のいずれかが落ちたら **main へ push しない**
+  （代わりに `wip/phase-N-*` ブランチへ退避し、roadmap を IN_PROGRESS にする）
+- 未完了 PHASE を COMPLETE 扱いしない
+- migration 未適用なら実装を止めて報告する
+- 1回の実行で **最大1 PHASE**
+- dev サーバーは必ずバックグラウンド起動 + PID 保持 + 明示的に kill
+
 ## 未解決事項
 
-- Vercel 連携の有無が未確認（上記「デプロイ構成」参照）
+- Vercel の Production URL が未記録。判明したら「デプロイ構成」に追記し、
+  監視タスクが実際に HTTP で疎通確認できるようにすること
 - ブラウザペインは `visibilityState: hidden` で `requestAnimationFrame` が
   発火しないため、Suspense の再表示と prefetch が検証できない。実機確認が必要。
 - 曖昧な食材指定（「鶏肉」で鶏もも肉と鶏むね肉がある）の最終防御は AI の
