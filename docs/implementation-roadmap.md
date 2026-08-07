@@ -60,7 +60,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 |---|---|---|---|---|---|---|
 | 1 | 消費期限・賞味期限管理 | **COMPLETE** | `24f5980` | yes | `0003_expiry_tracking.sql` | ✅ 適用済み |
 | 2 | 在庫残量の自然言語更新 | **COMPLETE** | `d9da9ce` | yes | なし | — |
-| 3 | 「今あるもので何作れる？」強化 | **COMPLETE** | (次コミット) | yes | なし | — |
+| 3 | 「今あるもので何作れる？」強化 | **COMPLETE** | `df12d6b` | yes | なし | — |
 | 4 | 食材・調味料の代替提案 | NOT_STARTED | — | — | — | — |
 | 5 | 調理セッション・工程状態管理 | NOT_STARTED | — | — | — | — |
 | 6 | 複数タイマー | NOT_STARTED | — | — | — | — |
