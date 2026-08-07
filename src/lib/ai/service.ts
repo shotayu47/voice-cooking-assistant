@@ -5,11 +5,13 @@ import type {
   ChatCompletionMessageToolCall,
 } from 'openai/resources/chat/completions';
 
-import { ServiceError, type ServiceContext } from '@/lib/inventory/service';
+import { listInventory, ServiceError, type ServiceContext } from '@/lib/inventory/service';
+import { isAvailable } from '@/lib/inventory/quantity';
+import { freshnessOf } from '@/lib/inventory/freshness';
 import { getOpenSession, getSession } from '@/lib/cooking/service';
 import type { CookingSession, Profile } from '@/types/domain';
 import { CHAT_MODEL, getOpenAI } from './openai';
-import { buildSystemPrompt } from './prompt';
+import { buildSystemPrompt, type InventorySnapshotItem } from './prompt';
 import { TOOL_DEFINITIONS, executeTool } from './tools';
 
 /** Hard ceiling on tool round-trips per user message. */
@@ -72,7 +74,7 @@ export async function loadMessages(
   if (error) throw new ServiceError(error.message);
 
   const rows = ((data ?? []) as StoredMessage[]).reverse();
-  return dropOrphanedToolMessages(rows);
+  return redactStaleReads(dropOrphanedToolMessages(rows));
 }
 
 /**
@@ -110,6 +112,49 @@ function dropOrphanedToolMessages(rows: StoredMessage[]): StoredMessage[] {
   }
 
   return kept;
+}
+
+/**
+ * Tools whose result describes the inventory at one moment. Replaying an old
+ * one asserts something that may since have become false — and it did: after
+ * 砂糖 was added, the model kept reporting it missing because a `not_found`
+ * from two turns earlier was still in the transcript, outweighing both the
+ * system prompt and the real database.
+ *
+ * Mutation results and ids (create_recipe, start_cooking_session, …) stay:
+ * those are records of what happened, which does not expire.
+ */
+const STALE_ON_REPLAY = new Set([
+  'get_inventory',
+  'find_inventory_item',
+  'search_meal_candidates',
+]);
+
+const STALE_NOTE = JSON.stringify({
+  note: 'この結果は過去の時点のものです。現在の在庫はシステムプロンプトの一覧が正です。必要ならツールで取り直してください。',
+});
+
+/**
+ * Blank out inventory readings from earlier turns, keeping the message
+ * structure intact so the tool-call protocol stays valid.
+ */
+export function redactStaleReads(rows: StoredMessage[]): StoredMessage[] {
+  const staleCallIds = new Set<string>();
+
+  for (const row of rows) {
+    if (row.role !== 'assistant' || !row.tool_calls) continue;
+    for (const call of row.tool_calls) {
+      if (call.type === 'function' && STALE_ON_REPLAY.has(call.function.name)) {
+        staleCallIds.add(call.id);
+      }
+    }
+  }
+
+  return rows.map((row) =>
+    row.role === 'tool' && row.tool_call_id && staleCallIds.has(row.tool_call_id)
+      ? { ...row, content: STALE_NOTE }
+      : row,
+  );
 }
 
 function toChatMessage(row: StoredMessage): ChatCompletionMessageParam {
@@ -187,6 +232,10 @@ export async function runTurn(
       profile: await loadProfile(ctx),
       session,
       today: new Date().toISOString().slice(0, 10),
+      mode: 'text',
+      // Rebuilt every turn, so this is always current — which stops the model
+      // answering "do you have sugar?" from a tool result two turns old.
+      inventory: await loadInventorySnapshot(ctx),
     }) },
     ...(await loadMessages(ctx, input.conversationId)).map(toChatMessage),
   ];
@@ -336,6 +385,20 @@ const MUTATING_TOOLS = new Set([
 
 function isMutation(name: string): boolean {
   return MUTATING_TOOLS.has(name);
+}
+
+/** Compact inventory for the system prompt: what they have, how much, urgency. */
+async function loadInventorySnapshot(
+  ctx: ServiceContext,
+): Promise<InventorySnapshotItem[]> {
+  const items = await listInventory(ctx, { includeEmpty: false });
+
+  return items.filter(isAvailable).map((item) => ({
+    name: item.name,
+    quantity: item.quantity,
+    unit: item.unit,
+    daysLeft: freshnessOf(item)?.daysLeft ?? null,
+  }));
 }
 
 async function loadProfile(

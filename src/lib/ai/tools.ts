@@ -72,13 +72,22 @@ export const TOOL_DEFINITIONS: ChatCompletionTool[] = [
     function: {
       name: 'find_inventory_item',
       description:
-        '食材名から在庫の item_id を1件に特定する。「玉ねぎ使い切った」のように特定の食材を変更する前は、get_inventory を全件走査せずこのツールを使うこと。表記ゆれ（鶏もも/鶏もも肉/チキン）も解決する。複数該当する場合は ambiguous を返すので、その時はユーザーに確認すること。',
+        `食材名から在庫を確認する。複数まとめて調べられる。表記ゆれ（鶏もも/鶏もも肉/チキン）も解決する。
+用途は2つ:
+・在庫を変更する前に item_id を特定する（「玉ねぎ使い切った」など）。複数該当なら ambiguous を返すのでユーザーに確認すること。
+・代替品を提案する前に、その代替品を実際に持っているか確認する。**在庫にない物を代替案として挙げないこと。**
+get_inventory を全件走査するより、こちらで名前を指定する方が確実。`,
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'ユーザーが言った食材名そのまま' },
+          names: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'ユーザーが言った食材名、または確認したい代替品の候補名。まとめて指定できる。',
+          },
         },
-        required: ['name'],
+        required: ['names'],
         additionalProperties: false,
       },
     },
@@ -515,24 +524,66 @@ async function dispatch(
     }
 
     case 'find_inventory_item': {
-      const resolution = await findInventoryItemByName(ctx, String(args.name ?? ''));
+      // Accepts a batch so a substitution answer can check every candidate in
+      // one call. `name` stays accepted for older single-name call sites.
+      const requested = Array.isArray(args.names)
+        ? args.names.map(String)
+        : args.name !== undefined
+          ? [String(args.name)]
+          : [];
 
-      if (resolution.status === 'matched') {
-        return { result: { status: 'matched', item: publicItem(resolution.item) } };
+      const names = requested.map((value) => value.trim()).filter(Boolean).slice(0, 10);
+      if (names.length === 0) {
+        return {
+          result: { error: 'invalid_arguments', message: '確認したい食材名を指定してください。' },
+        };
       }
-      if (resolution.status === 'ambiguous') {
+
+      const results = await Promise.all(
+        names.map(async (name) => {
+          const resolution = await findInventoryItemByName(ctx, name);
+
+          if (resolution.status === 'matched') {
+            return { name, status: 'matched' as const, item: publicItem(resolution.item) };
+          }
+          if (resolution.status === 'ambiguous') {
+            return {
+              name,
+              status: 'ambiguous' as const,
+              candidates: resolution.candidates.map(publicItem),
+            };
+          }
+          return { name, status: 'not_found' as const };
+        }),
+      );
+
+      // Single-name calls keep their original shape so nothing downstream has
+      // to special-case the batch.
+      if (results.length === 1 && !Array.isArray(args.names)) {
+        const only = results[0];
         return {
           result: {
-            status: 'ambiguous',
-            candidates: resolution.candidates.map(publicItem),
-            note: 'どれを指しているかユーザーに確認してください。勝手に選ばないでください。',
+            status: only.status,
+            ...(only.status === 'matched' ? { item: only.item } : {}),
+            ...(only.status === 'ambiguous'
+              ? {
+                  candidates: only.candidates,
+                  note: 'どれを指しているかユーザーに確認してください。勝手に選ばないでください。',
+                }
+              : {}),
+            ...(only.status === 'not_found'
+              ? { note: 'この名前の食材は在庫にありません。あると仮定しないでください。' }
+              : {}),
           },
         };
       }
+
       return {
         result: {
-          status: 'not_found',
-          note: 'この名前の食材は在庫にありません。あると仮定しないでください。',
+          results,
+          note:
+            'not_found の食材は在庫にありません。代替案として挙げないでください。' +
+            'ambiguous はどれを指すかユーザーに確認してください。',
         },
       };
     }

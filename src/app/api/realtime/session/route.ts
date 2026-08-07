@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 
 import { UnauthorizedError, getServiceContext } from '@/lib/supabase/server';
 import { getOpenSession } from '@/lib/cooking/service';
+import { listInventory } from '@/lib/inventory/service';
+import { isAvailable } from '@/lib/inventory/quantity';
+import { freshnessOf } from '@/lib/inventory/freshness';
 import { buildSystemPrompt } from '@/lib/ai/prompt';
 import { realtimeToolDefinitions } from '@/lib/ai/tools';
 import type { Profile } from '@/types/domain';
@@ -36,13 +39,14 @@ export async function POST() {
     return NextResponse.json({ error: 'openai_not_configured' }, { status: 500 });
   }
 
-  const [session, profileResult] = await Promise.all([
+  const [session, profileResult, items] = await Promise.all([
     getOpenSession(ctx),
     ctx.supabase
       .from('profiles')
       .select('preferred_heat_scale, cooking_skill_level')
       .eq('id', ctx.userId)
       .maybeSingle(),
+    listInventory(ctx, { includeEmpty: false }),
   ]);
 
   const instructions = buildSystemPrompt({
@@ -53,6 +57,14 @@ export async function POST() {
     session,
     today: new Date().toISOString().slice(0, 10),
     mode: 'voice',
+    // Fixed at mint time, so it is labelled a snapshot: a call can run for a
+    // while and the assistant must re-check before changing anything.
+    inventory: items.filter(isAvailable).map((item) => ({
+      name: item.name,
+      quantity: item.quantity,
+      unit: item.unit,
+      daysLeft: freshnessOf(item)?.daysLeft ?? null,
+    })),
   });
 
   const response = await fetch('https://api.openai.com/v1/realtime/client_secrets', {

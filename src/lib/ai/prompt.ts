@@ -39,6 +39,19 @@ export const BASE_SYSTEM_PROMPT = `あなたは家庭料理専用の音声・テ
 - 数量が不明なのに勝手な数字を設定しないでください。
 - 曖昧な場合は在庫を破壊的に変更しないでください。
 
+【代替食材】
+- 「みりんない」「砂糖ない」のように材料が無いと言われたら、一般的な代用品辞典ではなく、
+  いま作っている料理のその工程でどう置き換えるかを答えてください。
+- 代替案を出す前に find_inventory_item で候補をまとめて確認し、
+  **実際に在庫にあるものだけ**を提案してください。無いものを「あれば使えます」と勧めないでください。
+- 在庫に代替品が1つも無い場合は、そう伝えたうえで「無くても作れるか」「味がどう変わるか」を答えてください。
+- 代替案には次の4点を含めてください。
+  1. 何で代えるか（在庫にあるもの）
+  2. どれだけ使うか（元の分量に対する換算。例: みりん大さじ1 → 砂糖小さじ1＋酒大さじ1）
+  3. 味や仕上がりがどう変わるか
+  4. 加熱時間や手順を変える必要があるか
+- 砂糖と酒でみりんを代えるなど複数材料の組み合わせは、その全部が在庫にある場合のみ提案してください。
+
 【安全性】
 - 生肉、魚、卵、作り置き、常温放置などに食品安全上のリスクがある場合、安全側に判断してください。
 - 見た目だけで安全だと断定しないでください。
@@ -55,6 +68,7 @@ const TOOL_USAGE_RULES = `【ツールの使い方】
 - 料理を提案するときは search_meal_candidates を2回使ってください。1回目は candidates を null にして在庫を取得、2回目は考えた候補を candidates に入れて判定を受け取ります。
 - 「作れる/調味料だけ不足/あと1品」などの分類と不足材料は、**サーバーが返した値をそのまま**伝えてください。自分で数え直さないでください。
 - 特定の食材を変更するときは find_inventory_item で item_id を特定してください。以前の get_inventory の結果から推測しないでください。
+- 「〇〇がない」と言われたら、まず find_inventory_item で代替候補をまとめて確認してから答えてください。記憶や会話履歴の在庫情報で答えないでください。
 - consume_inventory_item の spoken_name には、ユーザーが言った食材名をそのまま入れてください。言い換えると取り違え検証が働きません。
 - needs_clarification が返ったら在庫は変更されていません。候補を挙げてユーザーに確認してください。
 - get_inventory の category は、献立を考えるとき以外は null にしてください。カテゴリ未設定の食材が結果から漏れます。
@@ -79,12 +93,61 @@ const VOICE_STYLE_RULES = `【音声応答スタイル】
 - 「もちろんです」「それでは説明しますね」のような前置きは使わないでください。
 - 聞き取れなかった場合は短く聞き返してください。`;
 
+/** Minimal facts about one item — enough to answer "do I have it?". */
+export type InventorySnapshotItem = {
+  name: string;
+  quantity: number | null;
+  unit: string | null;
+  daysLeft: number | null;
+};
+
+/**
+ * The current inventory, rendered into the system prompt.
+ *
+ * Without this the model answers "do you have sugar?" from whatever it saw
+ * earlier in the conversation. That goes stale the moment anything is added,
+ * and it did: after 砂糖 was registered, the model still reported it missing
+ * because a tool result from two turns earlier said so. The system prompt is
+ * rebuilt every turn, so putting the list here means the freshest facts are
+ * always the most prominent ones.
+ */
+function renderInventory(items: InventorySnapshotItem[], stale: boolean): string {
+  if (items.length === 0) {
+    return `【現在の在庫】
+登録されている食材はありません。`;
+  }
+
+  const lines = items.map((item) => {
+    const amount =
+      item.quantity !== null ? ` ${item.quantity}${item.unit ?? ''}` : '';
+    const expiry =
+      item.daysLeft === null
+        ? ''
+        : item.daysLeft < 0
+          ? '（期限切れ）'
+          : item.daysLeft <= 3
+            ? `（あと${item.daysLeft}日）`
+            : '';
+    return `- ${item.name}${amount}${expiry}`;
+  });
+
+  return [
+    '【現在の在庫】',
+    ...lines,
+    stale
+      ? 'これは接続時点のスナップショットです。在庫を変更する前に必ずツールで最新を確認してください。'
+      : 'これが最新です。会話の途中で得た古い在庫情報より、この一覧を優先してください。ここに無い食材は持っていません。',
+  ].join('\n');
+}
+
 export function buildSystemPrompt(options: {
   profile: Pick<Profile, 'preferred_heat_scale' | 'cooking_skill_level'> | null;
   session: CookingSession | null;
   today: string;
   /** Voice mode appends the SPEC §21.4 brevity rules. */
   mode?: 'text' | 'voice';
+  /** Current inventory. Voice mints once, so its copy is marked as a snapshot. */
+  inventory?: InventorySnapshotItem[];
 }): string {
   const parts = [BASE_SYSTEM_PROMPT, TOOL_USAGE_RULES];
 
@@ -99,6 +162,10 @@ export function buildSystemPrompt(options: {
   parts.push(`【現在の状況】
 今日の日付: ${options.today}
 調理レベル: ${options.profile?.cooking_skill_level ?? 'beginner'}`);
+
+  if (options.inventory) {
+    parts.push(renderInventory(options.inventory, options.mode === 'voice'));
+  }
 
   if (options.session) {
     const recipe = options.session.recipe_snapshot;
