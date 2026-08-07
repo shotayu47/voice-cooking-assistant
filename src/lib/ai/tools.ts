@@ -27,6 +27,12 @@ import {
 } from '@/lib/cooking/service';
 import { isAvailable } from '@/lib/inventory/quantity';
 import { freshnessOf } from '@/lib/inventory/freshness';
+import {
+  MEAL_CANDIDATE_BUCKET_LABELS,
+  missingStaples,
+  STAPLE_SEASONINGS,
+  surplusItems,
+} from '@/lib/meals/classification';
 import type { InventoryItem } from '@/types/domain';
 
 /**
@@ -194,7 +200,7 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
     function: {
       name: 'search_meal_candidates',
       description:
-        '献立を考えるための材料コンテキスト（利用可能な在庫・期限が近い食材・不足しがちな基礎調味料）を取得する。この結果をもとに候補を3〜5件組み立てること。',
+        '献立を考えるための材料コンテキスト（利用可能な在庫・期限が近い食材・余っている食材・不足している基礎調味料・候補の分類基準）を取得する。この結果の classification_guide に従って、候補ごとに分類ラベルを必ず1つ付けること。3〜5件組み立てること。',
       parameters: {
         type: 'object',
         properties: {
@@ -202,8 +208,14 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
           meal_type: { type: ['string', 'null'], description: '主菜 / 副菜 / 丼 など' },
           style: { type: ['string', 'null'], description: '「ご飯に合う」「軽め」など' },
           difficulty: { type: ['string', 'null'], enum: ['easy', 'medium', 'hard', null] },
+          mode: {
+            type: ['string', 'null'],
+            enum: ['fridge_cleanup', null],
+            description:
+              'ユーザーが「冷蔵庫整理」「余ってるもの使いたい」のように言った場合のみ fridge_cleanup を指定する。それ以外は null。',
+          },
         },
-        required: ['max_minutes', 'meal_type', 'style', 'difficulty'],
+        required: ['max_minutes', 'meal_type', 'style', 'difficulty', 'mode'],
         additionalProperties: false,
       },
     },
@@ -573,13 +585,34 @@ async function dispatch(
     }
 
     case 'search_meal_candidates': {
+      const mode = args.mode === 'fridge_cleanup' ? 'fridge_cleanup' : 'normal';
+      // 冷蔵庫整理モードでは「もうすぐ切れる」の範囲を広げ、多めに拾う。
+      const expiringWindowDays = mode === 'fridge_cleanup' ? 7 : 5;
+
       const [items, expiring] = await Promise.all([
         listInventory(ctx, { includeEmpty: false }),
-        listExpiringSoon(ctx, 5),
+        listExpiringSoon(ctx, expiringWindowDays),
       ]);
       const usable = items.filter(isAvailable);
+
+      const rankingGuidance =
+        mode === 'fridge_cleanup'
+          ? [
+              '賞味期限が近い食材・余っている食材（surplus_items）を使う料理を最優先',
+              '在庫だけで完結する料理を次に優先',
+              '不足材料が少ない順',
+              '工程が少ない順',
+            ]
+          : [
+              '在庫だけで完結する料理を最優先',
+              '賞味期限が近い食材を使う料理を次に優先',
+              '不足材料が少ない順',
+              '工程が少ない順',
+            ];
+
       return {
         result: {
+          mode,
           preferences: {
             max_minutes: args.max_minutes ?? null,
             meal_type: args.meal_type ?? null,
@@ -591,12 +624,18 @@ async function dispatch(
             ...publicItem(item),
             urgency: freshness.label,
           })),
-          ranking_guidance: [
-            '在庫だけで完結する料理を最優先',
-            '賞味期限が近い食材を使う料理を次に優先',
-            '不足材料が少ない順',
-            '工程が少ない順',
-          ],
+          surplus_items: surplusItems(usable).map(publicItem),
+          missing_staples: missingStaples(items),
+          classification_guide: {
+            buckets: MEAL_CANDIDATE_BUCKET_LABELS,
+            staple_seasonings: STAPLE_SEASONINGS,
+            instructions:
+              '候補ごとに、不足している必須材料の名前を数えること。missing_staples に載っている基礎調味料はカウントに含めない。' +
+              '残りの不足数が0なら fully_stocked、不足がすべて基礎調味料だけなら staples_only、非調味料の不足が1つなら one_missing、' +
+              '2〜3つなら few_missing、4つ以上なら not_feasible として、buckets のラベルをユーザーに明示すること。' +
+              'not_feasible の候補は提案しない。expiring_soon の食材を使う候補には、期限が近い食材を消費できる旨も添えること。',
+          },
+          ranking_guidance: rankingGuidance,
           note: 'この一覧に無い食材は在庫にありません。あると仮定しないでください。',
         },
       };

@@ -60,7 +60,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 |---|---|---|---|---|---|---|
 | 1 | 消費期限・賞味期限管理 | **COMPLETE** | `24f5980` | yes | `0003_expiry_tracking.sql` | ✅ 適用済み |
 | 2 | 在庫残量の自然言語更新 | **COMPLETE** | `d9da9ce` | yes | なし | — |
-| 3 | 「今あるもので何作れる？」強化 | NOT_STARTED | — | — | — | — |
+| 3 | 「今あるもので何作れる？」強化 | **COMPLETE** | `<pending>` | yes | なし | — |
 | 4 | 食材・調味料の代替提案 | NOT_STARTED | — | — | — | — |
 | 5 | 調理セッション・工程状態管理 | NOT_STARTED | — | — | — | — |
 | 6 | 複数タイマー | NOT_STARTED | — | — | — | — |
@@ -84,7 +84,7 @@ PHASE 2 と 5 は**既存実装でほぼ達成済み**です。着手時は作�
   「キャベツ半分使った」(分数指定) の解釈のみ。
 - **PHASE 5**: `cooking_sessions` に `current_step` / `recipe_snapshot` / 再開 /
   二重実行防止まで実装済み。不足は完了工程の記録・使用食材の記録・工程スキップ。
-- **PHASE 3**: `search_meal_candidates` は在庫を返すだけ。分類と冷蔵庫整理モードが未実装。
+- **PHASE 3**: COMPLETE。`search_meal_candidates` が5分類の判定材料と冷蔵庫整理モードを返す。
 - **PHASE 4**: プロンプトに記述はあるが**専用ツールが無い**。
 
 ---
@@ -196,6 +196,77 @@ OpenAI の **429（TPM 制限）** でターンが 500 になる際、**ツー�
 
 ---
 
+## PHASE 3 — 「今あるもので何作れる？」強化
+
+**Status: COMPLETE**
+
+### 実装内容
+
+レシピの一般知識自体は元々モデル任せ（在庫データベースだけで、既存の完成レシピ集は
+アプリに存在しない）。今回作ったのは、モデルが候補を分類するための**決定的な判定材料**
+を実在庫から計算して渡す部分。新規テーブルは追加していない。
+
+- `src/lib/meals/classification.ts`（新規・純粋関数のみ）
+  - `STAPLE_SEASONINGS`: 基礎調味料10種（塩・胡椒・醤油・味噌・砂糖・酢・みりん・
+    料理酒・油・ゴマ油）を手打ちで列挙。`normalize.ts` のエイリアス解決を再利用するので
+    「しょうゆ」「サラダ油」も同じ調味料として認識する。
+  - `missingStaples(items)`: 実在庫のうち `isAvailable` を満たすものだけを見て、
+    上記10種のうちユーザーが**今切らしているもの**を返す。
+  - `surplusItems(items)`: `quantity_state === 'plenty'` かつ利用可能な食材（余り物）。
+  - `classifyMealCandidate(missingRequired)`: 不足材料名の配列から
+    `fully_stocked` / `staples_only` / `one_missing` / `few_missing` / `not_feasible`
+    の5分類を返す。基礎調味料の不足は不足数にカウントしない（醤油が無いことと
+    メイン食材が無いことを同列に扱わない）。
+  - `usesExpiringIngredient`: 候補の材料名が期限の近い食材と一致するかの判定。
+- `src/lib/ai/tools.ts` の `search_meal_candidates` を拡張
+  - 新しい引数 `mode`（`null` | `"fridge_cleanup"`）。ユーザーが「冷蔵庫整理」
+    「余ってるもの使いたい」と言ったときだけモデルがこれを立てる。
+  - レスポンスに追加: `mode` / `surplus_items` / `missing_staples` /
+    `classification_guide`（5分類の日本語ラベルと分類基準をそのままモデルに渡す）。
+  - `fridge_cleanup` モードでは期限判定の窓を5日→7日に広げ、`ranking_guidance` を
+    「期限が近い食材・余り物を使う料理を最優先」に並べ替える。
+- `src/lib/ai/prompt.ts`: 候補ごとに4分類ラベル（今あるものだけで作れる／調味料だけ
+  追加すれば作れる／あと1品／あと2〜3品）を明示することと、`mode: "fridge_cleanup"`
+  を使うタイミングをプロンプトに追記。
+
+### 設計判断
+
+料理候補そのものを構造化データとして保存する仕組み（`MealCandidate` 型は SPEC に
+既にあったが未使用）は今回作らなかった。会話の中でモデルが自由に候補名・材料を
+挙げる既存の設計を維持しつつ、「不足材料が何個か」「それは基礎調味料か」という
+**判定ロジックだけ**をサーバー側の純粋関数に切り出した。モデルの自己申告
+（`missingRequired` 相当）を検証する仕組みは無いので、分類の正しさは
+プロンプト遵守に依存する（PHASE 2 の在庫更新のようにサーバーが値を強制検証は
+していない）。将来ここを固めるなら、モデルに構造化出力（候補ごとの
+`missingRequired: string[]`）を強制し、`classifyMealCandidate` をサーバー側で
+再計算してから UI に渡す形にするとよい。
+
+### テスト
+
+`src/lib/meals/classification.test.ts` — 18件新規（基礎調味料のエイリアス解決・
+在庫からの充足判定・plenty のみ拾う・5分類の境界値・期限食材の一致判定）。
+既存136件 + 新規18件 = 合計154件、全て pass。
+
+### 実データでの動作確認（済み、開発サーバー起動 → ログイン → /api/chat に実送信）
+
+在庫（実データ）: 鶏もも肉（消費期限まで推定2日）・卵（quantity_state: plenty）・
+キャベツ・醤油（在庫あり）・玉ねぎ/にんにく（empty）・片栗粉。
+
+- 「今ある食材で何か作れる?」→ `search_meal_candidates` を `mode: "normal"` で呼び、
+  返信は「【今あるものだけで作れる】鶏もも肉の照り焼き（醤油でOK、期限が近いので
+  おすすめ）」「【調味料だけ追加すれば作れる】卵焼き／キャベツの卵炒め（塩や砂糖が
+  必要）」と正しく2分類で提示。
+- 「冷蔵庫整理したいんだけど、余ってるものと期限近いもの優先で何か提案して」→
+  ツール呼び出しの引数が実際に `{"mode":"fridge_cleanup", ...}` になっているのを
+  `conversation_messages.tool_calls` で確認。返信も「卵が余っています」「鶏もも肉の
+  消費期限が近い」と surplus_items / expiring_soon を反映した内容になった。
+
+### migration
+
+なし（新規テーブル・カラムともに追加していない）。
+
+---
+
 ## 自動実行タスク
 
 Claude デスクトップアプリの Scheduled Tasks に2件登録済み。どちらも 0/5/10/15/20時。
@@ -237,17 +308,23 @@ PC をスリープさせず Claude アプリを開いたままにしておけば
 
 ## 次に実装する PHASE
 
-**PHASE 3 — 「今あるもので何作れる？」強化**
+**PHASE 4 — 食材・調味料の代替提案**
 
 再開手順:
-1. `src/lib/ai/tools.ts` の `search_meal_candidates` を読む（現在は在庫を返すだけ）
-2. 料理候補を次の分類で返せるようにする:
-   - 今あるものだけで作れる
-   - 調味料だけ追加すれば作れる
-   - あと1品あれば作れる
-   - あと2〜3品買えば作れる
-   - 期限が近い食材を優先して消費できる
-3. 「冷蔵庫整理」モードを追加（`days_left` が小さい食材と余り物を優先）
-4. AI へ渡す在庫は**必要な情報だけ**に絞る（`publicItem` は既に整理済み）
-5. 構造化出力（Zod で validate）してから UI に渡す
-6. 新規テーブルは不要な想定。DB 変更なしで実装できるか先に検討すること
+1. `src/lib/ai/prompt.ts` の BASE_SYSTEM_PROMPT に既にある
+   「代用品が合理的な場合のみ代替案を提示してください」を読む。プロンプト任せに
+   なっており、専用ツールが無い状態。
+2. 代替可能かどうかの判定はレシピ知識そのものなので PHASE 3 と同様、完全な
+   代替データベースは作らない想定。まずは以下を検討する:
+   - 在庫にある調味料・食材から、よくある代替ペア（醤油⇄めんつゆ、みりん⇄
+     （酒+砂糖）、バター⇄油、牛乳⇄豆乳 など）を `src/lib/meals/` 配下に
+     `substitutions.ts` として手打ちで持つか、モデルの自己申告に任せるかを判断する。
+   - `create_recipe` の `ingredients[].substitute_options` は既にフィールドとして
+     存在する（`src/types/domain.ts` の `RecipeIngredient.substituteOptions`）。
+     これがどこまで使われているか（UI 表示・在庫確認との連携）を先に調べること。
+3. 代替提案を「在庫にある食材から選ぶ」ものにする場合、`find_inventory_item` /
+   `get_inventory` の結果と `substituteOptions` を突き合わせる純粋関数を書く。
+4. 新規ツール（例: `suggest_substitute`）を追加するか、既存の `search_meal_candidates`
+   / `create_recipe` の拡張で足りるかは、既存実装を読んでから判断すること。
+5. 新規テーブルが必要になりそうか（代替ペアをユーザーごとにカスタマイズする等）は
+   要件を広げすぎないよう、まず不要な設計で検討する。
