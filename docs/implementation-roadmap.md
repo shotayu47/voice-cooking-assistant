@@ -306,7 +306,7 @@ PC をスリープさせず Claude アプリを開いたままにしておけば
 
 **PHASE 4 は対話セッションが実装中です（🔒）。自動タスクは着手しないでください。**
 
-PHASE 3 で、対話セッションと  が同じ PHASE を
+PHASE 3 で、対話セッションと `continue-cooking-assistant-development` が同じ PHASE を
 並行実装し、一方の作業が無駄になりました。再発防止のため、着手前にこのファイルで
 PHASE を確保してから実装します。
 
