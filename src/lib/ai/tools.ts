@@ -26,7 +26,15 @@ import {
   updateStatus,
 } from '@/lib/cooking/service';
 import { isAvailable } from '@/lib/inventory/quantity';
-import { freshnessOf } from '@/lib/inventory/freshness';
+import { freshnessOf, todayIso } from '@/lib/inventory/freshness';
+import {
+  cleanoutTargets,
+  evaluateCandidates,
+  pantryStatus,
+  summarize,
+  type EvaluatedCandidate,
+} from '@/lib/meals/candidates';
+import { evaluateMealCandidatesSchema } from '@/lib/meals/schemas';
 import type { InventoryItem } from '@/types/domain';
 
 /**
@@ -194,7 +202,7 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
     function: {
       name: 'search_meal_candidates',
       description:
-        '献立を考えるための材料コンテキスト（利用可能な在庫・期限が近い食材・不足しがちな基礎調味料）を取得する。この結果をもとに候補を3〜5件組み立てること。',
+        '献立を考えるための材料コンテキスト（利用可能な在庫・期限が近い食材・不足しがちな基礎調味料）を取得する。この結果をもとに候補を3〜5件組み立て、必ず evaluate_meal_candidates に渡して判定させること。作れる/足りないを自分で判断しないこと。',
       parameters: {
         type: 'object',
         properties: {
@@ -202,8 +210,77 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
           meal_type: { type: ['string', 'null'], description: '主菜 / 副菜 / 丼 など' },
           style: { type: ['string', 'null'], description: '「ご飯に合う」「軽め」など' },
           difficulty: { type: ['string', 'null'], enum: ['easy', 'medium', 'hard', null] },
+          mode: {
+            type: 'string',
+            enum: ['normal', 'cleanout'],
+            description:
+              '「冷蔵庫を整理したい」「余りもの片付けたい」「期限が近いものから使いたい」なら cleanout。通常は normal。',
+          },
         },
-        required: ['max_minutes', 'meal_type', 'style', 'difficulty'],
+        required: ['max_minutes', 'meal_type', 'style', 'difficulty', 'mode'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'evaluate_meal_candidates',
+      description:
+        `考えた料理候補を在庫と突き合わせて判定する。「作れます」「〜が足りません」とユーザーに伝える前に必ず呼ぶこと。
+在庫との照合はサーバーが行うので、自分で在庫リストと突き合わせないこと。
+返り値の availability が判定結果:
+・ready = 今あるものだけで作れる
+・seasoning_only = 調味料だけ追加すれば作れる
+・one_short = あと1品あれば作れる
+・few_short = あと2〜3品買えば作れる
+・not_feasible = 不足が多い
+uses_expiring は期限が近い食材を消費できる候補。返ってきた順番のまま提示すること。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          mode: {
+            type: 'string',
+            enum: ['normal', 'cleanout'],
+            description: '冷蔵庫整理なら cleanout。search_meal_candidates と揃えること。',
+          },
+          candidates: {
+            type: 'array',
+            description: '3〜5件。材料は調味料も含めてすべて列挙すること。',
+            items: {
+              type: 'object',
+              properties: {
+                title: { type: 'string' },
+                estimated_minutes: { type: ['integer', 'null'] },
+                difficulty: { type: ['string', 'null'], enum: ['easy', 'medium', 'hard', null] },
+                reason: {
+                  type: ['string', 'null'],
+                  description: 'なぜこの候補か（例:「鶏もも肉の期限が近い」）',
+                },
+                ingredients: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      name: { type: 'string', description: '一般的な食材名。在庫名に寄せないこと。' },
+                      amount: { type: ['number', 'null'] },
+                      unit: { type: ['string', 'null'] },
+                      required: {
+                        type: 'boolean',
+                        description: '無くても成立するなら false',
+                      },
+                    },
+                    required: ['name', 'amount', 'unit', 'required'],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ['title', 'estimated_minutes', 'difficulty', 'reason', 'ingredients'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['mode', 'candidates'],
         additionalProperties: false,
       },
     },
@@ -377,6 +454,12 @@ export type ToolOutcome = {
   effect?: 'inventory_changed' | 'session_changed';
   /** Set by start_cooking_session so the chat can link straight into cooking. */
   sessionId?: string;
+  /**
+   * Server-evaluated meal proposals (PHASE 3). Passed to the UI as data rather
+   * than re-read out of the model's prose, so the cards cannot disagree with
+   * what the inventory actually says.
+   */
+  mealCandidates?: EvaluatedCandidate[];
 };
 
 /**
@@ -573,32 +656,79 @@ async function dispatch(
     }
 
     case 'search_meal_candidates': {
+      const mode = args.mode === 'cleanout' ? 'cleanout' : 'normal';
+      const today = todayIso();
       const [items, expiring] = await Promise.all([
         listInventory(ctx, { includeEmpty: false }),
         listExpiringSoon(ctx, 5),
       ]);
       const usable = items.filter(isAvailable);
+      const pantry = pantryStatus(usable, today);
+
       return {
         result: {
+          mode,
           preferences: {
             max_minutes: args.max_minutes ?? null,
             meal_type: args.meal_type ?? null,
             style: args.style ?? null,
             difficulty: args.difficulty ?? null,
           },
-          available_items: usable.map(publicItem),
+          available_items: usable.map(mealPlanningItem),
           expiring_soon: expiring.map(({ item, freshness }) => ({
-            ...publicItem(item),
+            ...mealPlanningItem(item),
             urgency: freshness.label,
           })),
-          ranking_guidance: [
-            '在庫だけで完結する料理を最優先',
-            '賞味期限が近い食材を使う料理を次に優先',
-            '不足材料が少ない順',
-            '工程が少ない順',
-          ],
+          pantry: {
+            on_hand: pantry.onHand,
+            missing: pantry.missing,
+            note: 'missing の調味料は在庫にありません。使うなら不足として伝えてください。',
+          },
+          ...(mode === 'cleanout'
+            ? {
+                cleanout_targets: cleanoutTargets(usable, today),
+                cleanout_note:
+                  '冷蔵庫整理モードです。cleanout_targets を1品でも多く使う候補を優先してください。',
+              }
+            : {}),
+          next_step:
+            '候補を3〜5件考え、材料（調味料を含む）をつけて evaluate_meal_candidates に渡してください。作れるか足りないかの判定はサーバーが行います。',
           note: 'この一覧に無い食材は在庫にありません。あると仮定しないでください。',
         },
+      };
+    }
+
+    case 'evaluate_meal_candidates': {
+      const parsed = evaluateMealCandidatesSchema.parse(args);
+      // Used-up rows are included on purpose: 「在庫に無い」 and 「切らして
+      // いる」 are different things to tell the user.
+      const inventory = await listInventory(ctx, { includeEmpty: true });
+
+      const candidates = evaluateCandidates(
+        parsed.candidates.map((candidate) => ({
+          title: candidate.title,
+          estimatedMinutes: candidate.estimated_minutes ?? null,
+          difficulty: candidate.difficulty ?? null,
+          reason: candidate.reason ?? null,
+          ingredients: candidate.ingredients.map((ingredient) => ({
+            name: ingredient.name,
+            amount: ingredient.amount ?? null,
+            unit: ingredient.unit ?? null,
+            required: ingredient.required ?? true,
+          })),
+        })),
+        inventory,
+        { mode: parsed.mode ?? 'normal', today: todayIso() },
+      );
+
+      return {
+        result: {
+          mode: parsed.mode ?? 'normal',
+          summary: summarize(candidates),
+          candidates: candidates.map(publicCandidate),
+          note: 'この判定がユーザーの在庫の事実です。ここに無い不足を足したり、missing_required を無視したりしないでください。',
+        },
+        mealCandidates: candidates,
       };
     }
 
@@ -689,6 +819,72 @@ function publicItem(item: InventoryItem) {
           expiry_is_estimated: freshness.estimated,
         }
       : {}),
+  };
+}
+
+/**
+ * Meal planning needs less than the full item. The row id is useless here —
+ * the model submits ingredient *names* and the server resolves them — and the
+ * raw date adds nothing once `days_left` is present.
+ */
+function mealPlanningItem(item: InventoryItem) {
+  const freshness = freshnessOf(item);
+
+  return {
+    name: item.name,
+    category: item.category,
+    quantity: item.quantity,
+    unit: item.unit,
+    quantity_state: item.quantity_state,
+    storage_location: item.storage_location,
+    ...(freshness
+      ? {
+          days_left: freshness.daysLeft,
+          expiry_kind: freshness.kind,
+          expiry_is_estimated: freshness.estimated,
+        }
+      : {}),
+  };
+}
+
+/** snake_case projection of an evaluated candidate for the model. */
+function publicCandidate(candidate: EvaluatedCandidate) {
+  return {
+    title: candidate.title,
+    availability: candidate.availability,
+    estimated_minutes: candidate.estimatedMinutes,
+    difficulty: candidate.difficulty,
+    reason: candidate.reason,
+    have: candidate.have.map((matched) => ({
+      name: matched.itemName,
+      urgency: matched.urgency,
+      expiry_is_estimated: matched.estimated,
+      ...(matched.ambiguous
+        ? { note: '同名の候補が複数あります。どれを使うかユーザーに確認してください。' }
+        : {}),
+    })),
+    missing_required: candidate.missingRequired.map(publicMissing),
+    missing_optional: candidate.missingOptional.map(publicMissing),
+    uses_expiring: candidate.usesExpiring.map((matched) => ({
+      name: matched.itemName,
+      urgency: matched.urgency,
+      expiry_is_estimated: matched.estimated,
+    })),
+    check_first: candidate.checkFirst.map((matched) => ({
+      name: matched.itemName,
+      urgency: matched.urgency,
+      note: '賞味期限を過ぎています。食べられますが状態を確認するよう伝えてください。',
+    })),
+  };
+}
+
+function publicMissing(missing: { name: string; reason: string; seasoning: boolean; short?: { amount: number; unit: string | null }; note?: string }) {
+  return {
+    name: missing.name,
+    reason: missing.reason,
+    is_seasoning: missing.seasoning,
+    ...(missing.short ? { short_by: `${missing.short.amount}${missing.short.unit ?? ''}` } : {}),
+    ...(missing.note ? { note: missing.note } : {}),
   };
 }
 

@@ -11,6 +11,7 @@ import type { CookingSession, Profile } from '@/types/domain';
 import { CHAT_MODEL, getOpenAI } from './openai';
 import { buildSystemPrompt } from './prompt';
 import { TOOL_DEFINITIONS, executeTool } from './tools';
+import type { EvaluatedCandidate } from '@/lib/meals/candidates';
 
 /** Hard ceiling on tool round-trips per user message. */
 const MAX_TOOL_ITERATIONS = 8;
@@ -159,6 +160,12 @@ export type TurnResult = {
   inventoryChanged: boolean;
   /** The cooking session the turn ended on, if any. */
   cookingSessionId: string | null;
+  /**
+   * PHASE 3 — the server's own verdict on the dishes proposed this turn. The
+   * cards render from this rather than from the reply text, so what the user
+   * sees about their inventory comes from the database either way.
+   */
+  mealCandidates: EvaluatedCandidate[] | null;
 };
 
 /**
@@ -195,6 +202,7 @@ export async function runTurn(
   const toolsUsed: string[] = [];
   let inventoryChanged = false;
   let cookingSessionId = session?.id ?? null;
+  let mealCandidates: EvaluatedCandidate[] | null = null;
 
   // Backend guards, not prompt requests: one utterance may move the step at
   // most once, and an identical mutation repeated inside a turn is a model
@@ -220,7 +228,7 @@ export async function runTurn(
       if (toolsUsed.length > 0) {
         const reply = describeCompletedWork(toolsUsed, inventoryChanged);
         await persistMessage(ctx, input.conversationId, { role: 'assistant', content: reply });
-        return { reply, toolsUsed, inventoryChanged, cookingSessionId };
+        return { reply, toolsUsed, inventoryChanged, cookingSessionId, mealCandidates };
       }
       throw error;
     }
@@ -248,6 +256,7 @@ export async function runTurn(
         toolsUsed,
         inventoryChanged,
         cookingSessionId,
+        mealCandidates,
       };
     }
 
@@ -283,6 +292,8 @@ export async function runTurn(
 
       if (outcome.effect === 'inventory_changed') inventoryChanged = true;
       if (outcome.sessionId) cookingSessionId = outcome.sessionId;
+      // A later evaluation supersedes an earlier one within the same turn.
+      if (outcome.mealCandidates) mealCandidates = outcome.mealCandidates;
 
       const content = JSON.stringify(outcome.result);
       await persistMessage(ctx, input.conversationId, {
@@ -296,7 +307,7 @@ export async function runTurn(
 
   const fallback = 'うまくまとめられませんでした。もう一度、短く言い直してもらえますか。';
   await persistMessage(ctx, input.conversationId, { role: 'assistant', content: fallback });
-  return { reply: fallback, toolsUsed, inventoryChanged, cookingSessionId };
+  return { reply: fallback, toolsUsed, inventoryChanged, cookingSessionId, mealCandidates };
 }
 
 /**

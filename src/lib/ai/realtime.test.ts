@@ -27,8 +27,11 @@ describe('realtimeToolDefinitions', () => {
   });
 
   it('covers the SPEC §8 tools plus the §14 name resolver', () => {
-    expect(realtime).toHaveLength(12);
+    expect(realtime).toHaveLength(13);
     expect(realtime.map((tool) => tool.name)).toContain('find_inventory_item');
+    // PHASE 3 — voice must be able to check a proposal against the inventory
+    // too, or the spoken answer and the typed answer disagree.
+    expect(realtime.map((tool) => tool.name)).toContain('evaluate_meal_candidates');
   });
 });
 

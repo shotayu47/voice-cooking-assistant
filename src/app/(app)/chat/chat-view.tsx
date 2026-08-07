@@ -5,9 +5,17 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
 
 import { cn } from '@/lib/cn';
+import { MealCandidateCards } from '@/components/meal-candidate-cards';
 import { VoicePanel } from '@/components/voice-panel';
+import type { EvaluatedCandidate } from '@/lib/meals/candidates';
 
-type Message = { id: string; role: 'user' | 'assistant'; content: string };
+type Message = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  /** PHASE 3 — server-evaluated proposals shown as cards under the reply. */
+  candidates?: EvaluatedCandidate[] | null;
+};
 
 const SUGGESTIONS = [
   '今あるもので何作れる？',
@@ -69,11 +77,17 @@ export function ChatView({
         reply: string;
         cookingSessionId: string | null;
         inventoryChanged: boolean;
+        mealCandidates: EvaluatedCandidate[] | null;
       };
 
       setMessages((current) => [
         ...current,
-        { id: `reply-${current.length}`, role: 'assistant', content: result.reply },
+        {
+          id: `reply-${current.length}`,
+          role: 'assistant',
+          content: result.reply,
+          candidates: result.mealCandidates,
+        },
       ]);
       if (result.cookingSessionId) setSessionId(result.cookingSessionId);
       // The inventory pages are server-rendered; pull fresh data after a write.
@@ -134,7 +148,12 @@ export function ChatView({
         ) : null}
 
         {messages.map((message) => (
-          <Bubble key={message.id} role={message.role} content={message.content} />
+          <div key={message.id} className="space-y-2">
+            <Bubble role={message.role} content={message.content} />
+            {message.candidates?.length ? (
+              <MealCandidateCards candidates={message.candidates} />
+            ) : null}
+          </div>
         ))}
 
         {sending ? (

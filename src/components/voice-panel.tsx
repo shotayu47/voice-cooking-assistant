@@ -83,6 +83,7 @@ const TOOL_LABELS: Record<string, string> = {
   update_inventory_item: '在庫を更新',
   consume_inventory_item: '在庫を減らす',
   search_meal_candidates: '献立を検討',
+  evaluate_meal_candidates: '作れるか判定',
   create_recipe: 'レシピを作成',
   start_cooking_session: '調理を開始',
   get_current_cooking_step: '工程を確認',
