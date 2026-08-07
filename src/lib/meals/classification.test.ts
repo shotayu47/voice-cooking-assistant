@@ -42,6 +42,30 @@ describe('isStapleSeasoning', () => {
     expect(isStapleSeasoning('鶏もも肉')).toBe(false);
     expect(isStapleSeasoning('玉ねぎ')).toBe(false);
   });
+
+  it('matches a variety whose name ends in the staple', () => {
+    expect(isStapleSeasoning('濃口醤油')).toBe(true);
+    expect(isStapleSeasoning('粗塩')).toBe(true);
+    expect(isStapleSeasoning('米酢')).toBe(true);
+  });
+
+  /**
+   * A staple at the *start* of a word names a food made with it, not the
+   * seasoning. Containment matching called all of these seasonings, so a dish
+   * short of 油揚げ was reported as "just needs seasonings".
+   */
+  it('does not treat a food named after a seasoning as a staple', () => {
+    expect(isStapleSeasoning('油揚げ')).toBe(false);
+    expect(isStapleSeasoning('塩鮭')).toBe(false);
+    expect(isStapleSeasoning('塩昆布')).toBe(false);
+    expect(isStapleSeasoning('酢豚')).toBe(false);
+    expect(isStapleSeasoning('味噌汁')).toBe(false);
+  });
+
+  it('does not let a shorter word match a longer staple', () => {
+    // Sesame seeds are not sesame oil.
+    expect(isStapleSeasoning('ゴマ')).toBe(false);
+  });
 });
 
 describe('missingStaples', () => {

@@ -34,13 +34,22 @@ export const STAPLE_SEASONINGS = [
 
 const STAPLE_KEYS = new Set(STAPLE_SEASONINGS.map((name) => foldName(name)));
 
-/** Whether a (possibly free-text) ingredient name names a staple seasoning. */
+/**
+ * Whether a (possibly free-text) ingredient name names a staple seasoning.
+ *
+ * Matches on suffix, not on containment. In Japanese a staple at the *end* of
+ * a word names a kind of that staple (濃口醤油, 粗塩, 米酢, サラダ油), while a
+ * staple at the *start* usually names a food made with it — 油揚げ, 塩鮭,
+ * 塩昆布, 酢豚, 味噌汁. Plain containment called all of those seasonings, so a
+ * dish missing 油揚げ would have been reported as "just needs seasonings".
+ */
 export function isStapleSeasoning(name: string): boolean {
   const canonical = foldName(normalizeIngredientName(name));
   if (!canonical) return false;
   if (STAPLE_KEYS.has(canonical)) return true;
+
   for (const key of STAPLE_KEYS) {
-    if (canonical.includes(key) || key.includes(canonical)) return true;
+    if (canonical.length > key.length && canonical.endsWith(key)) return true;
   }
   return false;
 }
