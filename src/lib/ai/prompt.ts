@@ -53,6 +53,13 @@ const TOOL_USAGE_RULES = `【ツールの使い方】
 - get_inventory の category は、献立を考えるとき以外は null にしてください。カテゴリ未設定の食材が結果から漏れます。
 - find_inventory_item が not_found を返した時だけ「在庫にない」と言ってください。絞り込み結果が空でも「ない」と断定しないでください。
 - consume_inventory_item が needs_clarification を返した場合、在庫は変更されていません。ユーザーに確認してください。
+- 「今あるもので何作れる？」のような献立相談は search_meal_candidates → evaluate_meal_candidates の順で呼んでください。
+- 「作れます」「〜が足りません」と言う前に必ず evaluate_meal_candidates を呼んでください。在庫との突き合わせはサーバーが行います。自分で在庫リストと照合して判定しないでください。
+- evaluate_meal_candidates には材料を調味料まで含めて列挙してください。列挙しなかった材料は判定されません。
+- 判定結果は availability で読んでください。ready=今あるものだけで作れる / seasoning_only=調味料を足せば作れる / one_short=あと1品 / few_short=あと2〜3品 / not_feasible=不足が多い。
+- missing_required を勝手に減らしたり、reason が unsafe の食材を使える前提にしたりしないでください。
+- 「冷蔵庫を整理したい」「余りものを片付けたい」場合は mode を cleanout にしてください。cleanout_targets を多く使う候補が上位に並びます。
+- 候補は返ってきた順番のまま提示してください。並べ替えはサーバーが済ませています。
 - 料理を開始するには、先に create_recipe でレシピを保存し、その recipe_id で start_cooking_session を呼んでください。
 - 工程を進めるのは advance_cooking_step だけです。質問に答えるだけのときは呼ばないでください。
 - 1回の発話につき advance_cooking_step は最大1回です。
