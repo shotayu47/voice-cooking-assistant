@@ -19,7 +19,6 @@ import {
   obsoleteTimerKeys,
   parseTimers,
   removeTimer,
-  renameTimer,
   saveTimers,
   sortTimers,
   storageKey,
@@ -58,25 +57,32 @@ class TimerStore {
   constructor(private readonly key: string) {}
 
   subscribe = (listener: () => void): (() => void) => {
-    this.listeners.add(listener);
-
-    // First subscription is the earliest safe moment for side effects: this
-    // runs in an effect, not during render.
-    if (!this.swept) {
-      this.swept = true;
-      try {
-        for (const stale of obsoleteTimerKeys(Object.keys(window.localStorage))) {
-          window.localStorage.removeItem(stale);
+    // Bound to the first and last subscriber rather than to each one: with
+    // several components subscribed, `addEventListener` would dedupe on the
+    // shared handler reference and the first unsubscribe would then remove it
+    // out from under the rest.
+    if (this.listeners.size === 0) {
+      // The earliest safe moment for side effects — subscribe runs in an
+      // effect, not during render.
+      if (!this.swept) {
+        this.swept = true;
+        try {
+          for (const stale of obsoleteTimerKeys(Object.keys(window.localStorage))) {
+            window.localStorage.removeItem(stale);
+          }
+        } catch {
+          /* nothing reachable to clean up */
         }
-      } catch {
-        /* nothing reachable to clean up */
       }
+      window.addEventListener('storage', this.onStorage);
     }
 
-    window.addEventListener('storage', this.onStorage);
+    this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
-      window.removeEventListener('storage', this.onStorage);
+      if (this.listeners.size === 0) {
+        window.removeEventListener('storage', this.onStorage);
+      }
     };
   };
 
@@ -142,7 +148,6 @@ type TimersValue = {
   start: (input: StartInput) => void;
   complete: (id: string) => void;
   dismiss: (id: string) => void;
-  rename: (id: string, name: string) => void;
 };
 
 const TimersContext = createContext<TimersValue | null>(null);
@@ -217,20 +222,17 @@ export function CookingTimersProvider({
 
   const start = useCallback(
     (input: StartInput) => {
-      setNow(Date.now());
+      // One timestamp for both the deadline and the repaint, so the first
+      // frame cannot show a countdown that already lost a few milliseconds.
+      const at = Date.now();
+      setNow(at);
       store.update((current) => {
         if (!canAddTimer(current)) return [...current];
         const origin = input.origin ?? null;
         const name = input.name?.trim() || defaultTimerName(current, origin);
         return addTimer(
           current,
-          createTimer({
-            id: newTimerId(),
-            name,
-            durationMs: input.durationMs,
-            now: Date.now(),
-            origin,
-          }),
+          createTimer({ id: newTimerId(), name, durationMs: input.durationMs, now: at, origin }),
         );
       });
     },
@@ -247,11 +249,6 @@ export function CookingTimersProvider({
     [store],
   );
 
-  const rename = useCallback(
-    (id: string, name: string) => store.update((current) => renameTimer(current, id, name)),
-    [store],
-  );
-
   const value = useMemo<TimersValue>(
     () => ({
       timers: sortTimers(timers),
@@ -260,9 +257,8 @@ export function CookingTimersProvider({
       start,
       complete,
       dismiss,
-      rename,
     }),
-    [timers, now, start, complete, dismiss, rename],
+    [timers, now, start, complete, dismiss],
   );
 
   return <TimersContext.Provider value={value}>{children}</TimersContext.Provider>;

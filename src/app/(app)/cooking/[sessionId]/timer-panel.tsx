@@ -80,14 +80,7 @@ function TimerRow({ timer, now }: { timer: CookingTimer; now: number }) {
     >
       <div className="min-w-0 flex-1">
         <p className={cn('truncate text-sm', done && 'line-through')}>{timer.name}</p>
-        {/*
-          Announced politely rather than assertively: on iOS there is no way to
-          ring (the measurement found no Notification API in a Safari tab), so
-          this line is the only thing telling a cook who is not looking.
-        */}
         <p
-          role={over ? 'status' : undefined}
-          aria-live={over ? 'polite' : undefined}
           className={cn(
             'text-xs',
             done ? 'text-faint' : over ? 'text-warn' : 'text-muted',
@@ -99,6 +92,15 @@ function TimerRow({ timer, now }: { timer: CookingTimer; now: number }) {
               ? `時間を過ぎています（${formatRemaining(overdueMs(timer, now))} 超過）`
               : '残り'}
         </p>
+
+        {/*
+          The visible line above counts up every second, so it cannot carry the
+          live region — a screen reader would re-announce it on every tick. This
+          says the one thing worth hearing, once, when it becomes true. On iOS
+          there is no way to ring (the measurement found no Notification API in
+          a Safari tab), so this is what tells a cook who is not looking.
+        */}
+        {over ? <span role="status" className="sr-only">{timer.name}の時間を過ぎています</span> : null}
       </div>
 
       {!done ? (

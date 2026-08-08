@@ -16,7 +16,6 @@ import {
   parseTimers,
   remainingMs,
   removeTimer,
-  renameTimer,
   saveTimers,
   serializeTimers,
   sortTimers,
@@ -181,12 +180,6 @@ describe('adding and removing', () => {
     const done = completeTimer(list, 'a');
     expect(done[0].status).toBe('done');
     expect(done[1].status).toBe('running');
-  });
-
-  it('renames, ignoring a blank name', () => {
-    const list = [timer({ id: 'a', name: '古い' })];
-    expect(renameTimer(list, 'a', '  新しい  ')[0].name).toBe('新しい');
-    expect(renameTimer(list, 'a', '   ')[0].name).toBe('古い');
   });
 });
 

@@ -163,16 +163,6 @@ export function completeTimer(timers: readonly CookingTimer[], id: string): Cook
   );
 }
 
-export function renameTimer(
-  timers: readonly CookingTimer[],
-  id: string,
-  name: string,
-): CookingTimer[] {
-  const trimmed = name.trim();
-  if (!trimmed) return [...timers];
-  return timers.map((timer) => (timer.id === id ? { ...timer, name: trimmed } : timer));
-}
-
 /**
  * Soonest deadline first, so whatever needs attention is at the top and an
  * overdue timer sorts above everything still counting down. Acknowledged ones
