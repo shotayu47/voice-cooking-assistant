@@ -12,7 +12,8 @@
     "test:watch": "vitest",
     "icons": "node scripts/generate-icons.mjs",
     "test:live": "vitest run --config vitest.live.config.mts",
-    "audit:rls": "node scripts/audit-rls.mjs"
+    "audit:rls": "node scripts/audit-rls.mjs",
+    "check:migrations": "node scripts/check-migrations.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.4",

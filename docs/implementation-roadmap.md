@@ -11,6 +11,17 @@
 
 品質ゲート（毎 PHASE）: `npm run typecheck` / `npm run lint` / `npm test`
 数 PHASE ごと・最終: `npm run build` / `npm run audit:rls`
+migration を伴う PHASE: `npm run check:migrations`（`audit:rls` では適用状況は分からない）
+
+## この環境の注意点
+
+**シェルは PowerShell。** `curl` は `Invoke-WebRequest` のエイリアスなので、
+Linux 形式の `curl -H "key: value"` は `Headers` のバインドに失敗する。
+REST を直接叩くなら `curl.exe` か `Invoke-RestMethod -Headers @{ key = 'value' }`。
+
+`.env.local` は PowerShell の環境変数には自動ロードされない。`$env:SUPABASE_URL` は
+空のまま。付属スクリプト（`check:migrations` / `audit:rls`）は `.env.local` を
+直接読むのでそのまま動く。**鍵の値をログに出さないこと。**
 
 ## デプロイ構成
 
@@ -62,7 +73,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 2 | 在庫残量の自然言語更新 | **COMPLETE** | `d9da9ce` | yes | なし | — |
 | 3 | 「今あるもので何作れる？」強化 | **COMPLETE** | `8e8891a` | yes | なし | — |
 | 4 | 食材・調味料の代替提案 | **COMPLETE** | `e67a0f4` | yes | なし | — |
-| 5 | 調理セッション・工程状態管理 | **COMPLETE** | `a7623cb` | yes | `0004_cooking_progress.sql` | ⚠️ **要手動実行** |
+| 5 | 調理セッション・工程状態管理 | **COMPLETE** | `a7623cb` | yes | `0004_cooking_progress.sql` | ✅ 適用済み |
 | 6 | 複数タイマー | NOT_STARTED | — | — | — | — |
 | 7 | 調理中のトラブル対応 | NOT_STARTED | — | — | — | — |
 | 8 | 分量の自動調整 | NOT_STARTED | — | — | — | — |
@@ -336,7 +347,7 @@ UI で「新しい会話を始める」導線があると確実。今回の指�
 
 ## PHASE 5 — 調理セッション・工程状態管理
 
-**Status: COMPLETE**（migration 0004 の適用待ち）
+**Status: COMPLETE**
 
 ### 調査結果：大部分は既に実装済みだった
 
@@ -403,15 +414,51 @@ CHECK 制約で両配列が `0 <= i < total_steps` に収まることを保証�
 
 合計 204件。
 
-### ⚠️ 手動対応が必要
+### migration
 
-**Supabase SQL Editor で `supabase/migrations/0004_cooking_progress.sql` を実行してください。**
+✅ `0004_cooking_progress.sql` 適用済み。
 
-未適用の状態も実測で確認済み: **アプリは壊れない**（`select *` とカラム存在チェックで
-degrade する）。工程は今までどおり進み、エラーも出ない。ただし完了/スキップ/使用食材は
-記録されず、進捗セグメントは現在位置しか色が付かない。
+初回は CHECK 制約にサブクエリを書いてしまい `0A000: cannot use subquery in check
+constraint` で失敗した。トランザクション全体がロールバックしたのでカラムは1つも
+追加されなかった。CHECK 式自体にはサブクエリを書けないが、**サブクエリを含む
+IMMUTABLE 関数を呼ぶことはできる**ため、範囲チェックを `int_array_within_bounds`
+に移して解決した（`8d8c35f`）。
 
-適用前に iPhone で確認しても、PHASE 5 の新機能は見えない。
+### 実データ検証（済み）
+
+```
+開始       step 2/7 | 完了:[0]     | スキップ:[]  | 残り:6
+できた      step 3/7 | 完了:[0,1]   | スキップ:[]  | 残り:5
+飛ばす      step 4/7 | 完了:[0,1]   | スキップ:[2] | 残り:4
+できた      step 5/7 | 完了:[0,1,3] | スキップ:[2] | 残り:3
+即・重複     step 5/7 | 完了:[0,1,3] | スキップ:[2] | 残り:3  ← デバウンスで無視
+戻る       step 4/7 | 完了:[0,1,3] | スキップ:[2] | 残り:3  ← 記録は変わらない
+```
+
+使用食材も工程番号つきで記録された:
+
+```json
+{"name":"鶏もも肉","amount":200,"unit":"g","stepIndex":3,"inventoryItemId":"..."}
+```
+
+UI も実測: 7セグメントが 現在1／完了2／スキップ1／未着手3 で描画され、
+「1工程スキップ」と `aria-label="7工程中3工程完了"` が出力されている。
+
+### 検証手順の訂正
+
+`npm run audit:rls` は RLS しか見ておらず、**migration の適用状況を確認できない**。
+検証方法として案内したのは誤りだった。専用スクリプトを追加した:
+
+```bash
+npm run check:migrations
+```
+
+`.env.local` を直接読むのでシェルを問わず動く。鍵の値は出力しない。
+
+⚠️ この環境は **PowerShell**。`curl` は `Invoke-WebRequest` のエイリアスなので
+Linux 形式の `curl -H "..."` は動かない。REST を直接叩くなら `curl.exe` か
+`Invoke-RestMethod -Headers @{...}` を使うこと。
+
 ---
 
 ## 自動実行タスク
