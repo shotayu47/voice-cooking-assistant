@@ -1,4 +1,5 @@
 import { renderTroublePlaybook } from '@/lib/cooking/trouble';
+import { resolveScaling } from '@/lib/recipes/scale';
 import type { CookingSession, Profile } from '@/types/domain';
 
 /** SPEC §11.2 — the behavioural contract, verbatim. */
@@ -102,6 +103,42 @@ const TROUBLE_RULES = `【調理中のトラブル対応】
 - 安全（最優先）と書かれた項目は、味や仕上がりより常に優先してください。
   ユーザーが「大丈夫そう」と言っても、加熱不足を大丈夫だと追認しないでください。`;
 
+/**
+ * PHASE 8. Amount arithmetic is the server's job.
+ *
+ * Two failures this replaces. Multiplying amounts in prose produces numbers
+ * nobody checked; and a model asked for "double the recipe" will cheerfully
+ * double the cooking time along with the chicken. The first rule sends the
+ * arithmetic to a tool, the last one refuses the second failure outright.
+ */
+const AMOUNT_RULES = `【分量】
+- 分量を変える計算を自分でしないでください。人数の変更・倍量・半量は adjust_recipe_amounts を
+  mode: "scale" と target_servings で呼び、**返ってきた数値をそのまま**伝えてください。
+- 「今ある分で何人分作れる?」は mode: "max_from_inventory" で呼んでください。
+- capacity_status が exact でないときは「最大◯人分作れます」と断定しないでください。
+  確認できた範囲であることを述べ、unverified_constraints に挙がった材料（数量不明・単位が比べられない等）を
+  そのまま伝えて、ユーザーに確認してもらってください。
+- 「適量」「少々」を数値に変えないでください。倍率を掛けた数字を作らないでください。
+- 端数はそのまま伝えてください。「卵1と1/2個」は勝手に2個に丸めず、
+  溶いて半量使うといった現実的な方法を添えてください。
+- 加熱時間と火力は自動で倍率変更しません。「2倍だから2倍の時間」とは言わないでください。
+  量・鍋の大きさ・食材の厚みによって変わるため、火の通りを確認すること、
+  必要なら分けて調理することを伝えてください。
+- 調理中の分量を聞かれたら get_current_cooking_step を呼び、その ingredients の値を答えてください。
+  会話の記憶から答えないでください。`;
+
+/**
+ * PHASE 8, session-only. Changing the servings mid-cook is the case where a
+ * confident answer does real damage: what is already in the pan cannot come
+ * back out, so the difference has to be stated rather than the total.
+ */
+const COOKING_AMOUNT_RULES = `【調理中に分量を変えられたら】
+- adjust_recipe_amounts の already_added を必ず確認してください。すでに入れた分は元に戻せません。
+- status が partially_added の材料は、合計ではなく「あと◯◯」という差分で伝えてください。
+- status が unknown の材料は、入れた量が記録されていません。量を断定せず、
+  何をどれだけ入れたかユーザーに確認してください。
+- 分量を変えただけで工程を進めないでください。advance_cooking_step を呼ばないでください。`;
+
 const IH_10_TABLE = `【火力の目安（IH 10段階）】
 とろ火 1〜2 / 弱火 2〜3 / 弱めの中火 3〜4 / 中火 5 / 強めの中火 6〜7 / 強火 8〜9 / 最大・沸騰 10
 これは目安です。物理的な等価ではありません。実際の焼き色や煮え方を優先して調整を案内してください。`;
@@ -170,7 +207,8 @@ export function buildSystemPrompt(options: {
   /** Current inventory. Voice mints once, so its copy is marked as a snapshot. */
   inventory?: InventorySnapshotItem[];
 }): string {
-  const parts = [BASE_SYSTEM_PROMPT, TOOL_USAGE_RULES];
+  // Amount rules apply everywhere: writing a recipe, planning, and cooking.
+  const parts = [BASE_SYSTEM_PROMPT, TOOL_USAGE_RULES, AMOUNT_RULES];
 
   if (options.mode === 'voice') {
     parts.push(VOICE_STYLE_RULES);
@@ -192,13 +230,18 @@ export function buildSystemPrompt(options: {
     // Trouble handling is only reachable while something is on the heat, and
     // the playbook is long. Injecting it on every turn would spend tokens on
     // inventory and meal-planning turns that can never use it.
-    parts.push(TROUBLE_RULES, renderTroublePlaybook());
+    parts.push(TROUBLE_RULES, renderTroublePlaybook(), COOKING_AMOUNT_RULES);
 
     const recipe = options.session.recipe_snapshot;
+    const scaling = resolveScaling(recipe);
     parts.push(`進行中の料理: 「${recipe.title}」
 セッションID: ${options.session.id}
 現在の工程: ${options.session.current_step + 1} / ${options.session.total_steps}
-工程の実際の値はデータベース側の値が正です。get_current_cooking_step で確認してください。`);
+分量: ${scaling.targetServings}人分${
+      scaling.adjusted ? `（レシピの基準は${scaling.baseServings}人分。調整済み）` : ''
+    }
+工程の実際の値はデータベース側の値が正です。get_current_cooking_step で確認してください。
+分量も同じです。記憶ではなくツールの値を答えてください。`);
   } else {
     parts.push('進行中の料理はありません。');
   }

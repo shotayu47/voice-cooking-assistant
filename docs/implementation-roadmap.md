@@ -161,7 +161,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 5 | 調理セッション・工程状態管理 | **COMPLETE** | `a7623cb` | yes | `0004_cooking_progress.sql` | ✅ 適用済み |
 | 6 | 複数タイマー | **BLOCKED 🔒**（実測待ち） | — | — | — | — |
 | 7 | 調理中のトラブル対応 | **COMPLETE** | `bfa1dbe` | yes | なし | — |
-| 8 | 分量の自動調整 | NOT_STARTED | — | — | — | — |
+| 8 | 分量の自動調整 | **COMPLETE** | `4bdf619` | no | なし | — |
 | 9 | 買い物リスト | NOT_STARTED | — | — | — | — |
 | 10 | AI 買い物候補提案 | NOT_STARTED | — | — | — | — |
 | 11 | レシート読み込み | NOT_STARTED | — | — | — | — |
@@ -600,7 +600,11 @@ PHASE 3 で対話セッションと自動タスクが同じ PHASE を並行実�
 
 PHASE 6 が実測待ちの間に PHASE 7 を先に完了させた。PHASE 7 はタイマーに依存しない
 （プロンプトとトラブル対応表のみ）ため、実測結果がどうなっても作り直しは発生しない。
-次に着手できるのは **PHASE 8**（PHASE 6 は実測待ちのまま）。
+
+**PHASE 8 も同じ理由で先に完了させた**（`feature/phase8-quantity-adjust` ブランチ。
+タイマーに依存せず、migration も無い）。設計記録は
+`docs/phase8-quantity-adjustment.md` に分離してある。
+次に着手できるのは **PHASE 9**（PHASE 6 は実測待ちのまま）。
 
 ## 次セッションで最初にやること
 

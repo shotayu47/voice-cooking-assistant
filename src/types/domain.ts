@@ -130,6 +130,21 @@ export type RecipeStep = {
   safetyNote?: string;
 };
 
+/**
+ * PHASE 8 — how many servings the amounts are being cooked for.
+ *
+ * Deliberately metadata rather than rewritten amounts: `ingredients` stays the
+ * recipe as written, and every scaled figure is derived as
+ * `amount × targetServings / baseServings`. Changing 2 → 4 → 3 servings
+ * therefore always recomputes from the same base instead of compounding.
+ */
+export type RecipeScaling = {
+  /** Servings the stored `ingredients` amounts belong to. */
+  baseServings: number;
+  /** Servings the user actually wants. */
+  targetServings: number;
+};
+
 export type Recipe = {
   title: string;
   description?: string;
@@ -138,6 +153,9 @@ export type Recipe = {
   difficulty?: Difficulty;
   ingredients: RecipeIngredient[];
   steps: RecipeStep[];
+  /** Absent on every recipe that has not been adjusted — including all
+   *  snapshots written before PHASE 8. */
+  scaling?: RecipeScaling | null;
 };
 
 export type StoredRecipe = Recipe & {
