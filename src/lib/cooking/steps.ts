@@ -6,6 +6,7 @@
  * either boundary.
  */
 
+import { scaleRecipe, type ScaledIngredient } from '@/lib/recipes/scale';
 import type { Recipe, RecipeStep } from '@/types/domain';
 
 export type StepTransition = {
@@ -106,17 +107,43 @@ export function stepAt(recipe: Recipe, index: number): RecipeStep | null {
 }
 
 /**
+ * Ingredients referenced by a step, with the amounts for the servings this
+ * session is actually cooking (PHASE 8).
+ *
+ * Amounts come from `scaleRecipe`, so an adjusted session shows the adjusted
+ * figure here and in the assistant's answer from the same calculation — the
+ * screen and the voice reply cannot disagree.
+ */
+export function stepIngredientDetails(recipe: Recipe, index: number): ScaledIngredient[] {
+  const step = stepAt(recipe, index);
+  if (!step?.ingredientRefs?.length) return [];
+
+  const scaled = scaleRecipe(recipe).ingredients;
+
+  return step.ingredientRefs.map((ref) => {
+    const match = scaled.find((ingredient) => ingredient.name === ref);
+    if (match) return match;
+
+    // A step referencing something the ingredient list does not contain. Show
+    // the name and no amount rather than inventing one.
+    return {
+      name: ref,
+      policy: 'no_amount' as const,
+      amount: null,
+      unit: null,
+      baseAmount: null,
+      display: '',
+      required: true,
+    };
+  });
+}
+
+/**
  * Ingredients referenced by a step, resolved to display strings like
  * 「玉ねぎ 1個」 so cooking mode can show amounts for the current step only.
  */
 export function ingredientsForStep(recipe: Recipe, index: number): string[] {
-  const step = stepAt(recipe, index);
-  if (!step?.ingredientRefs?.length) return [];
-
-  return step.ingredientRefs.map((ref) => {
-    const ingredient = recipe.ingredients.find((candidate) => candidate.name === ref);
-    if (!ingredient) return ref;
-    const amount = [ingredient.amount, ingredient.unit].filter(Boolean).join('');
-    return amount ? `${ingredient.name} ${amount}` : ingredient.name;
-  });
+  return stepIngredientDetails(recipe, index).map((ingredient) =>
+    ingredient.display ? `${ingredient.name} ${ingredient.display}` : ingredient.name,
+  );
 }

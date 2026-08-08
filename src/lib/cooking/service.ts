@@ -8,6 +8,7 @@ import type {
 } from '@/types/domain';
 import { ServiceError, type ServiceContext } from '@/lib/inventory/service';
 import { getRecipe, toRecipeSnapshot } from '@/lib/recipes/service';
+import { isValidServings, MAX_SERVINGS, withTargetServings } from '@/lib/recipes/scale';
 import {
   advanceStep,
   isFinalStep,
@@ -272,6 +273,44 @@ function markStep(
     next.skipped_steps.every((value, position) => value === skipped[position]);
 
   return unchanged ? null : next;
+}
+
+/**
+ * Adjust how many servings this session is cooking (PHASE 8).
+ *
+ * Only the scaling metadata is written. `recipe_snapshot.ingredients` keeps the
+ * amounts the recipe was written with, so changing 2 → 4 → 3 servings always
+ * recalculates from the same base instead of scaling an already-scaled number.
+ * That also keeps this migration-free: the snapshot is already a per-session
+ * jsonb copy, and an older snapshot without the field simply reads as
+ * "not adjusted".
+ */
+export async function setSessionServings(
+  ctx: ServiceContext,
+  sessionId: string,
+  targetServings: number,
+): Promise<StepView> {
+  if (!isValidServings(targetServings)) {
+    throw new ServiceError(`人数は1〜${MAX_SERVINGS}の整数で指定してください`);
+  }
+
+  const session = await requireSession(ctx, sessionId);
+  if (TERMINAL_STATUSES.includes(session.status)) {
+    throw new ServiceError('この料理はすでに終了しています');
+  }
+
+  const snapshot = withTargetServings(session.recipe_snapshot as Recipe, targetServings);
+
+  const { data, error } = await ctx.supabase
+    .from('cooking_sessions')
+    .update({ recipe_snapshot: snapshot })
+    .eq('user_id', ctx.userId)
+    .eq('id', sessionId)
+    .select(SESSION_COLUMNS)
+    .single();
+
+  if (error) throw new ServiceError(error.message);
+  return toStepView(data as CookingSession);
 }
 
 /**
