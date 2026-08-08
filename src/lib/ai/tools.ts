@@ -21,7 +21,9 @@ import {
 import { createRecipe } from '@/lib/recipes/service';
 import {
   getCurrentStep,
+  getOpenSession,
   moveStep,
+  recordUsedIngredient,
   startSession,
   updateStatus,
 } from '@/lib/cooking/service';
@@ -369,11 +371,22 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
     function: {
       name: 'advance_cooking_step',
       description:
-        '工程を1つ進める。「次」「できた」など、完了が明確な場合のみ呼ぶこと。質問に答えるだけのときは呼ばない。',
+        `工程を1つ進める。「次」「できた」など、完了が明確な場合のみ呼ぶこと。質問に答えるだけのときは呼ばない。
+intent で「やった」のか「飛ばした」のかを区別する:
+・done … 「できた」「終わった」→ 完了として記録
+・skip … 「飛ばす」「これはやらない」「もう入れてある」→ スキップとして記録
+どちらか分からない場合は done にせず、ユーザーに確認すること。`,
       parameters: {
         type: 'object',
-        properties: { session_id: { type: 'string' } },
-        required: ['session_id'],
+        properties: {
+          session_id: { type: 'string' },
+          intent: {
+            type: 'string',
+            enum: ['done', 'skip'],
+            description: '工程を完了したのか飛ばしたのか',
+          },
+        },
+        required: ['session_id', 'intent'],
         additionalProperties: false,
       },
     },
@@ -674,6 +687,19 @@ async function dispatch(
         };
       }
 
+      // Cooking in progress? Record what was actually used, so the finished
+      // session carries the real ingredient list rather than the recipe's.
+      const openSession = await getOpenSession(ctx);
+      if (openSession) {
+        await recordUsedIngredient(ctx, openSession.id, {
+          name: outcome.item.name,
+          inventoryItemId: outcome.item.id,
+          amount: (args.amount as number | null) ?? null,
+          unit: (args.unit as string | null) ?? outcome.item.unit,
+          stepIndex: openSession.current_step,
+        });
+      }
+
       return {
         result: { status: 'applied', item: publicItem(outcome.item) },
         effect: 'inventory_changed',
@@ -820,6 +846,7 @@ async function dispatch(
     case 'advance_cooking_step': {
       const view = await moveStep(ctx, String(args.session_id), 'next', undefined, {
         aiInitiated: true,
+        intent: args.intent === 'skip' ? 'skip' : 'done',
       });
       return { result: stepResult(view), effect: 'session_changed', sessionId: view.session.id };
     }
@@ -889,6 +916,12 @@ function stepResult(view: Awaited<ReturnType<typeof getCurrentStep>>) {
     heat: view.step?.heat ?? null,
     ingredient_refs: view.step?.ingredientRefs ?? [],
     safety_note: view.step?.safetyNote ?? null,
+    // Progress detail so the assistant can answer 「あと何工程？」 and知る
+    // which steps were skipped rather than done.
+    completed_steps: view.progress.completed,
+    skipped_steps: view.progress.skipped,
+    remaining_steps: view.progress.remaining,
+    all_steps_accounted_for: view.progress.isFinished,
   };
 }
 

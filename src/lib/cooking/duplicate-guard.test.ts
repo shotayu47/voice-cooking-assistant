@@ -113,6 +113,92 @@ describe('AI-initiated step moves', () => {
   });
 });
 
+// PHASE 5 — marking rides the same conditional update as the move, so the
+// duplicate guards have to cover it too.
+describe('step marking', () => {
+  let ctx: ServiceContext;
+  let tables: Tables;
+
+  beforeEach(() => {
+    ({ ctx, tables } = setup({
+      cooking_sessions: [seedSession({ completed_steps: [], skipped_steps: [] })],
+    }));
+  });
+
+  it('records a step as done when advancing', async () => {
+    await moveStep(ctx, 'session-1', 'next', 0, { intent: 'done' });
+
+    expect(tables.cooking_sessions[0].completed_steps).toEqual([0]);
+    expect(tables.cooking_sessions[0].skipped_steps).toEqual([]);
+  });
+
+  it('records a step as skipped instead', async () => {
+    await moveStep(ctx, 'session-1', 'next', 0, { intent: 'skip' });
+
+    expect(tables.cooking_sessions[0].completed_steps).toEqual([]);
+    expect(tables.cooking_sessions[0].skipped_steps).toEqual([0]);
+  });
+
+  it('does not record the same step twice on a duplicate relay', async () => {
+    await moveStep(ctx, 'session-1', 'next', undefined, {
+      aiInitiated: true,
+      intent: 'done',
+    });
+    await moveStep(ctx, 'session-1', 'next', undefined, {
+      aiInitiated: true,
+      intent: 'done',
+    });
+
+    expect(tables.cooking_sessions[0].completed_steps).toEqual([0]);
+    expect(tables.cooking_sessions[0].current_step).toBe(1);
+  });
+
+  it('marks the final step even though the position cannot move', async () => {
+    ({ ctx, tables } = setup({
+      cooking_sessions: [
+        seedSession({ current_step: 3, completed_steps: [0, 1, 2], skipped_steps: [] }),
+      ],
+    }));
+
+    await moveStep(ctx, 'session-1', 'next', 3, { intent: 'done' });
+
+    expect(tables.cooking_sessions[0].completed_steps).toEqual([0, 1, 2, 3]);
+  });
+
+  it('completing a step it had skipped clears the skip', async () => {
+    ({ ctx, tables } = setup({
+      cooking_sessions: [seedSession({ completed_steps: [], skipped_steps: [0] })],
+    }));
+
+    await moveStep(ctx, 'session-1', 'next', 0, { intent: 'done' });
+
+    expect(tables.cooking_sessions[0].completed_steps).toEqual([0]);
+    expect(tables.cooking_sessions[0].skipped_steps).toEqual([]);
+  });
+
+  it('going back records nothing either way', async () => {
+    ({ ctx, tables } = setup({
+      cooking_sessions: [seedSession({ current_step: 2, completed_steps: [0, 1] })],
+    }));
+
+    await moveStep(ctx, 'session-1', 'previous', 2, { intent: 'done' });
+
+    expect(tables.cooking_sessions[0].completed_steps).toEqual([0, 1]);
+    expect(tables.cooking_sessions[0].current_step).toBe(1);
+  });
+
+  it('reports progress in the step view', async () => {
+    const view = await moveStep(ctx, 'session-1', 'next', 0, { intent: 'skip' });
+
+    expect(view.progress).toMatchObject({
+      completed: [],
+      skipped: [0],
+      remaining: [1, 2, 3],
+      isFinished: false,
+    });
+  });
+});
+
 describe('terminal session status', () => {
   it('refuses to reopen a completed session', async () => {
     const { ctx, tables } = setup({

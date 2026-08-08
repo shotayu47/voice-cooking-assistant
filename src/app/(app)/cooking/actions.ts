@@ -17,7 +17,25 @@ export type StepState = {
   totalSteps: number;
   isFinalStep: boolean;
   status: CookingSessionStatus;
+  completedSteps: number[];
+  skippedSteps: number[];
 };
+
+function toStepState(view: {
+  session: { current_step: number; status: CookingSessionStatus };
+  totalSteps: number;
+  isFinalStep: boolean;
+  progress: { completed: number[]; skipped: number[] };
+}): StepState {
+  return {
+    currentStep: view.session.current_step,
+    totalSteps: view.totalSteps,
+    isFinalStep: view.isFinalStep,
+    status: view.session.status,
+    completedSteps: view.progress.completed,
+    skippedSteps: view.progress.skipped,
+  };
+}
 
 /**
  * Move one step. `expectedStep` is the step the client is currently showing —
@@ -27,18 +45,15 @@ export async function moveStepAction(
   sessionId: string,
   direction: 'next' | 'previous',
   expectedStep: number,
+  /** Forward only: whether the step was done or jumped over. */
+  intent: 'done' | 'skip' = 'done',
 ): Promise<StepState> {
   const { ctx } = await getServiceContext();
-  const view = await moveStep(ctx, sessionId, direction, expectedStep);
+  const view = await moveStep(ctx, sessionId, direction, expectedStep, { intent });
 
   revalidatePath(`/cooking/${sessionId}`);
 
-  return {
-    currentStep: view.session.current_step,
-    totalSteps: view.totalSteps,
-    isFinalStep: view.isFinalStep,
-    status: view.session.status,
-  };
+  return toStepState(view);
 }
 
 /**
@@ -48,13 +63,7 @@ export async function moveStepAction(
 export async function getStepStateAction(sessionId: string): Promise<StepState> {
   const { ctx } = await getServiceContext();
   const view = await getCurrentStep(ctx, sessionId);
-
-  return {
-    currentStep: view.session.current_step,
-    totalSteps: view.totalSteps,
-    isFinalStep: view.isFinalStep,
-    status: view.session.status,
-  };
+  return toStepState(view);
 }
 
 export async function finishSessionAction(

@@ -43,6 +43,8 @@ export default async function CookingPage({
       recipe={recipe}
       initialStep={session.current_step}
       totalSteps={session.total_steps}
+      initialCompleted={session.completed_steps ?? []}
+      initialSkipped={session.skipped_steps ?? []}
     />
   );
 }

@@ -1,9 +1,23 @@
 import 'server-only';
 
-import type { CookingSession, CookingSessionStatus, Recipe } from '@/types/domain';
+import type {
+  CookingSession,
+  CookingSessionStatus,
+  Recipe,
+  UsedIngredient,
+} from '@/types/domain';
 import { ServiceError, type ServiceContext } from '@/lib/inventory/service';
 import { getRecipe, toRecipeSnapshot } from '@/lib/recipes/service';
-import { advanceStep, isFinalStep, previousStep, stepAt } from './steps';
+import {
+  advanceStep,
+  isFinalStep,
+  previousStep,
+  stepAt,
+  stepProgress,
+  withStepMarked,
+  withStepUnmarked,
+  type StepProgress,
+} from './steps';
 
 /**
  * `*` rather than an explicit list so the code runs against a database where
@@ -111,6 +125,7 @@ export type StepView = {
   stepNumber: number;
   totalSteps: number;
   isFinalStep: boolean;
+  progress: StepProgress;
 };
 
 export async function getCurrentStep(
@@ -129,6 +144,11 @@ export function toStepView(session: CookingSession): StepView {
     stepNumber: session.current_step + 1,
     totalSteps: session.total_steps,
     isFinalStep: isFinalStep(session.current_step, session.total_steps),
+    progress: stepProgress(
+      session.total_steps,
+      session.completed_steps ?? [],
+      session.skipped_steps ?? [],
+    ),
   };
 }
 
@@ -145,7 +165,14 @@ export async function moveStep(
   sessionId: string,
   direction: 'next' | 'previous',
   expectedStep?: number,
-  options: { aiInitiated?: boolean } = {},
+  options: {
+    aiInitiated?: boolean;
+    /**
+     * Moving forward because the step is done, or because it is being jumped
+     * over. Only these two differ — going back marks nothing either way.
+     */
+    intent?: 'done' | 'skip';
+  } = {},
 ): Promise<StepView> {
   const session = await requireSession(ctx, sessionId);
 
@@ -179,12 +206,23 @@ export async function moveStep(
       ? advanceStep(session.current_step, session.total_steps)
       : previousStep(session.current_step, session.total_steps);
 
-  if (!transition.changed) return toStepView(session);
+  // Marking rides the same conditional update as the move, so the existing
+  // duplicate guards cover it too. `withStepMarked` is a union, so a repeated
+  // tap cannot record the same step twice.
+  const hasProgress = 'completed_steps' in session;
+  const marking =
+    hasProgress && direction === 'next' && options.intent
+      ? markStep(session, options.intent)
+      : null;
+
+  // Nothing to do — already at the boundary and nothing new to record.
+  if (!transition.changed && !marking) return toStepView(session);
 
   const { data, error } = await ctx.supabase
     .from('cooking_sessions')
     .update({
       current_step: transition.currentStep,
+      ...(marking ?? {}),
       ...(options.aiInitiated && hasMoveMarker
         ? { last_ai_step_move_at: new Date().toISOString() }
         : {}),
@@ -201,6 +239,66 @@ export async function moveStep(
   if (!data) return toStepView(await requireSession(ctx, sessionId));
 
   return toStepView(data as CookingSession);
+}
+
+/**
+ * The progress columns to write when leaving a step, or null when nothing
+ * would change. Completing a step also clears it from the skipped set — you
+ * cannot have both skipped and done the same thing.
+ */
+function markStep(
+  session: CookingSession,
+  intent: 'done' | 'skip',
+): { completed_steps: number[]; skipped_steps: number[] } | null {
+  const index = session.current_step;
+  const completed = session.completed_steps ?? [];
+  const skipped = session.skipped_steps ?? [];
+
+  const next =
+    intent === 'done'
+      ? {
+          completed_steps: withStepMarked(completed, index),
+          skipped_steps: withStepUnmarked(skipped, index),
+        }
+      : {
+          completed_steps: withStepUnmarked(completed, index),
+          skipped_steps: withStepMarked(skipped, index),
+        };
+
+  const unchanged =
+    next.completed_steps.length === completed.length &&
+    next.skipped_steps.length === skipped.length &&
+    next.completed_steps.every((value, position) => value === completed[position]) &&
+    next.skipped_steps.every((value, position) => value === skipped[position]);
+
+  return unchanged ? null : next;
+}
+
+/**
+ * Record what a cook consumed. Appended as inventory is decremented, so the
+ * finished session carries the real ingredient list rather than the recipe's
+ * intended one — which is what cooking history needs.
+ */
+export async function recordUsedIngredient(
+  ctx: ServiceContext,
+  sessionId: string,
+  entry: Omit<UsedIngredient, 'recordedAt'>,
+): Promise<void> {
+  const session = await getSession(ctx, sessionId);
+  if (!session) return;
+  if (!('used_ingredients' in session)) return; // migration 0004 not applied
+
+  const existing = session.used_ingredients ?? [];
+  const { error } = await ctx.supabase
+    .from('cooking_sessions')
+    .update({
+      used_ingredients: [...existing, { ...entry, recordedAt: new Date().toISOString() }],
+    })
+    .eq('user_id', ctx.userId)
+    .eq('id', sessionId);
+
+  // Bookkeeping must not fail a user action that already succeeded.
+  if (error) console.error('[cooking] failed to record used ingredient:', error.message);
 }
 
 const TERMINAL_STATUSES: CookingSessionStatus[] = ['completed', 'cancelled'];

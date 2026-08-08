@@ -24,13 +24,19 @@ export function CookingView({
   recipe,
   initialStep,
   totalSteps,
+  initialCompleted,
+  initialSkipped,
 }: {
   sessionId: string;
   recipe: Recipe;
   initialStep: number;
   totalSteps: number;
+  initialCompleted: number[];
+  initialSkipped: number[];
 }) {
   const [currentStep, setCurrentStep] = useState(initialStep);
+  const [completed, setCompleted] = useState(initialCompleted);
+  const [skipped, setSkipped] = useState(initialSkipped);
   const [pending, startTransition] = useTransition();
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -51,7 +57,7 @@ export function CookingView({
   const isFirst = currentStep === 0;
   const isLast = currentStep >= totalSteps - 1;
 
-  function move(direction: 'next' | 'previous') {
+  function move(direction: 'next' | 'previous', intent: 'done' | 'skip' = 'done') {
     // Two taps inside 600ms is a bounce, not an intent to skip two steps.
     const now = Date.now();
     if (pending || now - lastTapRef.current < 600) return;
@@ -61,8 +67,10 @@ export function CookingView({
     setError(null);
     startTransition(async () => {
       try {
-        const state = await moveStepAction(sessionId, direction, expected);
+        const state = await moveStepAction(sessionId, direction, expected, intent);
         setCurrentStep(state.currentStep);
+        setCompleted(state.completedSteps);
+        setSkipped(state.skippedSteps);
       } catch {
         // The step lives in the database; a failed move means the screen may
         // now disagree with it. Say so rather than implying it worked.
@@ -88,6 +96,8 @@ export function CookingView({
           return;
         }
         setCurrentStep(state.currentStep);
+        setCompleted(state.completedSteps);
+        setSkipped(state.skippedSteps);
       } catch {
         // Re-render on next interaction; nothing to surface mid-cook.
       }
@@ -116,18 +126,38 @@ export function CookingView({
             {currentStep + 1}
           </span>
           <span className="text-sm text-faint">/ {totalSteps}</span>
+          {skipped.length > 0 ? (
+            <span className="ml-auto text-xs text-muted">{skipped.length}工程スキップ</span>
+          ) : null}
         </div>
+
+        {/*
+          One segment per step rather than a single bar: with skipping, how far
+          along you are is no longer the same as which step is on screen.
+        */}
         <div
-          className="mt-2 h-1 overflow-hidden rounded-full bg-surface-2"
+          className="mt-2 flex gap-0.5"
           role="progressbar"
-          aria-valuenow={currentStep + 1}
-          aria-valuemin={1}
+          aria-valuenow={completed.length}
+          aria-valuemin={0}
           aria-valuemax={totalSteps}
+          aria-label={`${totalSteps}工程中${completed.length}工程完了`}
         >
-          <div
-            className="h-full rounded-full bg-accent transition-[width]"
-            style={{ width: `${((currentStep + 1) / totalSteps) * 100}%` }}
-          />
+          {Array.from({ length: totalSteps }, (_, index) => (
+            <span
+              key={index}
+              className={cn(
+                'h-1 flex-1 rounded-full',
+                index === currentStep
+                  ? 'bg-accent'
+                  : completed.includes(index)
+                    ? 'bg-accent/50'
+                    : skipped.includes(index)
+                      ? 'bg-muted/40'
+                      : 'bg-surface-2',
+              )}
+            />
+          ))}
         </div>
       </div>
 
@@ -184,7 +214,7 @@ export function CookingView({
           </button>
           <button
             type="button"
-            onClick={() => (isLast ? finish('completed') : move('next'))}
+            onClick={() => (isLast ? finish('completed') : move('next', 'done'))}
             disabled={pending}
             className={cn(
               'min-h-[72px] flex-1 rounded-xl text-xl font-bold active:bg-accent-strong disabled:opacity-50',
@@ -194,6 +224,22 @@ export function CookingView({
             {isLast ? '完成！' : 'できた / 次へ'}
           </button>
         </div>
+
+        {/*
+          Deliberately small and secondary: skipping is a real need — the step
+          is already done, or does not apply — but it must not be the button
+          someone hits by accident instead of 「できた」.
+        */}
+        {!isLast ? (
+          <button
+            type="button"
+            onClick={() => move('next', 'skip')}
+            disabled={pending}
+            className="min-h-11 w-full rounded-xl text-sm text-faint active:bg-surface-2 disabled:opacity-40"
+          >
+            この工程は飛ばす
+          </button>
+        ) : null}
 
         <VoicePanel
           onToolEffect={(effect) => {

@@ -161,6 +161,26 @@ export type CookingSession = {
   updated_at: string;
   /** Set only by AI-initiated moves; drives the duplicate-relay guard. */
   last_ai_step_move_at?: string | null;
+
+  // PHASE 5 — progress detail (migration 0004). Optional so the code still
+  // runs against a database where that migration has not been applied.
+  /** Step indices explicitly marked done. */
+  completed_steps?: number[] | null;
+  /** Step indices deliberately jumped over. */
+  skipped_steps?: number[] | null;
+  /** What this cook actually consumed. */
+  used_ingredients?: UsedIngredient[] | null;
+};
+
+/** One ingredient consumed during a cook, recorded as inventory is decremented. */
+export type UsedIngredient = {
+  name: string;
+  inventoryItemId: string | null;
+  amount: number | null;
+  unit: string | null;
+  /** Which step was on screen at the time, when known. */
+  stepIndex: number | null;
+  recordedAt: string;
 };
 
 export type InventoryTransaction = {

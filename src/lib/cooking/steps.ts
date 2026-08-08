@@ -46,6 +46,59 @@ export function goToStep(index: number, totalSteps: number): StepTransition {
   return { currentStep: to, changed: true, isFinalStep: isFinalStep(to, totalSteps) };
 }
 
+/**
+ * Add an index to a progress set. Union, not append: marking the same step
+ * done twice — a repeated tap, a replayed tool call — must not grow the list.
+ */
+export function withStepMarked(list: readonly number[], index: number): number[] {
+  return list.includes(index) ? [...list] : [...list, index].sort((a, b) => a - b);
+}
+
+/** Remove an index, e.g. a step marked done is no longer a skipped one. */
+export function withStepUnmarked(list: readonly number[], index: number): number[] {
+  return list.filter((value) => value !== index);
+}
+
+export type StepProgress = {
+  completed: number[];
+  skipped: number[];
+  /** Steps neither done nor deliberately skipped. */
+  remaining: number[];
+  /** Everything is accounted for — nothing left to do. */
+  isFinished: boolean;
+};
+
+/**
+ * What has and has not been done. `current_step` cannot answer this once a
+ * step can be skipped: "before the current step" would count a jumped-over
+ * step as completed.
+ */
+export function stepProgress(
+  totalSteps: number,
+  completed: readonly number[],
+  skipped: readonly number[],
+): StepProgress {
+  const inRange = (index: number) => index >= 0 && index < totalSteps;
+
+  const completedSet = [...new Set(completed.filter(inRange))].sort((a, b) => a - b);
+  // A step that was later completed is no longer skipped.
+  const skippedSet = [...new Set(skipped.filter(inRange))]
+    .filter((index) => !completedSet.includes(index))
+    .sort((a, b) => a - b);
+
+  const remaining: number[] = [];
+  for (let index = 0; index < totalSteps; index += 1) {
+    if (!completedSet.includes(index) && !skippedSet.includes(index)) remaining.push(index);
+  }
+
+  return {
+    completed: completedSet,
+    skipped: skippedSet,
+    remaining,
+    isFinished: totalSteps > 0 && remaining.length === 0,
+  };
+}
+
 export function stepAt(recipe: Recipe, index: number): RecipeStep | null {
   if (!Array.isArray(recipe.steps) || recipe.steps.length === 0) return null;
   const clamped = clamp(index, recipe.steps.length);
