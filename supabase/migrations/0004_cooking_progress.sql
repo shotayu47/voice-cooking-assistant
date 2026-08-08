@@ -11,17 +11,31 @@ alter table public.cooking_sessions
   add column if not exists skipped_steps integer[] not null default '{}',
   add column if not exists used_ingredients jsonb not null default '[]'::jsonb;
 
+-- A CHECK expression may not contain a subquery, but it may call a function
+-- that does. Both progress arrays index into recipe_snapshot.steps, so every
+-- element has to stay addressable.
+create or replace function public.int_array_within_bounds(
+  values_in integer[],
+  upper_bound integer
+)
+returns boolean
+language sql
+immutable
+as $$
+  select values_in is null or not exists (
+    select 1 from unnest(values_in) as step_index
+    where step_index < 0 or step_index >= upper_bound
+  );
+$$;
+
 do $$
 begin
-  -- Both sets index into recipe_snapshot.steps, so they must stay in range.
   if not exists (
     select 1 from pg_constraint where conname = 'cooking_sessions_completed_steps_in_range'
   ) then
     alter table public.cooking_sessions
       add constraint cooking_sessions_completed_steps_in_range
-      check (
-        completed_steps <@ (select array_agg(i) from generate_series(0, total_steps - 1) i)
-      );
+      check (public.int_array_within_bounds(completed_steps, total_steps));
   end if;
 
   if not exists (
@@ -29,9 +43,7 @@ begin
   ) then
     alter table public.cooking_sessions
       add constraint cooking_sessions_skipped_steps_in_range
-      check (
-        skipped_steps <@ (select array_agg(i) from generate_series(0, total_steps - 1) i)
-      );
+      check (public.int_array_within_bounds(skipped_steps, total_steps));
   end if;
 
   if not exists (
