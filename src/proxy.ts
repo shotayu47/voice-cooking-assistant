@@ -4,7 +4,26 @@ import { createServerClient } from '@supabase/ssr';
 import { getSupabaseAnonKey, getSupabaseUrl } from '@/lib/supabase/env';
 import { timed } from '@/lib/perf';
 
-const PUBLIC_PATHS = ['/login', '/auth/callback', '/auth/error'];
+const PUBLIC_PATHS = [
+  '/login',
+  '/auth/callback',
+  '/auth/error',
+  // TEMPORARY — MEASUREMENT ONLY. REVERT BEFORE THE PHASE 6 PR.
+  //
+  // Magic Link sign-in fails in iOS Safari on `main`, which makes it
+  // impossible to reach this page on the device we need to measure. The
+  // replacement (Email OTP) is being built on `feature/auth-otp`; this exists
+  // so the PHASE 6 measurement does not have to wait for it.
+  //
+  // Safe to expose only because the page is a pure browser measurement: it
+  // reads `performance`, `navigator`, lifecycle events and its own
+  // `tsugu-diag:*` storage keys, makes no request to our API, and touches no
+  // Supabase data. Scoped to the single path — `/diagnostics` itself and every
+  // other route stay behind the gate.
+  //
+  // This must not reach `main`, Production, or the PHASE 6 PR.
+  '/diagnostics/timer',
+];
 
 /**
  * Refreshes the Supabase session cookie on every request and gates the app
