@@ -163,7 +163,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 3 | 「今あるもので何作れる？」強化 | **COMPLETE** | `8e8891a` | yes | なし | — |
 | 4 | 食材・調味料の代替提案 | **COMPLETE** | `e67a0f4` | yes | なし | — |
 | 5 | 調理セッション・工程状態管理 | **COMPLETE** | `a7623cb` | yes | `0004_cooking_progress.sql` | ✅ 適用済み |
-| 6 | 複数タイマー | **COMPLETE** | `7b36eb8`..`6f71618` | 承認待ち | なし | — |
+| 6 | 複数タイマー | **COMPLETE** | `7b36eb8`..`6f71618` | yes | なし | — |
 | 7 | 調理中のトラブル対応 | **COMPLETE** | `bfa1dbe` | yes | なし | — |
 | 8 | 分量の自動調整 | NOT_STARTED | — | — | — | — |
 | 9 | 買い物リスト | NOT_STARTED | — | — | — | — |
