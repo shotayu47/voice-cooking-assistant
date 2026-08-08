@@ -161,7 +161,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 5 | 調理セッション・工程状態管理 | **COMPLETE** | `a7623cb` | yes | `0004_cooking_progress.sql` | ✅ 適用済み |
 | 6 | 複数タイマー | **BLOCKED 🔒**（実測待ち） | — | — | — | — |
 | 7 | 調理中のトラブル対応 | **COMPLETE** | `bfa1dbe` | yes | なし | — |
-| 8 | 分量の自動調整 | **COMPLETE** | — | no | なし | — |
+| 8 | 分量の自動調整 | **COMPLETE** | `4bdf619` | no | なし | — |
 | 9 | 買い物リスト | NOT_STARTED | — | — | — | — |
 | 10 | AI 買い物候補提案 | NOT_STARTED | — | — | — | — |
 | 11 | レシート読み込み | NOT_STARTED | — | — | — | — |
