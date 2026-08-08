@@ -389,7 +389,10 @@ export function TimerDiagnostics() {
       setDurationMs(ms);
       setDeadline(end);
       setNow(at);
-      setStats((current) => ({ ...current, maxGap: null, maxPerfGap: null }));
+      // Zero the tick counter as well as the gaps: "tick-derived elapsed" is
+      // only comparable with "real elapsed" if both are counted from the same
+      // moment, and real elapsed is measured from the start of the timer.
+      setStats((current) => ({ ...current, ticks: 0, maxGap: null, maxPerfGap: null }));
       stateRef.current.startedAt = at;
       stateRef.current.durationMs = ms;
       stateRef.current.deadline = end;
