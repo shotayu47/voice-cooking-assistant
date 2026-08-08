@@ -12,6 +12,7 @@
     "test:watch": "vitest",
     "icons": "node scripts/generate-icons.mjs",
     "test:live": "vitest run --config vitest.live.config.mts",
+    "dev:otp": "node scripts/dev-otp.mjs",
     "audit:rls": "node scripts/audit-rls.mjs",
     "check:migrations": "node scripts/check-migrations.mjs"
   },
