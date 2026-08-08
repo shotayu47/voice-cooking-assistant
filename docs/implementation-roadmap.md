@@ -45,7 +45,7 @@ REST を直接叩くなら `curl.exe` か `Invoke-RestMethod -Headers @{ key = '
 外部サービス名は影響を確認して別途。「名称変更だから」という理由だけで
 機械的に変えないこと。
 
-#### 第1段階：表示名のみ **COMPLETE**（commit は次の「commit 記録」で追記）
+#### 第1段階：表示名のみ **COMPLETE**（`534311b`）
 
 変更前: 表示名 `料理アシスタント` / `short_name` `料理` /
 `appleWebApp.title` `料理`
