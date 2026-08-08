@@ -1,3 +1,4 @@
+import { renderTroublePlaybook } from '@/lib/cooking/trouble';
 import type { CookingSession, Profile } from '@/types/domain';
 
 /** SPEC §11.2 — the behavioural contract, verbatim. */
@@ -80,6 +81,26 @@ const TOOL_USAGE_RULES = `【ツールの使い方】
 - 手順（steps）は必ず1工程1動作の粒度に分割してください。
   悪い例: 「玉ねぎを切って鶏肉を炒めて調味料を加える」
   良い例: 「玉ねぎを薄切りにする」「鶏肉を一口大に切る」「フライパンを中火で温める」`;
+
+/**
+ * PHASE 7. Only used while a session is open — see `buildSystemPrompt`.
+ *
+ * The ordering rule is the point of this block. When something is burning the
+ * user is holding a pan, not reading; an explanation that arrives before the
+ * instruction is worse than no answer.
+ */
+const TROUBLE_RULES = `【調理中のトラブル対応】
+- トラブルを訴えられたら、**最初の1文は必ず「今すぐやる動作」**にしてください。
+  原因の説明・慰め・前置きを先に置かないでください。ユーザーは鍋の前にいます。
+- 対応は【トラブル対応表】に従ってください。表の「今すぐ」「してはいけない」に反することを言わないでください。
+- 表に無いトラブルでも、まず火を止めるか弱めるかを最初に判断してください。
+- **工程を進めないでください。** トラブル対応中に advance_cooking_step を呼ばないでください。
+  復旧してユーザーが「できた」と言うまで、現在の工程のままです。
+- 復旧に材料が要る場合は find_inventory_item で在庫を確認し、**在庫にあるものだけ**を提案してください。
+- 「元に戻せない」ものは、戻せると言わないでください。失われたものを認めたうえで、
+  そのうえで一番マシな選択肢（別の料理に転用する・その部分を捨てる）を出してください。
+- 安全（最優先）と書かれた項目は、味や仕上がりより常に優先してください。
+  ユーザーが「大丈夫そう」と言っても、加熱不足を大丈夫だと追認しないでください。`;
 
 const IH_10_TABLE = `【火力の目安（IH 10段階）】
 とろ火 1〜2 / 弱火 2〜3 / 弱めの中火 3〜4 / 中火 5 / 強めの中火 6〜7 / 強火 8〜9 / 最大・沸騰 10
@@ -168,6 +189,11 @@ export function buildSystemPrompt(options: {
   }
 
   if (options.session) {
+    // Trouble handling is only reachable while something is on the heat, and
+    // the playbook is long. Injecting it on every turn would spend tokens on
+    // inventory and meal-planning turns that can never use it.
+    parts.push(TROUBLE_RULES, renderTroublePlaybook());
+
     const recipe = options.session.recipe_snapshot;
     parts.push(`進行中の料理: 「${recipe.title}」
 セッションID: ${options.session.id}
