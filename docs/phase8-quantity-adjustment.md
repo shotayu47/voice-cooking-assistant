@@ -251,13 +251,30 @@ live: `src/lib/ai/amount-live.check.ts` 4件（`npm run test:live`）。
 
 `npm run test:live` は 4 ファイル並列で実行されると、OpenAI アカウントの
 **TPM 上限（30,000）を1分以内に超えて 429 で落ちる**。挙動の問題ではないのに
-挙動のテストが落ちるため、2点だけ直した。
+挙動のテストが落ちる。
+
+原因は**並列実行だけ**だった。直した箇所も1つだけ:
 
 - `vitest.live.config.mts` に `fileParallelism: false`
-- live check の `maxRetries` を 2 → 5（`amount-live.check.ts` と
-  `trouble-live.check.ts`。retry 方針のみで、アサーションは変更していない）
 
-これで `npm run test:live` は 4ファイル9件が通る（所要 約90秒）。
+`maxRetries` は全ファイル **2 のまま**（既定値を変更していない）。
+一度 5 まで上げて通したが、`fileParallelism: false` だけで通ることを確認したため
+戻した。`trouble-live.check.ts`（PHASE 7）は origin/main と完全に同一。
+
+現在の live check のAPI使用量:
+
+| ファイル | テスト数 | OpenAI 呼び出し | 備考 |
+|---|---|---|---|
+| `realtime-live.check.ts` | 1 | 1 | セッション発行 |
+| `trouble-live.check.ts` | 3 | 3 | 1テスト1呼び出し。重複なし |
+| `amount-live.check.ts` | 4 | 4 | 1テスト1呼び出し。重複なし |
+| `backfill-expiry.check.ts` | 1 | 0 | Supabase のみ |
+
+1呼び出しあたりシステムプロンプト＋ツール定義で約4,000トークン。直列なら
+合計 約30,000トークンが 25〜40秒に分散するため、テスト間の待機は要らない。
+並列だとこれが数秒に集中して上限を超える。
+
+`npm run test:live` は 4ファイル9件が通る（連続2回実測。所要 39秒 / 24秒）。
 
 ## migration
 

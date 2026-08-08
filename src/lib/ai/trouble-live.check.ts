@@ -43,10 +43,7 @@ async function askDuringCooking(message: string) {
   const apiKey = process.env.OPENAI_API_KEY;
   expect(apiKey, 'OPENAI_API_KEY must be set').toBeTruthy();
 
-  // Raised from 2 in PHASE 8: the live suite now makes enough calls to cross
-  // the account's tokens-per-minute ceiling, and a 429 says nothing about the
-  // behaviour this file measures. Retry policy only — no assertion changed.
-  const openai = new OpenAI({ apiKey, timeout: 45_000, maxRetries: 5 });
+  const openai = new OpenAI({ apiKey, timeout: 45_000, maxRetries: 2 });
   const completion = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL || 'gpt-4.1',
     messages: [

@@ -58,10 +58,7 @@ async function askDuringCooking(message: string) {
   const apiKey = process.env.OPENAI_API_KEY;
   expect(apiKey, 'OPENAI_API_KEY must be set').toBeTruthy();
 
-  // The whole live suite runs against a 30k TPM account ceiling, and a tool
-  // loop is a lot of tokens in a short window. Back off through it rather than
-  // failing a behavioural check on a rate limit.
-  const openai = new OpenAI({ apiKey, timeout: 45_000, maxRetries: 5 });
+  const openai = new OpenAI({ apiKey, timeout: 45_000, maxRetries: 2 });
   const completion = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL || 'gpt-4.1',
     messages: [
