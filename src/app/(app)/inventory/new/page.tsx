@@ -3,7 +3,7 @@ import { PageShell } from '@/components/page-shell';
 import { createItemAction } from '../actions';
 import { ItemForm } from '../item-form';
 
-export const metadata = { title: '食材を追加 | 料理アシスタント' };
+export const metadata = { title: '食材を追加 | TSUGU' };
 
 export default function NewInventoryItemPage() {
   return (

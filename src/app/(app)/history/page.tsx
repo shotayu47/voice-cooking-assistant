@@ -7,7 +7,7 @@ import { listHistory } from '@/lib/cooking/service';
 import { getServiceContext } from '@/lib/supabase/server';
 import type { CookingSessionStatus, Recipe } from '@/types/domain';
 
-export const metadata = { title: '履歴 | 料理アシスタント' };
+export const metadata = { title: '履歴 | TSUGU' };
 
 const STATUS_LABEL: Record<CookingSessionStatus, string> = {
   active: '調理中',

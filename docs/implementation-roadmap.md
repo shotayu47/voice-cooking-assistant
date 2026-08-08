@@ -41,28 +41,35 @@ REST を直接叩くなら `curl.exe` か `Invoke-RestMethod -Headers @{ key = '
 
 ### 名称変更の作業方針
 
-まだ**一切変更していない**（決定を記録しただけ）。次セッションで着手する。
-
 **表示名から安全に変更する。内部識別子は必要性を判断してから。**
 外部サービス名は影響を確認して別途。「名称変更だから」という理由だけで
 機械的に変えないこと。
 
-#### 第1段階：表示名のみ（安全・次セッションで着手）
+#### 第1段階：表示名のみ **COMPLETE**（commit は次の「commit 記録」で追記）
 
-| ファイル | 変更対象 |
+変更前: 表示名 `料理アシスタント` / `short_name` `料理` /
+`appleWebApp.title` `料理`
+
+| ファイル | 変更内容 |
 |---|---|
-| `src/app/layout.tsx` | `title` / `applicationName` / `description` / `appleWebApp.title` |
-| `src/app/manifest.ts` | `name` / `short_name` / `description` |
-| 各ページの `metadata.title` | chat / cooking / history / inventory×3 / settings / login の7ファイル |
-| `src/app/login/page.tsx` | `<h1>` のロゴテキスト |
-| `README.md` | 見出し |
-| `docs/` | 関連記述 |
+| `src/app/layout.tsx` | `title` / `applicationName` / `appleWebApp.title` → `TSUGU` |
+| `src/app/manifest.ts` | `name` / `short_name` → `TSUGU` |
+| 各ページの `metadata.title` | `... \| 料理アシスタント` → `... \| TSUGU`（8ファイル） |
+| `src/app/login/page.tsx` | `<h1>` のロゴテキスト → `TSUGU` |
+| `README.md` | 見出し → `TSUGU`。内部識別子を変えない理由も明記 |
 
-現在の値: 表示名 `料理アシスタント` / `short_name` `料理` /
-説明 `冷蔵庫の中身を知っている料理の相棒`
+##### 変更しなかったもの（判断を残す）
 
-⚠️ `manifest.name` を変えても**インストール済み PWA には即反映されない**。
-再インストールが必要な場合がある。`start_url` は変えないこと（変えると別アプリ扱いになる）。
+| 対象 | 現在値 | 理由 |
+|---|---|---|
+| `description`（layout / manifest） | `冷蔵庫の中身を知っている料理の相棒` | **ブランド表記を含まない**。旧名の痕跡ではなく紹介文なので、名称変更を理由に書き換える必要がない |
+| ログイン画面のサブコピー | `冷蔵庫の中身を覚えている、料理の相棒。` | 同上 |
+| `src/lib/ai/prompt.ts` の `家庭料理専用の音声・テキスト料理アシスタント` | 変更なし | **役割の説明であってアプリ名ではない**。システムプロンプトの変更は AI の応答挙動を変えるため、表示名変更の範囲外 |
+| `package.json` の `name` / ディレクトリ名 / GitHub / Vercel / Supabase / 認証クッキー / DB / PWA `start_url` | すべて `voice-cooking-assistant` 系のまま | 第2・第3段階および「触ってはいけないもの」を参照 |
+
+⚠️ `manifest.name` / `appleWebApp.title` を変えても**インストール済み PWA には即反映されない**。
+ホーム画面のラベルは再インストールまで旧名のまま残ることがある（同一性は壊れない）。
+`start_url` は変えていない（変えると別アプリ扱いになる）。
 
 #### 第2段階：内部識別子（必要性を判断してから／変更不要の可能性が高い）
 
@@ -589,11 +596,10 @@ PHASE 3 で対話セッションと自動タスクが同じ PHASE を並行実�
 
 ## 次セッションで最初にやること
 
-**TSUGU への名称変更（第1段階：表示名のみ）。** PHASE 6 より先に片付ける。
-理由: 表示名の変更は小さく安全で、PHASE を跨いで散らかると後から一括で直しにくい。
-手順は「プロダクト名：TSUGU（確定）」の節を参照。
+TSUGU への名称変更（第1段階：表示名のみ）は **COMPLETE**。
+第2段階（内部識別子）と第3段階（外部サービス）は、必要性が生じるまで着手しない。
 
-その後 PHASE 6 へ進む。
+**PHASE 6 — 複数タイマー** へ進む。
 
 ---
 

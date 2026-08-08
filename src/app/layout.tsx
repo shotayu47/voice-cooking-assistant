@@ -3,14 +3,14 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: '料理アシスタント',
+  title: 'TSUGU',
   description: '冷蔵庫の中身を知っている料理の相棒',
-  applicationName: '料理アシスタント',
+  applicationName: 'TSUGU',
   manifest: '/manifest.webmanifest',
   appleWebApp: {
     capable: true,
     statusBarStyle: 'black-translucent',
-    title: '料理',
+    title: 'TSUGU',
   },
   formatDetection: { telephone: false },
   icons: {

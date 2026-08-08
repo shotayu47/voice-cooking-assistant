@@ -6,7 +6,7 @@ import type { Profile } from '@/types/domain';
 import { signOutAction } from './actions';
 import { SettingsForm } from './settings-form';
 
-export const metadata = { title: '設定 | 料理アシスタント' };
+export const metadata = { title: '設定 | TSUGU' };
 
 export default async function SettingsPage() {
   const { ctx, user } = await getServiceContext();

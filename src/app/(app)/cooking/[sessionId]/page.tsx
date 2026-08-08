@@ -8,7 +8,7 @@ import type { Recipe } from '@/types/domain';
 
 import { CookingView } from './cooking-view';
 
-export const metadata = { title: '調理中 | 料理アシスタント' };
+export const metadata = { title: '調理中 | TSUGU' };
 
 export default async function CookingPage({
   params,

@@ -2,8 +2,8 @@ import type { MetadataRoute } from 'next';
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: '料理アシスタント',
-    short_name: '料理',
+    name: 'TSUGU',
+    short_name: 'TSUGU',
     description: '冷蔵庫の中身を知っている料理の相棒',
     start_url: '/',
     display: 'standalone',

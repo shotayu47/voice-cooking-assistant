@@ -9,7 +9,7 @@ import type { Category, InventoryItem } from '@/types/domain';
 
 import { InventoryRow } from './inventory-row';
 
-export const metadata = { title: '在庫 | 料理アシスタント' };
+export const metadata = { title: '在庫 | TSUGU' };
 
 export default async function InventoryPage() {
   const pageStart = now();

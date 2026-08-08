@@ -1,7 +1,12 @@
-# 料理アシスタント — Voice Cooking Assistant
+# TSUGU
 
 冷蔵庫の中身を覚えていて、1工程ずつ料理を案内するパーソナルアシスタント。
 本リポジトリは **SPEC.md の Phase 1（テキスト MVP）と Phase 2（Realtime 音声）** の実装です。
+
+プロダクト名は **TSUGU**（全て大文字）。由来は「継ぐ」— 台所の記憶を次へ引き継ぐこと。
+リポジトリ名・パッケージ名・デプロイURL は `voice-cooking-assistant` のままです。
+これらは既存の認証・デプロイの同一性に関わるため、表示名の変更とは分離しています
+（`docs/implementation-roadmap.md` の「プロダクト名：TSUGU（確定）」を参照）。
 
 ## 設計の要点
 

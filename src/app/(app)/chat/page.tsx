@@ -4,7 +4,7 @@ import { getServiceContext } from '@/lib/supabase/server';
 
 import { ChatView } from './chat-view';
 
-export const metadata = { title: 'AIに相談 | 料理アシスタント' };
+export const metadata = { title: 'AIに相談 | TSUGU' };
 
 export default async function ChatPage() {
   const { ctx } = await getServiceContext();

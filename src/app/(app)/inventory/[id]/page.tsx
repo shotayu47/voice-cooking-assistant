@@ -8,7 +8,7 @@ import { getServiceContext } from '@/lib/supabase/server';
 import { deleteItemAction, updateItemAction } from '../actions';
 import { ItemForm } from '../item-form';
 
-export const metadata = { title: '食材を編集 | 料理アシスタント' };
+export const metadata = { title: '食材を編集 | TSUGU' };
 
 export default async function EditInventoryItemPage({
   params,
