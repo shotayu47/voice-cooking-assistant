@@ -7,6 +7,7 @@ import { getServiceContext } from '@/lib/supabase/server';
 import type { Recipe } from '@/types/domain';
 
 import { CookingView } from './cooking-view';
+import { CookingTimersProvider } from './timers-provider';
 
 export const metadata = { title: '調理中 | TSUGU' };
 
@@ -38,13 +39,19 @@ export default async function CookingPage({
   }
 
   return (
-    <CookingView
-      sessionId={session.id}
-      recipe={recipe}
-      initialStep={session.current_step}
-      totalSteps={session.total_steps}
-      initialCompleted={session.completed_steps ?? []}
-      initialSkipped={session.skipped_steps ?? []}
-    />
+    // Wraps the view rather than sitting inside it, so no step change can reach
+    // the provider and remount it — a running timer outlives the step it was
+    // started from. `userId` scopes the storage key so two accounts sharing a
+    // phone cannot read each other's timers.
+    <CookingTimersProvider userId={ctx.userId} sessionId={session.id}>
+      <CookingView
+        sessionId={session.id}
+        recipe={recipe}
+        initialStep={session.current_step}
+        totalSteps={session.total_steps}
+        initialCompleted={session.completed_steps ?? []}
+        initialSkipped={session.skipped_steps ?? []}
+      />
+    </CookingTimersProvider>
   );
 }

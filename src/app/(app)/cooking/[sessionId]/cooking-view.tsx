@@ -10,6 +10,7 @@ import type { Recipe } from '@/types/domain';
 import { finishSessionAction, getStepStateAction, moveStepAction } from '../actions';
 import { AskSheet } from './ask-sheet';
 import { StepTimer } from './step-timer';
+import { TimerPanel } from './timer-panel';
 import { VoicePanel } from '@/components/voice-panel';
 
 /**
@@ -186,7 +187,7 @@ export function CookingView({
             </span>
           ) : null}
           {step?.durationSeconds ? (
-            <StepTimer key={currentStep} seconds={step.durationSeconds} />
+            <StepTimer stepIndex={currentStep} seconds={step.durationSeconds} />
           ) : null}
         </div>
 
@@ -197,6 +198,11 @@ export function CookingView({
         ) : null}
 
         {error ? <p className="text-sm text-danger">{error}</p> : null}
+      </div>
+
+      {/* Outside the step body so it stays on screen as the cook moves on. */}
+      <div className="px-4 pb-3">
+        <TimerPanel />
       </div>
 
       <div
