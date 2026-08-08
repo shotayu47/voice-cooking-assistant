@@ -1,64 +1,56 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
-
 import { cn } from '@/lib/cn';
+import { formatRemaining, isOverdue, remainingMs } from '@/lib/cooking/timers';
+
+import { useCookingTimers } from './timers-provider';
 
 /**
- * A one-shot countdown for the current step. Deliberately not persisted: a
- * timer that survives a reload but kept running while the phone was locked
- * would be misleading about how long the pan has actually been on.
+ * The per-step way into the session's timer list.
+ *
+ * It no longer owns a countdown of its own. Tapping hands the step's duration
+ * to the shared store, so the timer outlives the step: the previous version was
+ * mounted with `key={currentStep}` and was therefore thrown away the moment the
+ * cook moved on, which is the bug PHASE 6 exists to fix.
+ *
+ * While this step's timer is running the button becomes a read-only chip. A
+ * second timer for the same step is still possible through the panel's add
+ * form; what is prevented is starting a duplicate by tapping twice.
  */
-export function StepTimer({ seconds }: { seconds: number }) {
-  const [remaining, setRemaining] = useState(seconds);
-  const [running, setRunning] = useState(false);
-  const deadlineRef = useRef<number | null>(null);
+export function StepTimer({ stepIndex, seconds }: { stepIndex: number; seconds: number }) {
+  const { timers, now, start, canAdd } = useCookingTimers();
 
-  useEffect(() => {
-    if (!running) return;
+  const mine = timers.find(
+    (timer) => timer.status === 'running' && timer.origin?.stepIndex === stepIndex,
+  );
 
-    deadlineRef.current = Date.now() + remaining * 1000;
-    const id = setInterval(() => {
-      const left = Math.max(0, Math.round((deadlineRef.current! - Date.now()) / 1000));
-      setRemaining(left);
-      if (left === 0) setRunning(false);
-    }, 250);
-
-    return () => clearInterval(id);
-    // `remaining` is intentionally read once when the timer starts; including
-    // it here would reset the deadline on every tick.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running]);
-
-  const done = remaining === 0;
+  if (mine) {
+    const over = isOverdue(mine, now);
+    return (
+      <span
+        className={cn(
+          'inline-flex min-h-11 items-center rounded-lg border px-3 text-sm tabular-nums',
+          over ? 'border-warn/40 bg-warn/10 text-warn' : 'border-line text-muted',
+        )}
+      >
+        {over ? '時間です' : `計測中 ${formatRemaining(remainingMs(mine, now))}`}
+      </span>
+    );
+  }
 
   return (
     <button
       type="button"
-      onClick={() => {
-        if (done) {
-          setRemaining(seconds);
-          setRunning(true);
-        } else {
-          setRunning((value) => !value);
-        }
-      }}
-      className={cn(
-        'min-h-11 rounded-lg border px-3 text-sm tabular-nums',
-        done
-          ? 'border-ok/40 bg-ok/10 text-ok'
-          : running
-            ? 'border-accent/40 bg-accent/10 text-accent'
-            : 'border-line text-fg',
-      )}
+      disabled={!canAdd}
+      onClick={() =>
+        start({
+          durationMs: seconds * 1000,
+          origin: { stepIndex, label: `工程${stepIndex + 1}` },
+        })
+      }
+      className="min-h-11 rounded-lg border border-accent/40 bg-accent/10 px-3 text-sm tabular-nums text-accent active:bg-accent/20 disabled:opacity-40"
     >
-      {done ? '時間です — もう一度' : `${running ? '停止' : 'タイマー'} ${format(remaining)}`}
+      タイマー {formatRemaining(seconds * 1000)}
     </button>
   );
-}
-
-function format(totalSeconds: number): string {
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
