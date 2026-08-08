@@ -99,8 +99,12 @@ REST を直接叩くなら `curl.exe` か `Invoke-RestMethod -Headers @{ key = '
 
 #### 調査済みの事実
 
-`localStorage` / `sessionStorage` は**一切使っていない**（grep 済み）。
+製品コードは `localStorage` / `sessionStorage` を**一切使っていない**（grep 済み）。
 アプリ名をキーに含む永続データが無いので、改名でユーザーデータが失われる経路はない。
+
+例外は `/diagnostics/timer`（PHASE 6 の計測用ページ）だけで、`tsugu-diag:*` の
+2キーを使う。診断専用で、製品のデータでもユーザーデータでもない。計測が終われば
+ページごと削除してよい。
 
 ---
 
