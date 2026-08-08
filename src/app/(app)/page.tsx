@@ -51,6 +51,14 @@ export default async function HomePage() {
         <ButtonLink href="/chat" variant="secondary" size="lg" block>
           料理を始める
         </ButtonLink>
+        {/*
+         * A link only. Showing a count here would cost this page a shopping
+         * query on every visit, for a number nobody is on the home screen to
+         * read — the list itself is one tap away.
+         */}
+        <ButtonLink href="/shopping" variant="secondary" size="lg" block>
+          買い物リスト
+        </ButtonLink>
       </div>
 
       <section className="mt-8">

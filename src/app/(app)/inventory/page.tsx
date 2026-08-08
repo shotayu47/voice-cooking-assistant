@@ -1,3 +1,5 @@
+import Link from 'next/link';
+
 import { ButtonLink } from '@/components/ui/button';
 import { EmptyState } from '@/components/ui/surfaces';
 import { PageShell } from '@/components/page-shell';
@@ -29,6 +31,23 @@ export default async function InventoryPage() {
         </ButtonLink>
       }
     >
+      {/*
+       * Below the header rather than beside 「追加」, so it never competes with
+       * the primary inventory action, and outside the empty branch so it is
+       * still reachable from an empty fridge — noticing something is missing is
+       * exactly when the list is wanted. A link only: no shopping query runs on
+       * this page.
+       */}
+      <Link
+        href="/shopping"
+        className="mb-6 flex min-h-12 items-center justify-between rounded-card border border-line bg-surface px-4 text-sm"
+      >
+        <span>買い物リスト</span>
+        <span aria-hidden className="text-faint">
+          →
+        </span>
+      </Link>
+
       {items.length === 0 ? (
         <EmptyState
           title="まだ食材が登録されていません"
