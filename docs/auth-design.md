@@ -197,10 +197,19 @@ Admin API の `generate_link` は**メールを送信せず**、メールに載�
 | メールテンプレート | Authentication → Emails → Magic Link | `{{ .Token }}` を使う本文へ |
 | メールテンプレート | Authentication → Emails → Confirm signup | 同上（新規ユーザー用） |
 
-> 現状のプロジェクト設定は **OTP 長 = 8桁** になっている（実測）。
-> UI は 6 桁固定なので、この設定を 6 に変更するまで UI からログインできない。
+上 2 行は **2026-08-08 に適用済み**。適用前のプロジェクト設定は OTP 長 = 8 桁で、
+UI が 6 桁固定のためログインできなかった（実測して判明）。メールテンプレートの
+2 行はまだ変更していない — §11 の順序どおり、コードのデプロイ後に行う。
 
 Custom SMTP / Resend / 独自ドメインは今回のコード実装とは分離して扱う。
+
+### 内蔵 SMTP の送信上限（実測）
+
+内蔵メールサービスの送信枠は **1 時間のローリングウィンドウ**で、実測では 2 通目が
+`over_email_send_rate_limit` で弾かれた。32 分待っても回復せず、約 1 時間で回復。
+
+本番運用の前に Custom SMTP / Resend が要る根拠はこれ。開発中は §9 の
+`npm run dev:otp` でメールを 1 通も使わずに UI 検証ができるので、この枠に触れない。
 
 ---
 
@@ -208,18 +217,65 @@ Custom SMTP / Resend / 独自ドメインは今回のコード実装とは分離
 
 メールテンプレートを先に変えると、現行の Magic Link ログインが壊れる。
 
-1. コードをデプロイする（この branch）
-2. Email OTP Length を 6 に変更
-3. Email OTP Expiration を 600 に変更
-4. Magic Link / Confirm signup テンプレートを `{{ .Token }}` 本文へ変更
-5. 実機で 1 回ログインして確認
+| | 手順 | 状態 |
+| --- | --- | --- |
+| 1 | Email OTP Length を 6 に変更 | ✅ 2026-08-08 |
+| 2 | Email OTP Expiration を 600 に変更 | ✅ 2026-08-08 |
+| 3 | コードをデプロイする（この branch） | 未 |
+| 4 | Magic Link / Confirm signup テンプレートを `{{ .Token }}` 本文へ変更 | 未 |
+| 5 | 実機で 1 回ログインして確認 | 未 |
+
+1 と 2 を先に済ませても現行ログインは壊れない（Magic Link のリンクは OTP 長と
+無関係に機能する）。**壊れるのは 4 だけ**なので、4 は 3 の後に行う。
 
 `?token_hash=` 経路は残してあるので、4 の直前までに送信済みのメールは
 有効期限内であれば引き続き使える。
 
 ---
 
-## 12. 今回のスコープ外
+## 12. 検証記録（2026-08-08）
+
+Dashboard の OTP 長 = 6 / 有効期限 = 600 を適用したうえで、実際に動いている
+dev サーバーとブラウザで通した結果。「〜のはず」ではなく観測値のみを載せる。
+
+### UI 通し
+
+| 項目 | 結果 | 観測したもの |
+| --- | --- | --- |
+| 正しい OTP でログイン | ✅ | 6 桁入力 → 303 → セッション確立 |
+| 再送クールダウン | ✅ | 60 秒カウントダウン → 有効化 → 実際に再送 |
+| ログアウト → 再ログイン | ✅ | Cookie 消失 → 保護ルート再ブロック → 再ログイン成立 |
+| 同一 user.id 維持 | ✅ | JWT の `sub` = `285fadf6-…`（ログアウト前後で一致） |
+| 既存データ維持 | ✅ | 在庫 9 品目・調理中セッション `8cf77b91…` 5/7 工程・履歴 8月3日 |
+| `next=/inventory` 復帰 | ✅ | hidden input に `/inventory` → 検証後 `/inventory` に着地 |
+| 誤 OTP の日本語エラー | ✅ | Step 2 に留まり日本語表示。英語原文はサーバーログのみ |
+| rate limit の日本語エラー | ✅ | `over_email_send_rate_limit` → Step 2 を保ったまま日本語表示 |
+
+OTP 入力欄は実 DOM 上で `inputMode=numeric` / `autocomplete=one-time-code` /
+`maxLength=6` / `enterKeyHint=go`、Step 2 到達時に自動フォーカス。6 桁未満は
+送信ボタンが `disabled`。
+
+### open redirect（有効な token_hash を発行して実測）
+
+| `next` | 着地先 |
+| --- | --- |
+| `/inventory` | `http://localhost:3000/inventory` |
+| `/\evil.example.com` | `http://localhost:3000/` |
+| `//evil.example.com` | `http://localhost:3000/` |
+
+`/auth/error?message=<script>…` は描画されない（reason コード方式に変更済み）。
+
+### その他
+
+- `npm run audit:rls` — **32/32 PASS**（認証方式の変更が RLS に影響していない）
+- `src/lib/auth/redirect.test.ts` — 30 ケース。旧ガードが `/\evil.example.com` を
+  通していたことを回帰オラクルとして固定してある
+- 新規ユーザー作成経路 — `--signup` で作成 → `type: 'email'` で検証成立
+- コード単回使用 — 同じコードの 2 回目は 403
+
+---
+
+## 13. 今回のスコープ外
 
 - Google Sign-In — 次の認証フェーズ（`?code=` 経路は今回維持済み）
 - Apple Sign-In / Passkey — 保留
