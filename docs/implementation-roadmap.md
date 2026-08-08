@@ -155,7 +155,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 3 | 「今あるもので何作れる？」強化 | **COMPLETE** | `8e8891a` | yes | なし | — |
 | 4 | 食材・調味料の代替提案 | **COMPLETE** | `e67a0f4` | yes | なし | — |
 | 5 | 調理セッション・工程状態管理 | **COMPLETE** | `a7623cb` | yes | `0004_cooking_progress.sql` | ✅ 適用済み |
-| 6 | 複数タイマー | NOT_STARTED | — | — | — | — |
+| 6 | 複数タイマー | **BLOCKED 🔒**（実測待ち） | — | — | — | — |
 | 7 | 調理中のトラブル対応 | NOT_STARTED | — | — | — | — |
 | 8 | 分量の自動調整 | NOT_STARTED | — | — | — | — |
 | 9 | 買い物リスト | NOT_STARTED | — | — | — | — |
@@ -592,7 +592,7 @@ PHASE 3 で対話セッションと自動タスクが同じ PHASE を並行実�
 - 代わりに監視・回帰確認のみ行い、何もせず終了してよい
 - 🔒 が24時間以上更新されていない場合のみ引き継いでよい
 
-現在 🔒 の PHASE: **なし**
+現在 🔒 の PHASE: **PHASE 6**（iPhone 実機の計測結果待ち。下記「PHASE 6 の事前計測」を参照）
 
 ## 次セッションで最初にやること
 
@@ -603,9 +603,41 @@ TSUGU への名称変更（第1段階：表示名のみ）は **COMPLETE**。
 
 ---
 
+## PHASE 6 の事前計測（診断ページ）
+
+**PHASE 6 の本実装は、iPhone 実機の計測結果が出るまで着手しない。**
+自動タスクもこの PHASE に着手しないこと（🔒）。
+
+計測用の診断ページを追加した。**製品機能ではなく、計測が終わったら削除してよい一時的なページ。**
+
+| 項目 | 内容 |
+|---|---|
+| URL | `/diagnostics/timer` |
+| 配置 | `(app)` グループの外。下部ナビにもどこにもリンクしていない |
+| 認証 | 既存の proxy でそのままゲートされる（`PUBLIC_PATHS` に入れていない＝**認証設定は無変更**） |
+| SSR | `next/dynamic` の `ssr: false`。全部ブラウザ計測なので prerender しない |
+| 保存領域 | `sessionStorage` / `localStorage` の `tsugu-diag:*` のみ。Supabase・DB・既存データには一切触れない |
+
+測るもの: interval の実発火間隔と最大ギャップ、背面移行中の発火状況、復帰時の
+「実経過 vs tick 由来の経過」、`Date.now()` と `performance.now()` のずれ、
+visibilitychange / pagehide / pageshow / focus / blur / freeze / resume、
+Notification API と permission、Service Worker の有無と登録状況、standalone 判定、
+instance ID と起動回数による**プロセス破棄の検出**。
+
+設計上の要点: 残り時間は必ず `deadline − Date.now()` から求める。
+**interval の発火回数からは計算しない**（絞られた分だけ経過を取りこぼすため）。
+tick 由来の経過は「比較用」として別に表示している。
+
+通知の許可はページを開いただけでは要求しない（ユーザー操作のボタンからのみ）。
+このページでは **Service Worker を登録しない**（存在の確認のみ）。
+
+計測結果が出たら、それを根拠に永続化方式・通知方式・複数タイマーの状態管理を決める。
+
+---
+
 ## 次に実装する PHASE
 
-**PHASE 6 — 複数タイマー**
+**PHASE 6 — 複数タイマー**（🔒 実測待ち）
 
 再開手順:
 1. `src/app/(app)/cooking/[sessionId]/step-timer.tsx` を読む。現在は工程1つに対する
