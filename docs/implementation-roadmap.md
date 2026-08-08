@@ -166,7 +166,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 6 | 複数タイマー | **COMPLETE** | `7b36eb8`..`6f71618` | yes | なし | — |
 | 7 | 調理中のトラブル対応 | **COMPLETE** | `bfa1dbe` | yes | なし | — |
 | 8 | 分量の自動調整 | **COMPLETE** | `4bdf619` | no | なし | — |
-| 9 | 買い物リスト | NOT_STARTED | — | — | — | — |
+| 9 | 買い物リスト | **COMPLETE** | `014329b`..`ce4c627` | yes | `0005_shopping_list.sql` | ✅ 適用済み |
 | 10 | AI 買い物候補提案 | NOT_STARTED | — | — | — | — |
 | 11 | レシート読み込み | NOT_STARTED | — | — | — | — |
 | 12 | 購入履歴 | NOT_STARTED | — | — | — | — |
@@ -607,14 +607,14 @@ PHASE 6 が実測待ちの間に PHASE 7 と PHASE 8 を先に完了させた。
 migration も無い）ため、実測結果による作り直しは発生しなかった。PHASE 8 の設計記録は
 `docs/phase8-quantity-adjustment.md` に分離してある。
 
-PHASE 6 の実測と実装は完了済み。次に着手できるのは **PHASE 9**。
+PHASE 6 の実測と実装は完了済み。次に着手できるのは **PHASE 10**。
 
 ## 次セッションで最初にやること
 
 TSUGU への名称変更（第1段階：表示名のみ）は **COMPLETE**。
 第2段階（内部識別子）と第3段階（外部サービス）は、必要性が生じるまで着手しない。
 
-**PHASE 9 — 買い物リスト** へ進む。
+**PHASE 10 — AI 買い物候補提案** へ進む。
 
 ---
 
@@ -766,7 +766,43 @@ Test F を再実施して判断すること。** 通知は今の設計に対す�
 
 ---
 
+## PHASE 9 — 買い物リスト
+
+**Status: COMPLETE**（2026-08-09）
+
+設計と検証の記録は `docs/phase9-shopping-list.md` に分離してある。ここには結果だけ置く。
+
+| 項目 | 結果 |
+|---|---|
+| 第1段階 | migration / schema / 純粋ロジック / service / テスト（`014329b`・`8376d0c`） |
+| 第2段階 | `/shopping` 画面・Server Action・ホームと在庫からの導線（`cbcd38f`・`ce4c627`） |
+| migration | `0005_shopping_list.sql` — **`npm run check:migrations` 5/5 適用済み** |
+| RLS | **`npm run audit:rls` 43/43 PASS**。`shopping_items` は自前の被害者ユーザーと行を作って攻撃するため、空テーブルでも skip されない |
+| テスト | 462件（PHASE 8 時点の 381 から +81） |
+| **実機 QA** | **iPhone 実機 / Vercel Preview で 14/14 PASS**（2026-08-09・対象 `ce4c627`） |
+
+設計上の要点（詳細は分離ドキュメント）:
+
+- 保存先は Supabase。複数端末・再ログイン後の復元・RLS・PHASE 10〜12 との接続が理由
+- **同名項目を統合しない。** 「卵 6個」と「卵 1パック」は別の行として正当で、
+  統合はユーザーが書いた情報を捨てる。検出して知らせるだけにした
+- 購入済みは削除せず残す。一括削除は別の意図的な操作
+- **下部ナビは 5 項目のまま。** 導線はホームと在庫から。6 項目目は iPhone SE 幅で
+  タップ領域が窮屈になる
+- `normalized_name` は在庫と同じ `normalizeIngredientName()` で作る。PHASE 10 が
+  「同じ食材」の 2 つ目の定義を持ち込まずに済む
+
+⚠️ 確認したのは **Preview であって Production ではない**。main へ merge した後に
+改めて確認が必要。
+
+---
+
 ## 次に実装する PHASE
 
-**PHASE 9 — 買い物リスト**（PHASE 6・7・8 はいずれも COMPLETE）
+**PHASE 10 — AI 買い物候補提案**（PHASE 6・7・8・9 はいずれも COMPLETE）
+
+着手前に読むもの: `docs/phase9-shopping-list.md` の §2「PHASE 10〜12 との境界」。
+PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツールのまま）。
+接続点は `src/lib/meals/evaluate.ts` の `MissingIngredient { name, reason, isStaple }` で、
+これを `createShoppingItem` へ流し込む形になる。
 
