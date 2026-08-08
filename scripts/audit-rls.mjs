@@ -39,6 +39,7 @@ const USER_TABLES = [
   'conversation_sessions',
   'conversation_messages',
   'ai_tool_calls',
+  'shopping_items',
 ];
 
 const TEST_EMAIL = 'rls-audit-probe@example.com';

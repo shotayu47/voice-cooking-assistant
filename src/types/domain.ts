@@ -213,6 +213,23 @@ export type InventoryTransaction = {
   created_at: string;
 };
 
+/** PHASE 9 — one line on the shopping list. */
+export type ShoppingItem = {
+  id: string;
+  user_id: string;
+  name: string;
+  /** Canonical form from `normalizeIngredientName`, shared with inventory. */
+  normalized_name: string;
+  /** Null when the user only wrote a name, which is the common case. */
+  quantity: number | null;
+  /** Only ever set alongside a quantity. */
+  unit: string | null;
+  checked: boolean;
+  checked_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type ChatRole = 'user' | 'assistant' | 'tool';
 
 export type ConversationMessage = {
