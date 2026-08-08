@@ -10,6 +10,10 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/**/*.check.ts'],
+    // Running the files at once bursts past the account's tokens-per-minute
+    // ceiling and fails behavioural checks on a 429 that says nothing about
+    // the behaviour. One file at a time keeps the window survivable.
+    fileParallelism: false,
     env: { ...loadEnvLocal() },
   },
   resolve: {

@@ -165,7 +165,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 5 | 調理セッション・工程状態管理 | **COMPLETE** | `a7623cb` | yes | `0004_cooking_progress.sql` | ✅ 適用済み |
 | 6 | 複数タイマー | **COMPLETE** | `7b36eb8`..`6f71618` | yes | なし | — |
 | 7 | 調理中のトラブル対応 | **COMPLETE** | `bfa1dbe` | yes | なし | — |
-| 8 | 分量の自動調整 | NOT_STARTED | — | — | — | — |
+| 8 | 分量の自動調整 | **COMPLETE** | `4bdf619` | no | なし | — |
 | 9 | 買い物リスト | NOT_STARTED | — | — | — | — |
 | 10 | AI 買い物候補提案 | NOT_STARTED | — | — | — | — |
 | 11 | レシート読み込み | NOT_STARTED | — | — | — | — |
@@ -602,15 +602,19 @@ PHASE 3 で対話セッションと自動タスクが同じ PHASE を並行実�
 
 現在 🔒 の PHASE: **なし**。PHASE 6 の実測が完了し、ロックは解除済み。
 
-PHASE 6 が実測待ちの間に PHASE 7 を先に完了させた。PHASE 7 はタイマーに依存しない
-（プロンプトとトラブル対応表のみ）ため、実測結果による作り直しは発生しなかった。
+PHASE 6 が実測待ちの間に PHASE 7 と PHASE 8 を先に完了させた。どちらもタイマーに
+依存しない（PHASE 7 はプロンプトとトラブル対応表のみ、PHASE 8 は分量計算のみで
+migration も無い）ため、実測結果による作り直しは発生しなかった。PHASE 8 の設計記録は
+`docs/phase8-quantity-adjustment.md` に分離してある。
+
+PHASE 6 の実測と実装は完了済み。次に着手できるのは **PHASE 9**。
 
 ## 次セッションで最初にやること
 
 TSUGU への名称変更（第1段階：表示名のみ）は **COMPLETE**。
 第2段階（内部識別子）と第3段階（外部サービス）は、必要性が生じるまで着手しない。
 
-**PHASE 8 — 分量の自動調整** へ進む。
+**PHASE 9 — 買い物リスト** へ進む。
 
 ---
 
@@ -764,5 +768,5 @@ Test F を再実施して判断すること。** 通知は今の設計に対す�
 
 ## 次に実装する PHASE
 
-**PHASE 8 — 分量の自動調整**（`feature/phase8-quantity-adjust` に着手済みの worktree あり）
+**PHASE 9 — 買い物リスト**（PHASE 6・7・8 はいずれも COMPLETE）
 

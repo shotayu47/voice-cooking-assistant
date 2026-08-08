@@ -1,3 +1,5 @@
+import { safeNext } from '@/lib/auth/redirect';
+
 import { LoginForm } from './login-form';
 
 export const metadata = { title: 'ログイン | TSUGU' };
@@ -19,7 +21,12 @@ export default async function LoginPage({
         </p>
       </div>
 
-      <LoginForm next={next ?? '/'} />
+      {/*
+        Sanitized here as well as in the verify action. The proxy sets this
+        parameter, but anyone can hand out a /login?next=… link, and this value
+        is about to be rendered into a hidden input.
+      */}
+      <LoginForm next={safeNext(next)} />
     </div>
   );
 }

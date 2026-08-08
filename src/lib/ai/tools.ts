@@ -18,15 +18,26 @@ import {
   updateInventoryItem,
   type ServiceContext,
 } from '@/lib/inventory/service';
-import { createRecipe } from '@/lib/recipes/service';
+import { createRecipe, getRecipe, toRecipeSnapshot } from '@/lib/recipes/service';
 import {
   getCurrentStep,
   getOpenSession,
+  getSession,
   moveStep,
   recordUsedIngredient,
+  setSessionServings,
   startSession,
   updateStatus,
 } from '@/lib/cooking/service';
+import { ingredientProgress, maxServingsFromInventory } from '@/lib/recipes/capacity';
+import {
+  isValidServings,
+  MAX_SERVINGS,
+  resolveScaling,
+  scaleRecipe,
+  withTargetServings,
+} from '@/lib/recipes/scale';
+import { stepIngredientDetails } from '@/lib/cooking/steps';
 import { isAvailable } from '@/lib/inventory/quantity';
 import { freshnessOf } from '@/lib/inventory/freshness';
 import {
@@ -36,7 +47,7 @@ import {
   surplusItems,
 } from '@/lib/meals/classification';
 import { evaluateCandidates, MISSING_REASON_LABELS } from '@/lib/meals/evaluate';
-import type { InventoryItem } from '@/types/domain';
+import type { InventoryItem, Recipe } from '@/types/domain';
 
 /**
  * Tool definitions (SPEC §8).
@@ -335,6 +346,47 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
           'ingredients',
           'steps',
         ],
+        additionalProperties: false,
+      },
+    },
+  },
+  // PHASE 8. No existing tool owns "change the amounts", and folding it into
+  // create_recipe would mean the model re-issuing every number — which is
+  // exactly the arithmetic this tool exists to take away from it.
+  {
+    type: 'function',
+    function: {
+      name: 'adjust_recipe_amounts',
+      description:
+        `分量を計算するツール。**分量の掛け算を自分でしないこと。** 必ずこれを呼び、返ってきた数値をそのまま伝えること。
+mode で用途を選ぶ:
+・scale … 「4人分にして」「倍量で」「半分の量で」→ target_servings に作りたい人数を入れる。
+・max_from_inventory … 「今ある分で何人分作れる?」→ target_servings は null。
+session_id を渡すと、その調理セッションの分量として保存される（元のレシピの分量は書き換えない）。
+加熱時間と火力は倍率変更しない。返ってきた notes をそのまま伝えること。
+max_from_inventory の capacity_status が exact でない場合、「最大◯人分」と断定しないこと。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          mode: {
+            type: 'string',
+            enum: ['scale', 'max_from_inventory'],
+            description: '人数を変えるなら scale、在庫の上限を知りたいなら max_from_inventory',
+          },
+          target_servings: {
+            type: ['integer', 'null'],
+            description: 'mode が scale のとき必須。作りたい人数（1〜20）。それ以外は null。',
+          },
+          session_id: {
+            type: ['string', 'null'],
+            description: '調理中ならそのセッションID。無ければ null（進行中の料理を自動で使う）。',
+          },
+          recipe_id: {
+            type: ['string', 'null'],
+            description: 'まだ調理を開始していない保存済みレシピを対象にする場合のみ指定。',
+          },
+        },
+        required: ['mode', 'target_servings', 'session_id', 'recipe_id'],
         additionalProperties: false,
       },
     },
@@ -823,6 +875,129 @@ async function dispatch(
       };
     }
 
+    case 'adjust_recipe_amounts': {
+      const mode = args.mode === 'max_from_inventory' ? 'max_from_inventory' : 'scale';
+      const sessionId =
+        typeof args.session_id === 'string' && args.session_id.trim()
+          ? args.session_id.trim()
+          : null;
+      const recipeId =
+        typeof args.recipe_id === 'string' && args.recipe_id.trim()
+          ? args.recipe_id.trim()
+          : null;
+
+      // A session's snapshot wins: it is what the user is cooking right now.
+      // Only fall back to the open session when no explicit target was named.
+      let session = sessionId ? await getSession(ctx, sessionId) : null;
+      if (!session && !sessionId && !recipeId) session = await getOpenSession(ctx);
+
+      let recipe: Recipe | null = session ? (session.recipe_snapshot as Recipe) : null;
+      if (!recipe && recipeId) {
+        const stored = await getRecipe(ctx, recipeId);
+        recipe = stored ? toRecipeSnapshot(stored) : null;
+      }
+
+      if (!recipe) {
+        return {
+          result: {
+            error: 'recipe_not_found',
+            message: '分量を調整する対象のレシピが見つかりません。',
+            hint: '先に create_recipe でレシピを保存するか、調理を開始してください。分量を自分で計算しないでください。',
+          },
+        };
+      }
+
+      if (mode === 'max_from_inventory') {
+        // include_empty: an item that exists but is empty is 在庫切れ, which is
+        // a different answer from 在庫にない.
+        const items = await listInventory(ctx, { includeEmpty: true });
+        const capacity = maxServingsFromInventory(recipe, items);
+        const current = resolveScaling(recipe);
+
+        return {
+          result: {
+            mode,
+            base_servings: current.baseServings,
+            current_target_servings: current.targetServings,
+            capacity_status: capacity.status,
+            max_servings: capacity.maxServings,
+            capped_at_max: capacity.cappedAtMax,
+            limiting_ingredient: capacity.limiting,
+            verified_constraints: capacity.verified,
+            unverified_constraints: capacity.unverified,
+            note:
+              capacity.status === 'exact'
+                ? 'すべての必須材料を実在庫と照合済みです。'
+                : capacity.status === 'partial'
+                  ? '一部の材料は確認できていません。「確認できる範囲では最大◯人分」と伝え、' +
+                    'unverified_constraints の材料はユーザーに確認してください。断定しないでください。'
+                  : '在庫と照合できた材料がありません。人数の上限を答えないでください。',
+          },
+        };
+      }
+
+      const target = args.target_servings;
+      if (!isValidServings(target)) {
+        return {
+          result: {
+            error: 'invalid_arguments',
+            field: 'target_servings',
+            message: `作りたい人数を1〜${MAX_SERVINGS}の整数で指定してください。`,
+            hint: 'ユーザーが人数を言っていない場合は、勝手に決めず聞いてください。',
+          },
+        };
+      }
+
+      // Persisting is what makes the cooking screen and the next answer agree.
+      // Without a session there is nothing to persist — the calculation is
+      // still returned, it just is not remembered.
+      let saved = false;
+      let scaledRecipe = withTargetServings(recipe, target);
+      if (session) {
+        const view = await setSessionServings(ctx, session.id, target);
+        session = view.session;
+        scaledRecipe = session.recipe_snapshot as Recipe;
+        saved = true;
+      }
+
+      const scaled = scaleRecipe(scaledRecipe);
+      const progress = session
+        ? ingredientProgress(scaledRecipe, {
+            usedIngredients: session.used_ingredients ?? [],
+            completedSteps: session.completed_steps ?? [],
+          }).filter((entry) => entry.status !== 'not_started')
+        : [];
+
+      return {
+        result: {
+          mode,
+          base_servings: scaled.baseServings,
+          target_servings: scaled.targetServings,
+          factor: Math.round(scaled.factor * 1000) / 1000,
+          saved,
+          ingredients: scaled.ingredients.map((ingredient) => ({
+            name: ingredient.name,
+            amount: ingredient.amount,
+            unit: ingredient.unit,
+            display: ingredient.display,
+            policy: ingredient.policy,
+            required: ingredient.required,
+            ...(ingredient.note ? { note: ingredient.note } : {}),
+          })),
+          notes: scaled.notes,
+          ...(progress.length > 0 ? { already_added: progress } : {}),
+          note:
+            'この数値はサーバーが基準レシピから計算したものです。そのまま伝えてください。' +
+            '掛け算をやり直さないでください。加熱時間と火力は変更していません。' +
+            (progress.length > 0
+              ? ' already_added はすでに入れた分です。status が unknown のものは量が記録されていないので、' +
+                '入れた量を断定せずユーザーに確認してください。'
+              : ''),
+        },
+        ...(saved ? { effect: 'session_changed' as const, sessionId: session!.id } : {}),
+      };
+    }
+
     case 'start_cooking_session': {
       const session = await startSession(ctx, String(args.recipe_id));
       const view = await getCurrentStep(ctx, session.id);
@@ -904,6 +1079,9 @@ function publicItem(item: InventoryItem) {
 }
 
 function stepResult(view: Awaited<ReturnType<typeof getCurrentStep>>) {
+  const recipe = view.session.recipe_snapshot as Recipe;
+  const scaling = resolveScaling(recipe);
+
   return {
     session_id: view.session.id,
     current_step: view.session.current_step,
@@ -915,6 +1093,22 @@ function stepResult(view: Awaited<ReturnType<typeof getCurrentStep>>) {
     duration_seconds: view.step?.durationSeconds ?? null,
     heat: view.step?.heat ?? null,
     ingredient_refs: view.step?.ingredientRefs ?? [],
+    // PHASE 8. The tool description has always claimed this answers 分量
+    // questions, but it only ever returned names — leaving the model to recall
+    // amounts from the conversation. These are the amounts for the servings
+    // this session is actually cooking.
+    ingredients: stepIngredientDetails(recipe, view.session.current_step).map(
+      (ingredient) => ({
+        name: ingredient.name,
+        amount: ingredient.amount,
+        unit: ingredient.unit,
+        display: ingredient.display,
+        policy: ingredient.policy,
+      }),
+    ),
+    base_servings: scaling.baseServings,
+    target_servings: scaling.targetServings,
+    servings_adjusted: scaling.adjusted,
     safety_note: view.step?.safetyNote ?? null,
     // Progress detail so the assistant can answer 「あと何工程？」 and知る
     // which steps were skipped rather than done.
