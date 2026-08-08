@@ -49,6 +49,7 @@ const MIGRATIONS = [
   { file: '0002_tool_call_idempotency.sql', probe: 'ai_tool_calls?select=id&limit=1' },
   { file: '0003_expiry_tracking.sql', probe: 'inventory_items?select=expiry_source&limit=1' },
   { file: '0004_cooking_progress.sql', probe: 'cooking_sessions?select=completed_steps&limit=1' },
+  { file: '0005_shopping_list.sql', probe: 'shopping_items?select=id&limit=1' },
 ];
 
 const headers = { apikey: KEY, authorization: `Bearer ${KEY}` };
