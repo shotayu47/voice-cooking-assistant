@@ -139,6 +139,29 @@ const COOKING_AMOUNT_RULES = `【調理中に分量を変えられたら】
   何をどれだけ入れたかユーザーに確認してください。
 - 分量を変えただけで工程を進めないでください。advance_cooking_step を呼ばないでください。`;
 
+/**
+ * PHASE 10. The tool cannot write to the shopping list, so the only way the
+ * user ends up misled is the model *saying* it added something. These rules
+ * exist to keep the sentence honest, not to protect the data.
+ *
+ * The last rule matters because the assistant's own text is what survives a
+ * reload — the candidate card does not. Text that says 「以下を追加できます」
+ * followed by nothing is confusing a day later.
+ */
+const SHOPPING_SUGGESTION_RULES = `【買い物候補】
+- 買い物候補を出すときは suggest_shopping_items を使ってください。
+  先に create_recipe でレシピを作り、返ってきた recipe_id を渡してください。
+- **このツールは買い物リストに何も追加しません。** 「追加しました」「入れておきました」と
+  言わないでください。追加されるのは、ユーザーが画面のカードで選んで確定したものだけです。
+- 不足している材料・その理由・数量は、返ってきた結果をそのまま伝えてください。
+  自分で在庫を数え直したり、数量を推測して補ったりしないでください。
+- already_on_list が true の候補は「すでにリストにあります」と添えてください。
+  ただし追加できないわけではありません。買うかどうかはユーザーが決めます。
+- 調味料は既定では候補に入りません。ユーザーが調味料の買い足しを明示的に求めたときだけ
+  include_staples を true にしてください。
+- 候補を伝える文には「この候補は現在の在庫を基にした一時的な結果です。
+  再読み込み後は、最新の候補をもう一度確認してください。」という趣旨を必ず含めてください。`;
+
 const IH_10_TABLE = `【火力の目安（IH 10段階）】
 とろ火 1〜2 / 弱火 2〜3 / 弱めの中火 3〜4 / 中火 5 / 強めの中火 6〜7 / 強火 8〜9 / 最大・沸騰 10
 これは目安です。物理的な等価ではありません。実際の焼き色や煮え方を優先して調整を案内してください。`;
@@ -208,7 +231,12 @@ export function buildSystemPrompt(options: {
   inventory?: InventorySnapshotItem[];
 }): string {
   // Amount rules apply everywhere: writing a recipe, planning, and cooking.
-  const parts = [BASE_SYSTEM_PROMPT, TOOL_USAGE_RULES, AMOUNT_RULES];
+  const parts = [
+    BASE_SYSTEM_PROMPT,
+    TOOL_USAGE_RULES,
+    AMOUNT_RULES,
+    SHOPPING_SUGGESTION_RULES,
+  ];
 
   if (options.mode === 'voice') {
     parts.push(VOICE_STYLE_RULES);

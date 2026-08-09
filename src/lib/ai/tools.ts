@@ -19,6 +19,12 @@ import {
   type ServiceContext,
 } from '@/lib/inventory/service';
 import { createRecipe, getRecipe, toRecipeSnapshot } from '@/lib/recipes/service';
+import { listShoppingItems } from '@/lib/shopping/service';
+import {
+  buildShoppingSuggestions,
+  normalizeRecipeIds,
+  type ShoppingSuggestion,
+} from '@/lib/shopping/suggest';
 import {
   getCurrentStep,
   getOpenSession,
@@ -472,6 +478,36 @@ intent で「やった」のか「飛ばした」のかを区別する:
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'suggest_shopping_items',
+      description:
+        `買い物候補を出すツール。**このツールは買い物リストに何も追加しない。**
+先に create_recipe でレシピを作り、返ってきた recipe_id をここに渡すこと。
+材料・不足の理由・数量はすべてサーバーが在庫と照合して決める。自分で数え直さないこと。
+結果は画面にカードとして出て、**ユーザーがチェックを入れて確定したものだけ**が追加される。
+「追加しました」と言わないこと。「候補を出しました。追加するものを選んでください」と伝えること。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          recipe_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'create_recipe が返した recipe_id。最大5件。ここで渡した料理の材料だけが対象になる。',
+          },
+          include_staples: {
+            type: ['boolean', 'null'],
+            description:
+              '調味料も候補に含めるか。ユーザーが調味料の買い足しを明示的に求めた場合だけ true。通常は null。',
+          },
+        },
+        required: ['recipe_ids', 'include_staples'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 /**
@@ -508,6 +544,15 @@ export type ToolOutcome = {
   effect?: 'inventory_changed' | 'session_changed';
   /** Set by start_cooking_session so the chat can link straight into cooking. */
   sessionId?: string;
+  /**
+   * Shopping candidates for the chat to render as a pickable card.
+   *
+   * Carried out of band rather than parsed back out of the tool message: the
+   * stored `role: 'tool'` row is the model's transcript, and the browser never
+   * reads it. Nothing here is written anywhere — the user picks from the card
+   * and a separate action does the writing.
+   */
+  suggestions?: ShoppingSuggestion[];
 };
 
 /**
@@ -1043,6 +1088,69 @@ async function dispatch(
         result: { session_id: session.id, status: session.status },
         effect: 'session_changed',
         sessionId: session.id,
+      };
+    }
+
+    case 'suggest_shopping_items': {
+      // Read-only, deliberately. The model nominates recipes by the id
+      // create_recipe issued; everything else — the ingredients, whether the
+      // fridge has them, why not, how much — comes from the database. Nothing
+      // in this branch writes to shopping_items.
+      const recipeIds = normalizeRecipeIds(args.recipe_ids);
+      if (recipeIds.length === 0) {
+        return {
+          result: {
+            error: 'no_recipes',
+            message:
+              '先に create_recipe でレシピを作り、返ってきた recipe_id を渡してください。',
+          },
+        };
+      }
+
+      // getRecipe filters on user_id and RLS enforces the same rule, so an id
+      // belonging to someone else simply resolves to nothing.
+      const recipes = (await Promise.all(recipeIds.map((id) => getRecipe(ctx, id))))
+        .filter((recipe) => recipe !== null)
+        .map((recipe) => ({
+          id: recipe.id,
+          title: recipe.title,
+          ingredients: recipe.ingredients,
+        }));
+
+      if (recipes.length === 0) {
+        return {
+          result: {
+            error: 'recipes_not_found',
+            message: 'そのレシピが見つかりませんでした。作り直してから試してください。',
+          },
+        };
+      }
+
+      const [inventory, shoppingItems] = await Promise.all([
+        listInventory(ctx, { includeEmpty: true }),
+        listShoppingItems(ctx),
+      ]);
+
+      const suggestions = buildShoppingSuggestions(recipes, inventory, shoppingItems, {
+        includeStaples: args.include_staples === true,
+      });
+
+      return {
+        result: {
+          suggestions: suggestions.map((entry) => ({
+            name: entry.name,
+            reason: entry.reason,
+            reason_label: entry.reasonLabel,
+            quantity: entry.quantity,
+            unit: entry.unit,
+            already_on_list: entry.alreadyOnList,
+            for_dishes: entry.sourceRecipes.map((source) => source.title),
+          })),
+          added: false,
+          note:
+            'まだ何も追加していません。画面のカードでユーザーが選んだものだけが買い物リストに入ります。「追加しました」と言わないでください。',
+        },
+        suggestions,
       };
     }
 

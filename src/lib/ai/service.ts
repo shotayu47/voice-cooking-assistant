@@ -13,6 +13,7 @@ import type { CookingSession, Profile } from '@/types/domain';
 import { CHAT_MODEL, getOpenAI } from './openai';
 import { buildSystemPrompt, type InventorySnapshotItem } from './prompt';
 import { TOOL_DEFINITIONS, executeTool } from './tools';
+import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
 /** Hard ceiling on tool round-trips per user message. */
 const MAX_TOOL_ITERATIONS = 8;
@@ -128,6 +129,9 @@ const STALE_ON_REPLAY = new Set([
   'get_inventory',
   'find_inventory_item',
   'search_meal_candidates',
+  // Shopping candidates are an inventory reading in another shape. Replaying
+  // 「玉ねぎが無い」 from an hour ago would have the user buy a second one.
+  'suggest_shopping_items',
 ]);
 
 const STALE_NOTE = JSON.stringify({
@@ -204,6 +208,15 @@ export type TurnResult = {
   inventoryChanged: boolean;
   /** The cooking session the turn ended on, if any. */
   cookingSessionId: string | null;
+  /**
+   * Shopping candidates from this turn, for the chat to render as a card.
+   *
+   * The stored `role: 'tool'` row exists for the model's benefit and is never
+   * sent to the browser, so the structured result has to travel out here. It
+   * is deliberately not restored on reload — a candidate list is a reading of
+   * the fridge at one moment, and `STALE_ON_REPLAY` says those do not survive.
+   */
+  shoppingSuggestions: ShoppingSuggestion[];
 };
 
 /**
@@ -244,6 +257,9 @@ export async function runTurn(
   const toolsUsed: string[] = [];
   let inventoryChanged = false;
   let cookingSessionId = session?.id ?? null;
+  // Only the last call's candidates survive: if the model asks twice in one
+  // turn, the later reading is the current one.
+  let shoppingSuggestions: ShoppingSuggestion[] = [];
 
   // Backend guards, not prompt requests: one utterance may move the step at
   // most once, and an identical mutation repeated inside a turn is a model
@@ -269,7 +285,7 @@ export async function runTurn(
       if (toolsUsed.length > 0) {
         const reply = describeCompletedWork(toolsUsed, inventoryChanged);
         await persistMessage(ctx, input.conversationId, { role: 'assistant', content: reply });
-        return { reply, toolsUsed, inventoryChanged, cookingSessionId };
+        return { reply, toolsUsed, inventoryChanged, cookingSessionId, shoppingSuggestions };
       }
       throw error;
     }
@@ -297,6 +313,7 @@ export async function runTurn(
         toolsUsed,
         inventoryChanged,
         cookingSessionId,
+        shoppingSuggestions,
       };
     }
 
@@ -332,6 +349,7 @@ export async function runTurn(
 
       if (outcome.effect === 'inventory_changed') inventoryChanged = true;
       if (outcome.sessionId) cookingSessionId = outcome.sessionId;
+      if (outcome.suggestions) shoppingSuggestions = outcome.suggestions;
 
       const content = JSON.stringify(outcome.result);
       await persistMessage(ctx, input.conversationId, {
@@ -345,7 +363,7 @@ export async function runTurn(
 
   const fallback = 'うまくまとめられませんでした。もう一度、短く言い直してもらえますか。';
   await persistMessage(ctx, input.conversationId, { role: 'assistant', content: fallback });
-  return { reply: fallback, toolsUsed, inventoryChanged, cookingSessionId };
+  return { reply: fallback, toolsUsed, inventoryChanged, cookingSessionId, shoppingSuggestions };
 }
 
 /**

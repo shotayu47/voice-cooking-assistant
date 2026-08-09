@@ -27,9 +27,21 @@ describe('realtimeToolDefinitions', () => {
   });
 
   it('covers the SPEC §8 tools plus the §14 name resolver', () => {
-    // 12 through PHASE 7, plus adjust_recipe_amounts (PHASE 8).
-    expect(realtime).toHaveLength(13);
+    // 12 through PHASE 7, plus adjust_recipe_amounts (PHASE 8) and
+    // suggest_shopping_items (PHASE 10).
+    expect(realtime).toHaveLength(14);
     expect(realtime.map((tool) => tool.name)).toContain('find_inventory_item');
+  });
+
+  it('keeps the shopping suggestion tool read-only in voice too', () => {
+    // Parity with text mode is the SPEC §21.1 rule, so the tool is offered
+    // here as well. That is safe because it writes nothing in either mode —
+    // what voice cannot do is render the pickable card, so the candidates are
+    // spoken and the user adds them from the shopping screen later.
+    const suggest = realtime.find((tool) => tool.name === 'suggest_shopping_items');
+
+    expect(suggest).toBeDefined();
+    expect(suggest?.description).toContain('買い物リストに何も追加しない');
   });
 });
 
