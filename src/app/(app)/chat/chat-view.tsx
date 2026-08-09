@@ -13,6 +13,7 @@ import {
   type ChatTurnResponse,
 } from '@/lib/shopping/chat-suggestions';
 
+import { startNewConversationAction } from './actions';
 import { SuggestionCard } from './suggestion-card';
 
 /**
@@ -44,6 +45,8 @@ export function ChatView({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState(cookingSessionId);
+  const [confirmingNew, setConfirmingNew] = useState(false);
+  const [startingNew, setStartingNew] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -97,6 +100,41 @@ export function ChatView({
     }
   }
 
+  /**
+   * Starts a fresh conversation so the model stops answering from turns that
+   * have already been superseded.
+   *
+   * The transcript is cleared here rather than left to `router.refresh()`:
+   * `initialMessages` seeds `useState` once, so a re-render of the server
+   * component would deliver the empty conversation without the displayed
+   * messages ever changing.
+   */
+  async function startNew() {
+    if (startingNew) return;
+
+    setStartingNew(true);
+    setError(null);
+
+    try {
+      const result = await startNewConversationAction(sessionId);
+
+      if (result.status === 'error') {
+        // The old conversation is still open, so the card stays up and the
+        // user can simply press again.
+        setError(result.message);
+        return;
+      }
+
+      setMessages([]);
+      setConfirmingNew(false);
+      router.refresh();
+    } catch {
+      setError('新しい会話を始められませんでした。もう一度お試しください。');
+    } finally {
+      setStartingNew(false);
+    }
+  }
+
   return (
     /*
      * Fills the shell's content area and scrolls internally, so the composer
@@ -108,6 +146,18 @@ export function ChatView({
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
         <h1 className="flex-1 text-base font-semibold">AIに相談</h1>
+        {messages.length > 0 ? (
+          // Hidden on an empty conversation: there is nothing to start away
+          // from, and `startNewConversation` would no-op anyway.
+          <button
+            type="button"
+            onClick={() => setConfirmingNew(true)}
+            disabled={sending || startingNew}
+            className="min-h-11 rounded-lg border border-line px-3 text-xs text-fg disabled:opacity-40"
+          >
+            新しい会話
+          </button>
+        ) : null}
         {sessionId ? (
           <Link
             href={`/cooking/${sessionId}`}
@@ -122,6 +172,39 @@ export function ChatView({
         <p className="shrink-0 border-b border-line bg-surface px-4 py-2 text-xs text-muted">
           調理中: <span className="text-fg">{cookingTitle}</span>
         </p>
+      ) : null}
+
+      {confirmingNew ? (
+        /*
+         * Asked rather than done on the first tap. Nothing is deleted, but the
+         * transcript leaves the screen and there is no page that shows a
+         * closed conversation — so from where the user sits it is gone, and a
+         * mis-tap on a phone should not be what does it.
+         */
+        <div className="shrink-0 border-b border-line bg-surface px-4 py-3">
+          <p className="text-xs text-muted">
+            新しい会話を始めます。これまでのやりとりは画面から消えますが、
+            <span className="text-fg">削除はされません</span>。
+          </p>
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              onClick={() => void startNew()}
+              disabled={startingNew}
+              className="min-h-11 flex-1 rounded-xl bg-accent px-4 text-sm font-bold text-on-accent disabled:opacity-40"
+            >
+              {startingNew ? '開始中…' : '始める'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmingNew(false)}
+              disabled={startingNew}
+              className="min-h-11 flex-1 rounded-xl border border-line px-4 text-sm text-fg disabled:opacity-40"
+            >
+              キャンセル
+            </button>
+          </div>
+        </div>
       ) : null}
 
       <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-4 py-4">
