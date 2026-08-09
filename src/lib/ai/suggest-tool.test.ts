@@ -304,3 +304,31 @@ describe('voice mode', () => {
     expect(text).toContain('【買い物候補】');
   });
 });
+
+describe('the rule that stops a card being promised out of thin air', () => {
+  const prompt = buildSystemPrompt({
+    profile: null,
+    session: null,
+    today: '2026-08-10',
+    mode: 'text',
+  });
+
+  it('makes the tool call obligatory for this intent', () => {
+    // The device failure: the model answered 「不足している食材」 from the
+    // inventory already in the prompt, called nothing, and still sent the user
+    // to a card. The prose was right and none of it was real.
+    expect(prompt).toContain('必ず');
+    expect(prompt).toContain('ツールを呼ばずに「不足している食材」を列挙しないでください');
+  });
+
+  it('ties any mention of the card to having actually called the tool', () => {
+    expect(prompt).toContain(
+      '画面のカードに触れてよいのは、suggest_shopping_items を実際に呼んで結果が',
+    );
+  });
+
+  it('tells it what to say when there is genuinely nothing to buy', () => {
+    // Otherwise a 0-candidate result invites it to invent a list instead.
+    expect(prompt).toContain('買い足すものはありません');
+  });
+});

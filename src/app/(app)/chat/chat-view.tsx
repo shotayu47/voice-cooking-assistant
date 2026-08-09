@@ -6,7 +6,12 @@ import { useEffect, useRef, useState } from 'react';
 
 import { cn } from '@/lib/cn';
 import { VoicePanel } from '@/components/voice-panel';
-import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
+import {
+  assistantMessage,
+  hasSuggestionCard,
+  type ChatMessage,
+  type ChatTurnResponse,
+} from '@/lib/shopping/chat-suggestions';
 
 import { SuggestionCard } from './suggestion-card';
 
@@ -15,12 +20,7 @@ import { SuggestionCard } from './suggestion-card';
  * the fridge at one moment, so they are not part of `initialMessages` and do
  * not come back after a reload — see STALE_ON_REPLAY.
  */
-type Message = {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  suggestions?: ShoppingSuggestion[];
-};
+type Message = ChatMessage;
 
 const SUGGESTIONS = [
   '今あるもので何作れる？',
@@ -78,23 +78,14 @@ export function ChatView({
         );
       }
 
-      const result = (await response.json()) as {
-        reply: string;
+      const result = (await response.json()) as ChatTurnResponse & {
         cookingSessionId: string | null;
         inventoryChanged: boolean;
-        shoppingSuggestions?: ShoppingSuggestion[];
       };
 
       setMessages((current) => [
         ...current,
-        {
-          id: `reply-${current.length}`,
-          role: 'assistant',
-          content: result.reply,
-          suggestions: result.shoppingSuggestions?.length
-            ? result.shoppingSuggestions
-            : undefined,
-        },
+        assistantMessage(`reply-${current.length}`, result),
       ]);
       if (result.cookingSessionId) setSessionId(result.cookingSessionId);
       // The inventory pages are server-rendered; pull fresh data after a write.
@@ -157,7 +148,7 @@ export function ChatView({
         {messages.map((message) => (
           <div key={message.id} className="space-y-2">
             <Bubble role={message.role} content={message.content} />
-            {message.suggestions ? (
+            {hasSuggestionCard(message) && message.suggestions ? (
               <SuggestionCard suggestions={message.suggestions} />
             ) : null}
           </div>
