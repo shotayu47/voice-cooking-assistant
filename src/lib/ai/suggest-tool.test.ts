@@ -273,3 +273,34 @@ describe('shopping suggestion prompt rules', () => {
     expect(prompt).toContain('【買い物候補】');
   });
 });
+
+describe('voice mode', () => {
+  const voice = buildSystemPrompt({
+    profile: null,
+    session: null,
+    today: '2026-08-10',
+    mode: 'voice',
+  });
+  const text = buildSystemPrompt({
+    profile: null,
+    session: null,
+    today: '2026-08-10',
+    mode: 'text',
+  });
+
+  it('tells the model the card cannot be operated by voice', () => {
+    // The tool is offered in both modes (SPEC §21.1 parity) and writes nothing
+    // in either. What voice lacks is the pickable card.
+    expect(voice).toContain('音声では候補カードを操作できません');
+    expect(voice).toContain('追加は画面で候補を選んでください');
+  });
+
+  it('does not add the voice-only wording to text mode', () => {
+    expect(text).not.toContain('【音声での買い物候補】');
+  });
+
+  it('keeps the shared rules in both modes', () => {
+    expect(voice).toContain('【買い物候補】');
+    expect(text).toContain('【買い物候補】');
+  });
+});

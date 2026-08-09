@@ -162,6 +162,18 @@ const SHOPPING_SUGGESTION_RULES = `【買い物候補】
 - 候補を伝える文には「この候補は現在の在庫を基にした一時的な結果です。
   再読み込み後は、最新の候補をもう一度確認してください。」という趣旨を必ず含めてください。`;
 
+/**
+ * Voice has the same tool but cannot show the pickable card, so the sentence
+ * that works in text — 「画面のカードで選んでください」 — points at something the
+ * user cannot see while their hands are busy.
+ */
+const VOICE_SHOPPING_RULES = `【音声での買い物候補】
+- 音声では候補カードを操作できません。候補は読み上げるだけにしてください。
+- 「追加は画面で候補を選んでください」と案内してください。
+  その場で追加したように言わないでください。
+- 候補が多いときは全部読み上げず、主なものだけ挙げて
+  「残りは画面で確認できます」と伝えてください。`;
+
 const IH_10_TABLE = `【火力の目安（IH 10段階）】
 とろ火 1〜2 / 弱火 2〜3 / 弱めの中火 3〜4 / 中火 5 / 強めの中火 6〜7 / 強火 8〜9 / 最大・沸騰 10
 これは目安です。物理的な等価ではありません。実際の焼き色や煮え方を優先して調整を案内してください。`;
@@ -239,7 +251,7 @@ export function buildSystemPrompt(options: {
   ];
 
   if (options.mode === 'voice') {
-    parts.push(VOICE_STYLE_RULES);
+    parts.push(VOICE_STYLE_RULES, VOICE_SHOPPING_RULES);
   }
 
   if (options.profile?.preferred_heat_scale !== 'low_medium_high') {
