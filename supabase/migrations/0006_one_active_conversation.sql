@@ -3,9 +3,9 @@
 -- `getOrCreateConversation` reads "the newest active conversation" and inserts
 -- one when there is none. That read and that insert are not atomic: two
 -- requests arriving together — a page render and a POST /api/chat, say — can
--- both see zero and both insert. Nothing stopped them, and it shows: this
--- project's own database had three active conversations for one user by the
--- time anyone looked.
+-- both see zero and both insert. Nothing stopped them, and it shows: by the
+-- time anyone looked, this project's own database held three active rows
+-- across two users — one user with the duplicate pair, one with a single row.
 --
 -- An application-level rule cannot fix that, because the race is between two
 -- application processes. A partial unique index can: the second insert loses
@@ -75,3 +75,12 @@ commit;
 --
 -- Confirm the result with the read-only queries in
 -- `docs/phase10-ai-shopping-suggestions.md` §12.
+--
+-- Applied 2026-08-10. Measured either side of it:
+--
+--   sessions 7 -> 7   messages 186 -> 186   (nothing removed, as intended)
+--   active   3 -> 2   closed      4 -> 5    (exactly one row closed)
+--
+-- Step 1 therefore closed a single row: the one user who held two active
+-- conversations kept the newer, and the second user's lone active row was
+-- never a candidate.

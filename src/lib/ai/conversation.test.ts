@@ -9,7 +9,8 @@ import { getOrCreateConversation, loadMessages, startNewConversation } from './s
  * One active conversation per user, and starting a new one.
  *
  * The rule this pins is not "the app should only make one" — the app already
- * believed that and the database had three. It is that the *database* refuses
+ * believed that, and a user in the real database had two. It is that the
+ * *database* refuses
  * a second, and that both the normal path and the deliberate "start over" path
  * cope with losing that race instead of failing or duplicating.
  *

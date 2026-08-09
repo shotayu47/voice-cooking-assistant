@@ -381,6 +381,8 @@ Server Action と同じ合成（`runOnce(failClosed) × runAddSuggested`）で�
 
 ## 12. migration `0006_one_active_conversation.sql` — 適用後の確認
 
+**Status: ✅ 適用済み（2026-08-10）。** 実測値は §12.5。
+
 `0006` は列を足さないので、PostgREST 越しには「行が整理されたか」しか見えない。
 **行の整理だけが適用され index が無い状態**は、重複が 0 件という同じ見え方をする。
 `npm run check:migrations` はこの状態を PASS にせず
@@ -502,3 +504,55 @@ npm run test:live          # src/lib/ai/conversation-live.check.ts が実DBで i
 `auth.users` の削除（`on delete cascade`）で行う。既存の会話・メッセージには触れない。
 **`0006` 適用前に実行しないこと**（index が無ければ落ちるだけだが、
 落ちた理由が「未適用」だと分かるようにメッセージを入れてある）。
+
+### 12.5 実測（2026-08-10 適用）
+
+適用の前後を実測した結果。**行もメッセージも 1 件も失われていない。**
+
+| 項目 | 適用前 | 適用後 |
+|---|---|---|
+| `conversation_sessions` 合計 | 7 | **7** |
+| `conversation_messages` 合計 | 186 | **186** |
+| `status = 'active'` | 3 | **2** |
+| `status = 'closed'` | 4 | **5** |
+| active を持つ user 数 | 2 | 2 |
+| max active per user | 2 | **1** |
+| duplicate users | 1 | **0** |
+
+⚠️ **「1 ユーザーに 3 件」ではない。** active 3 件は **2 ユーザーにまたがって**おり、
+重複していたのは片方のユーザーの 1 件分だけ。したがって step 1 が `closed` にしたのは
+**1 行**（`closed` 4 → 5）。もう一方のユーザーの active 1 件は最初から対象外。
+
+§12.2 の結果:
+
+| 列 | 実測値 |
+| --- | --- |
+| `index_name` | `conversation_sessions_one_active_per_user_idx` |
+| `is_unique` | `true` |
+| `indexed_columns` | `{user_id}` |
+| `predicate` | `(status = 'active'::text)` |
+
+### 12.6 適用後に実行した確認
+
+| 実行 | 結果 |
+|---|---|
+| `npm run check:migrations` | `0001`〜`0005` ✅ / `0006` ⚠️ MANUAL VERIFICATION REQUIRED（**仕様どおり**。重複 0 件は確認、index は PostgREST から読めない） |
+| `conversation-live.check.ts` | **3/3 PASS**（実 Postgres） |
+| `npm run audit:rls` | **43/43 PASS** |
+| 一時ユーザーの後片付け | **独立に確認**。実行後 `conversation_sessions` 7 / `messages` 186 に戻り、`conversation-live-check@example.com` は 0 件 |
+
+live check が実証したこと:
+
+1. 同時に `getOrCreateConversation` を 2 本 → **同じ ID** を返し、active は 1 件
+2. 手で 2 本目の active を insert → **23505 で拒否**され、
+   エラーに `conversation_sessions_one_active_per_user_idx` が出る
+3. 同じ user の `closed` 行は**通る** —— index が partial であること自体の確認。
+   これが落ちると `startNewConversation`（1 件閉じて 1 件開く）が本番で壊れる
+
+**2 が本命。** 1 だけでは index がなくても通り得る（2 本目が偶然 1 本目の
+commit 済みの行を読めば ID は一致する）。DB 自身が拒否することを見ているのは 2 だけ。
+
+> 初回実行時、sign-in が Vitest の既定 5s を超えて timeout し、
+> 使い捨てユーザーが 1 件残った（会話行は 0 件）。sign-in を `beforeAll` に移して
+> 30s を与え、`afterAll` は id が取れていなくても email で引いて削除するようにした。
+> **アカウントを作る check は、失敗経路でも消せなければならない。**

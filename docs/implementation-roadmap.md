@@ -809,18 +809,18 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 
 ---
 
-## 手動で残っている作業
+## migration `0006_one_active_conversation.sql`
 
 | 対象 | 状態 |
 |---|---|
-| `supabase/migrations/0006_one_active_conversation.sql` | **未適用**。Supabase SQL Editor で実行する |
+| `supabase/migrations/0006_one_active_conversation.sql` | **✅ 適用済み（2026-08-10）** |
 
 `0006` は「1 user につき active な会話は 1 件」を DB 側で強制する partial unique
-index を足す。適用は手作業で、適用後の確認手順（読み取り専用 SQL）は
-`docs/phase10-ai-shopping-suggestions.md` §12 にある。
+index を足す。適用は Supabase SQL Editor での手作業。確認手順（読み取り専用 SQL）と
+実測値は `docs/phase10-ai-shopping-suggestions.md` §12 にある。
 
-`npm run check:migrations` は `0006` を `⚠️ MANUAL VERIFICATION REQUIRED` と出す。
-PostgREST から `pg_index` を読めないため、「行の整理だけ適用され index が無い」状態と
-「完全に適用された」状態を自動では区別できない。**⚠️ を PASS と読まないこと。**
-
-PHASE 10 の UI 第2段階は `0006` の適用待ちで停止している。
+`npm run check:migrations` は適用後も `0006` を `⚠️ MANUAL VERIFICATION REQUIRED`
+と出す。PostgREST から `pg_index` を読めないため、「行の整理だけ適用され index が無い」
+状態と「完全に適用された」状態を自動では区別できないからで、**これは仕様**。
+⚠️ を PASS と読まないのと同様に、**⚠️ を未適用と読むのも誤り**。判定は §12 の SQL と
+`npm run test:live` の `conversation-live.check.ts` で行う。

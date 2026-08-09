@@ -1,5 +1,5 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import type { ServiceContext } from '@/lib/inventory/service';
 
@@ -36,8 +36,12 @@ const NOT_APPLIED =
   'migration 0006_one_active_conversation.sql が未適用の可能性があります。' +
   'docs/phase10-ai-shopping-suggestions.md §12 を参照してください';
 
+/** Round trips to Auth and Postgres do not fit in Vitest's 5s default. */
+const TIMEOUT = 30_000;
+
 let userId = '';
 let admin: SupabaseClient | null = null;
+let ctx: ServiceContext | null = null;
 let conversationId = '';
 
 async function signIn(): Promise<ServiceContext> {
@@ -64,27 +68,47 @@ async function signIn(): Promise<ServiceContext> {
   return { supabase: anon, userId };
 }
 
+beforeAll(async () => {
+  if (!URL_ENV || !SERVICE_KEY || !ANON_KEY) {
+    throw new Error(
+      'NEXT_PUBLIC_SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / anon key must be set in .env.local',
+    );
+  }
+  // Signing in is a network round trip that has nothing to do with what any
+  // one test asserts. Paying for it here keeps it out of their time budget —
+  // and a failure here reads as "could not sign in" rather than as the first
+  // test mysteriously timing out.
+  ctx = await signIn();
+}, TIMEOUT);
+
 afterAll(async () => {
-  if (!admin || !userId) return;
   // Deleting the user is the whole cleanup: the cascade takes the throwaway
-  // conversation with it. No row is removed by name.
-  await admin.auth.admin.deleteUser(userId);
-});
+  // conversation and its messages with it. No row is removed by name.
+  //
+  // The id is looked up by email when sign-in never got far enough to record
+  // one. A check that creates an account has to remove it even on the paths
+  // where it fails, or a failed run leaves the account behind — which is
+  // exactly what happened the first time this file was run.
+  if (!URL_ENV || !SERVICE_KEY) return;
+  admin ??= createClient(URL_ENV, SERVICE_KEY, { auth: { persistSession: false } });
+
+  let id = userId;
+  if (!id) {
+    const { data } = await admin.auth.admin.listUsers();
+    id = data?.users.find((user) => user.email === EMAIL)?.id ?? '';
+  }
+
+  if (id) await admin.auth.admin.deleteUser(id);
+}, TIMEOUT);
 
 describe('one active conversation per user, against the real index', () => {
   it('gives two simultaneous callers the same conversation', async () => {
-    expect(URL_ENV, 'NEXT_PUBLIC_SUPABASE_URL must be set').toBeTruthy();
-    expect(SERVICE_KEY, 'SUPABASE_SERVICE_ROLE_KEY must be set').toBeTruthy();
-    expect(ANON_KEY, 'anon/publishable key must be set').toBeTruthy();
-
-    const ctx = await signIn();
-
     // The user starts with nothing, so both calls take the insert path. This
     // is the shape of the real race: a page render and a POST /api/chat that
     // arrive together, each reading zero active conversations.
     const [first, second] = await Promise.all([
-      getOrCreateConversation(ctx),
-      getOrCreateConversation(ctx),
+      getOrCreateConversation(ctx!),
+      getOrCreateConversation(ctx!),
     ]);
 
     expect(first, NOT_APPLIED).toBe(second);
@@ -99,7 +123,7 @@ describe('one active conversation per user, against the real index', () => {
     expect(error).toBeNull();
     expect(data, NOT_APPLIED).toHaveLength(1);
     expect(data![0].id).toBe(first);
-  });
+  }, TIMEOUT);
 
   it('lets the database refuse a second active conversation', async () => {
     // The test above can pass without an index — if the two calls happen to
@@ -124,7 +148,7 @@ describe('one active conversation per user, against the real index', () => {
 
     expect(data).toHaveLength(1);
     expect(data![0].id).toBe(conversationId);
-  });
+  }, TIMEOUT);
 
   it('still allows a closed conversation alongside the active one', async () => {
     // The index is partial. If that were ever lost, this insert would fail and
@@ -143,5 +167,5 @@ describe('one active conversation per user, against the real index', () => {
       .eq('status', 'closed');
 
     expect(count).toBe(1);
-  });
+  }, TIMEOUT);
 });
