@@ -806,3 +806,21 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 接続点は `src/lib/meals/evaluate.ts` の `MissingIngredient { name, reason, isStaple }` で、
 これを `createShoppingItem` へ流し込む形になる。
 
+
+---
+
+## 手動で残っている作業
+
+| 対象 | 状態 |
+|---|---|
+| `supabase/migrations/0006_one_active_conversation.sql` | **未適用**。Supabase SQL Editor で実行する |
+
+`0006` は「1 user につき active な会話は 1 件」を DB 側で強制する partial unique
+index を足す。適用は手作業で、適用後の確認手順（読み取り専用 SQL）は
+`docs/phase10-ai-shopping-suggestions.md` §12 にある。
+
+`npm run check:migrations` は `0006` を `⚠️ MANUAL VERIFICATION REQUIRED` と出す。
+PostgREST から `pg_index` を読めないため、「行の整理だけ適用され index が無い」状態と
+「完全に適用された」状態を自動では区別できない。**⚠️ を PASS と読まないこと。**
+
+PHASE 10 の UI 第2段階は `0006` の適用待ちで停止している。

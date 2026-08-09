@@ -16,6 +16,23 @@
 -- existing CHECK already allows and which the app already treats as "not the
 -- current conversation".
 
+begin;
+
+-- 0. Hold the table still for both steps below.
+--
+--    The normalising UPDATE takes only ROW EXCLUSIVE, and CREATE INDEX takes
+--    its own SHARE lock afterwards. Between the two there is a window in which
+--    a live request can insert a second active row for a user we have just
+--    tidied — and then CREATE INDEX fails with 23505 having already committed
+--    the UPDATE, which is the half-applied state this migration must not be
+--    able to produce.
+--
+--    SHARE ROW EXCLUSIVE conflicts with the ROW EXCLUSIVE that INSERT/UPDATE
+--    take, so writers wait from here to COMMIT. It also conflicts with itself,
+--    so two operators running this file at once serialise rather than race.
+--    Reads are untouched: SELECT takes ACCESS SHARE, which does not conflict.
+lock table public.conversation_sessions in share row exclusive mode;
+
 -- 1. Normalise what is already there. Keep the newest active conversation per
 --    user and close the rest.
 --
@@ -43,6 +60,18 @@ where target.id = ranked.id
 --
 --    Partial, so closed conversations are unconstrained — a user accumulates
 --    as many of those as they have had conversations.
+--
+--    Plain CREATE INDEX, not CONCURRENTLY: the latter cannot run inside a
+--    transaction block, and here the transaction is the point.
 create unique index if not exists conversation_sessions_one_active_per_user_idx
 on public.conversation_sessions (user_id)
 where status = 'active';
+
+commit;
+
+-- Both steps land together or neither does. If the COMMIT fails, the rows are
+-- exactly as they were and the index does not exist — `npm run check:migrations`
+-- will keep reporting 0006 as not applied, which is the truth.
+--
+-- Confirm the result with the read-only queries in
+-- `docs/phase10-ai-shopping-suggestions.md` §12.

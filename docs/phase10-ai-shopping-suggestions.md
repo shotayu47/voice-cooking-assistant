@@ -376,3 +376,129 @@ Server Action と同じ合成（`runOnce(failClosed) × runAddSuggested`）で�
 
 部分失敗・完了記録失敗・`unknown` は自動テストで担保済み。
 実機で障害を起こす必要はない。
+
+---
+
+## 12. migration `0006_one_active_conversation.sql` — 適用後の確認
+
+`0006` は列を足さないので、PostgREST 越しには「行が整理されたか」しか見えない。
+**行の整理だけが適用され index が無い状態**は、重複が 0 件という同じ見え方をする。
+`npm run check:migrations` はこの状態を PASS にせず
+`⚠️ MANUAL VERIFICATION REQUIRED` と出す。判定は以下の SQL で行う。
+
+**すべて `select` のみ。行は 1 件も変更しない。**
+Supabase SQL Editor で実行すること。
+
+### 12.1 active な会話が user ごとに 1 件以下
+
+```sql
+select user_id, count(*) as active_count
+from public.conversation_sessions
+where status = 'active'
+group by user_id
+having count(*) > 1;
+```
+
+**期待値: 0 行。** 1 行でも返れば index は存在し得ない（= 未適用）。
+
+### 12.2 index が「unique・対象列 user_id・predicate status='active'」であること
+
+```sql
+select
+  c.relname                                  as index_name,
+  i.indisunique                              as is_unique,
+  (
+    select array_agg(a.attname order by k.ord)
+    from unnest(i.indkey) with ordinality as k(attnum, ord)
+    join pg_attribute a
+      on a.attrelid = i.indrelid
+     and a.attnum   = k.attnum
+  )                                          as indexed_columns,
+  pg_get_expr(i.indpred, i.indrelid)         as predicate,
+  pg_get_indexdef(i.indexrelid)              as definition
+from pg_index i
+join pg_class     c on c.oid = i.indexrelid
+join pg_class     t on t.oid = i.indrelid
+join pg_namespace n on n.oid = t.relnamespace
+where n.nspname = 'public'
+  and t.relname = 'conversation_sessions'
+  and c.relname = 'conversation_sessions_one_active_per_user_idx';
+```
+
+**期待値: 1 行。かつ**
+
+| 列 | 期待値 |
+| --- | --- |
+| `is_unique` | `true` |
+| `indexed_columns` | `{user_id}` |
+| `predicate` | `(status = 'active'::text)` |
+
+0 行なら index が無い。`is_unique` が `false` なら重複を止められない。
+`predicate` が `null` なら partial ではなく、closed な会話まで 1 件に縛ってしまう。
+
+### 12.3 一発で PASS / FAIL を出す版
+
+12.1 と 12.2 の両方を 1 行に畳んだもの。`all_ok` が `true` なら適用済み。
+
+```sql
+select
+  not exists (
+    select 1
+    from public.conversation_sessions
+    where status = 'active'
+    group by user_id
+    having count(*) > 1
+  ) as no_duplicate_active,
+  coalesce(bool_or(
+    i.indisunique
+    and (
+      select array_agg(a.attname order by k.ord)
+      from unnest(i.indkey) with ordinality as k(attnum, ord)
+      join pg_attribute a
+        on a.attrelid = i.indrelid
+       and a.attnum   = k.attnum
+    ) = array['user_id']
+    and pg_get_expr(i.indpred, i.indrelid) ~ '^\(?status = ''active''(::text)?\)?$'
+  ), false) as index_ok,
+  not exists (
+    select 1
+    from public.conversation_sessions
+    where status = 'active'
+    group by user_id
+    having count(*) > 1
+  )
+  and coalesce(bool_or(
+    i.indisunique
+    and (
+      select array_agg(a.attname order by k.ord)
+      from unnest(i.indkey) with ordinality as k(attnum, ord)
+      join pg_attribute a
+        on a.attrelid = i.indrelid
+       and a.attnum   = k.attnum
+    ) = array['user_id']
+    and pg_get_expr(i.indpred, i.indrelid) ~ '^\(?status = ''active''(::text)?\)?$'
+  ), false) as all_ok
+from pg_index i
+join pg_class     c on c.oid = i.indexrelid
+join pg_class     t on t.oid = i.indrelid
+join pg_namespace n on n.oid = t.relnamespace
+where n.nspname = 'public'
+  and t.relname = 'conversation_sessions'
+  and c.relname = 'conversation_sessions_one_active_per_user_idx';
+```
+
+`index_ok` の predicate 比較を `=` ではなく `~` にしてあるのは、
+`pg_get_expr` の括弧と `::text` の付き方が Postgres のバージョンで揺れるため。
+中身（`status = 'active'`）が変わっていないことだけを見ている。
+
+### 12.4 適用後に実行するもの
+
+```
+npm run check:migrations   # 0006 が ⚠️ から ✅ に変わるのは pg_index を読めるときだけ
+npm run test:live          # src/lib/ai/conversation-live.check.ts が実DBで index を実測する
+```
+
+`test:live` は**使い捨てユーザーだけ**を作って検証し、後片付けは
+`auth.users` の削除（`on delete cascade`）で行う。既存の会話・メッセージには触れない。
+**`0006` 適用前に実行しないこと**（index が無ければ落ちるだけだが、
+落ちた理由が「未適用」だと分かるようにメッセージを入れてある）。
