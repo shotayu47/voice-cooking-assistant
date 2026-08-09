@@ -6,8 +6,21 @@ import { useEffect, useRef, useState } from 'react';
 
 import { cn } from '@/lib/cn';
 import { VoicePanel } from '@/components/voice-panel';
+import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
-type Message = { id: string; role: 'user' | 'assistant'; content: string };
+import { SuggestionCard } from './suggestion-card';
+
+/**
+ * `suggestions` only ever arrives on a live reply. Candidates are a reading of
+ * the fridge at one moment, so they are not part of `initialMessages` and do
+ * not come back after a reload — see STALE_ON_REPLAY.
+ */
+type Message = {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  suggestions?: ShoppingSuggestion[];
+};
 
 const SUGGESTIONS = [
   '今あるもので何作れる？',
@@ -69,11 +82,19 @@ export function ChatView({
         reply: string;
         cookingSessionId: string | null;
         inventoryChanged: boolean;
+        shoppingSuggestions?: ShoppingSuggestion[];
       };
 
       setMessages((current) => [
         ...current,
-        { id: `reply-${current.length}`, role: 'assistant', content: result.reply },
+        {
+          id: `reply-${current.length}`,
+          role: 'assistant',
+          content: result.reply,
+          suggestions: result.shoppingSuggestions?.length
+            ? result.shoppingSuggestions
+            : undefined,
+        },
       ]);
       if (result.cookingSessionId) setSessionId(result.cookingSessionId);
       // The inventory pages are server-rendered; pull fresh data after a write.
@@ -134,7 +155,12 @@ export function ChatView({
         ) : null}
 
         {messages.map((message) => (
-          <Bubble key={message.id} role={message.role} content={message.content} />
+          <div key={message.id} className="space-y-2">
+            <Bubble role={message.role} content={message.content} />
+            {message.suggestions ? (
+              <SuggestionCard suggestions={message.suggestions} />
+            ) : null}
+          </div>
         ))}
 
         {sending ? (
