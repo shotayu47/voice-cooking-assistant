@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ShoppingItem } from '@/types/domain';
 
 import {
+  MAX_PICKED_SUGGESTIONS,
   SHOPPING_PATH,
+  runAddSuggested,
   runClearChecked,
   runCreate,
   runDelete,
@@ -259,6 +261,142 @@ describe('runClearChecked', () => {
 
     expect(result.status).toBe('error');
     expect(JSON.stringify(result)).not.toContain('permission denied');
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+});
+
+describe('runAddSuggested', () => {
+  const pick = (name: string, quantity: number | null = null, unit: string | null = null) => ({
+    name,
+    quantity,
+    unit,
+  });
+
+  it('adds every line the user ticked', async () => {
+    const { deps: d } = deps();
+
+    const result = await runAddSuggested(d, [pick('玉ねぎ'), pick('じゃが芋', 3, '個')]);
+
+    expect(result.added).toEqual(['玉ねぎ', 'じゃが芋']);
+    expect(result.failed).toEqual([]);
+    expect(d.create).toHaveBeenNthCalledWith(1, { name: '玉ねぎ', quantity: null, unit: null });
+    expect(d.create).toHaveBeenNthCalledWith(2, { name: 'じゃが芋', quantity: 3, unit: '個' });
+  });
+
+  it('revalidates /shopping once, after the batch', async () => {
+    const { deps: d, revalidate } = deps();
+
+    await runAddSuggested(d, [pick('玉ねぎ'), pick('人参')]);
+
+    expect(revalidate).toHaveBeenCalledTimes(1);
+    expect(revalidate).toHaveBeenCalledWith(SHOPPING_PATH);
+  });
+
+  it('adds nothing when the selection is empty', async () => {
+    const { deps: d, revalidate } = deps();
+
+    const result = await runAddSuggested(d, []);
+
+    expect(result.error).toBe('追加するものを選んでください');
+    expect(d.create).not.toHaveBeenCalled();
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+
+  it('refuses an implausibly large batch without adding any of it', async () => {
+    const { deps: d } = deps();
+    const many = Array.from({ length: MAX_PICKED_SUGGESTIONS + 1 }, (_, i) => pick(`品${i}`));
+
+    const result = await runAddSuggested(d, many);
+
+    expect(result.error).toBeDefined();
+    expect(d.create).not.toHaveBeenCalled();
+  });
+
+  it('re-validates the values instead of trusting the card', async () => {
+    // The payload round-tripped through the browser, so it is client input.
+    const { deps: d } = deps();
+
+    await runAddSuggested(d, [pick('卵', 0, '個'), pick('牛乳', null, '本')]);
+
+    // A non-positive quantity and a unit with no quantity are both dropped
+    // rather than sent to a database that would reject them.
+    expect(d.create).toHaveBeenNthCalledWith(1, { name: '卵', quantity: null, unit: null });
+    expect(d.create).toHaveBeenNthCalledWith(2, { name: '牛乳', quantity: null, unit: null });
+  });
+
+  it('rejects a blank name as a failed line, not a crash', async () => {
+    const { deps: d } = deps();
+
+    const result = await runAddSuggested(d, [pick('   '), pick('玉ねぎ')]);
+
+    expect(result.added).toEqual(['玉ねぎ']);
+    expect(result.failed).toEqual([{ name: '   ', message: '品名が正しくありません' }]);
+  });
+
+  it('passes on the PHASE 9 duplicate notice', async () => {
+    const { deps: d } = deps({
+      create: vi.fn(async () => ({ item: item(), duplicates: [item({ id: 'other' })] })),
+    });
+
+    const result = await runAddSuggested(d, [pick('卵')]);
+
+    expect(result.added).toEqual(['卵']);
+    expect(result.notices).toEqual(['「卵」はすでにあります。別項目として追加しました']);
+  });
+
+  describe('when one line fails', () => {
+    function failingOnSecond() {
+      let call = 0;
+      return deps({
+        create: vi.fn(async () => {
+          call += 1;
+          if (call === 2) throw new Error('violates check constraint "x"');
+          return { item: item(), duplicates: [] };
+        }),
+      });
+    }
+
+    it('keeps the lines that succeeded', async () => {
+      const { deps: d } = failingOnSecond();
+
+      const result = await runAddSuggested(d, [pick('A'), pick('B'), pick('C')]);
+
+      expect(result.added).toEqual(['A', 'C']);
+      expect(result.failed.map((entry) => entry.name)).toEqual(['B']);
+    });
+
+    it('never throws, so the idempotency claim is not released', async () => {
+      // Releasing it would let a retry re-create the lines that worked.
+      const { deps: d } = failingOnSecond();
+
+      await expect(runAddSuggested(d, [pick('A'), pick('B')])).resolves.toBeDefined();
+    });
+
+    it('does not leak the database message', async () => {
+      const { deps: d } = failingOnSecond();
+
+      const result = await runAddSuggested(d, [pick('A'), pick('B')]);
+
+      expect(JSON.stringify(result)).not.toContain('constraint');
+      expect(result.failed[0].message).toBe('うまくいきませんでした。もう一度お試しください。');
+    });
+
+    it('still revalidates, because the list did change', async () => {
+      const { deps: d, revalidate } = failingOnSecond();
+
+      await runAddSuggested(d, [pick('A'), pick('B')]);
+
+      expect(revalidate).toHaveBeenCalledWith(SHOPPING_PATH);
+    });
+  });
+
+  it('does not revalidate when nothing was written', async () => {
+    const { deps: d, revalidate } = deps({
+      create: vi.fn(async () => { throw new Error('boom'); }),
+    });
+
+    await runAddSuggested(d, [pick('A')]);
+
     expect(revalidate).not.toHaveBeenCalled();
   });
 });

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createFakeSupabase, type Tables } from '@/test/fake-supabase';
 import type { ServiceContext } from '@/lib/inventory/service';
-import { runOnce } from './idempotency';
+import { IdempotencyUnavailableError, runOnce } from './idempotency';
 
 /**
  * Idempotency ledger (production-readiness audit).
@@ -94,5 +94,72 @@ describe('runOnce', () => {
     expect(run).toHaveBeenCalledTimes(2);
     expect(other.duplicate).toBe(false);
     expect(tables.ai_tool_calls).toHaveLength(2);
+  });
+});
+
+describe('runOnce failClosed — the write mode', () => {
+  /** A client whose ledger writes always fail. */
+  function brokenLedger(): ServiceContext {
+    return {
+      userId: USER_ID,
+      supabase: {
+        from: () => ({
+          upsert: () => ({
+            select: async () => ({ data: null, error: { message: 'ledger down' } }),
+          }),
+        }),
+      },
+    } as unknown as ServiceContext;
+  }
+
+  it('refuses to run when the claim cannot be made', async () => {
+    // The default mode executes anyway, which for a write would restore the
+    // double-add the ledger exists to prevent.
+    const ctx = brokenLedger();
+    const run = vi.fn();
+
+    await expect(
+      runOnce(ctx, 'req_1', 'add_suggested_shopping_items', run, { failClosed: true }),
+    ).rejects.toBeInstanceOf(IdempotencyUnavailableError);
+
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('refuses to run without a key at all', async () => {
+    const { ctx } = setup();
+    const run = vi.fn();
+
+    await expect(
+      runOnce(ctx, null, 'add_suggested_shopping_items', run, { failClosed: true }),
+    ).rejects.toBeInstanceOf(IdempotencyUnavailableError);
+
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('still runs once and replays the result when the ledger works', async () => {
+    const { ctx } = setup();
+    const run = vi.fn().mockResolvedValue({ added: ['卵'] });
+
+    const first = await runOnce(ctx, 'req_2', 'add_suggested_shopping_items', run, {
+      failClosed: true,
+    });
+    const second = await runOnce(ctx, 'req_2', 'add_suggested_shopping_items', run, {
+      failClosed: true,
+    });
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(first).toMatchObject({ duplicate: false, value: { added: ['卵'] } });
+    expect(second).toMatchObject({ duplicate: true, value: { added: ['卵'] } });
+  });
+
+  it('leaves the existing read behaviour alone', async () => {
+    // Same broken ledger, no failClosed: the read still happens.
+    const ctx = brokenLedger();
+    const run = vi.fn().mockResolvedValue({ ok: true });
+
+    const result = await runOnce(ctx, 'call_9', 'get_inventory', run);
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ duplicate: false, value: { ok: true } });
   });
 });

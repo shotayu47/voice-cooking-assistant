@@ -36,6 +36,24 @@ export type ShoppingFormState = {
 
 export type MutationOutcome = { status: 'ok' } | { status: 'error'; message: string };
 
+/** One line the user ticked on a suggestion card. */
+export type PickedSuggestion = {
+  name: string;
+  quantity: number | null;
+  unit: string | null;
+};
+
+export type AddSuggestedResult = {
+  /** Names actually written. */
+  added: string[];
+  /** Names that could not be written, with a message safe to render. */
+  failed: { name: string; message: string }[];
+  /** Duplicate notices, in the wording PHASE 9 established. */
+  notices: string[];
+  /** Set when nothing was attempted. */
+  error?: string;
+};
+
 export type ShoppingDeps = {
   create: (input: {
     name: string;
@@ -147,6 +165,73 @@ export async function runDelete(deps: ShoppingDeps, itemId: string): Promise<Mut
     logWith(deps, 'delete', error);
     return { status: 'error', message: describeShoppingError(error) };
   }
+}
+
+/** How many lines one confirmation may add. */
+export const MAX_PICKED_SUGGESTIONS = 30;
+
+/**
+ * Adds the suggestions the user ticked.
+ *
+ * **Never throws.** The caller wraps this in the idempotency ledger, which
+ * releases its claim on an exception so a genuine retry can run — and a retry
+ * after a mid-way failure would re-create the lines that already succeeded.
+ * So a failure part-way through is recorded as data and the run completes.
+ *
+ * Every value is re-validated here rather than trusted from the card: the
+ * payload round-tripped through the browser, so by the time it comes back it
+ * is client input again. Duplicate detection happens inside
+ * `createShoppingItem`, against the list as it is now — not as it was when the
+ * card was drawn.
+ */
+export async function runAddSuggested(
+  deps: ShoppingDeps,
+  picked: readonly PickedSuggestion[],
+): Promise<AddSuggestedResult> {
+  const empty: AddSuggestedResult = { added: [], failed: [], notices: [] };
+
+  if (picked.length === 0) {
+    return { ...empty, error: '追加するものを選んでください' };
+  }
+  if (picked.length > MAX_PICKED_SUGGESTIONS) {
+    return { ...empty, error: '一度に追加できるのは30件までです' };
+  }
+
+  const added: string[] = [];
+  const failed: { name: string; message: string }[] = [];
+  const notices: string[] = [];
+
+  for (const entry of picked) {
+    const name = entry.name.trim();
+    if (name === '' || shoppingKey(name) === '') {
+      failed.push({ name: entry.name, message: '品名が正しくありません' });
+      continue;
+    }
+
+    // A unit with no quantity is refused by the database; drop it here so the
+    // line is created without one rather than failing.
+    const quantity =
+      typeof entry.quantity === 'number' && Number.isFinite(entry.quantity) && entry.quantity > 0
+        ? entry.quantity
+        : null;
+    const unit = quantity === null ? null : (entry.unit?.trim() || null);
+
+    try {
+      const { duplicates } = await deps.create({ name, quantity, unit });
+      added.push(name);
+
+      const notice = duplicateNotice(name, duplicates.length);
+      if (notice) notices.push(notice);
+    } catch (error) {
+      logWith(deps, 'addSuggested', error);
+      failed.push({ name, message: describeShoppingError(error) });
+    }
+  }
+
+  // Even a partial run changed the list, so the page has to be re-read.
+  if (added.length > 0) deps.revalidate(SHOPPING_PATH);
+
+  return { added, failed, notices };
 }
 
 /** Clears the bought lines. Unchecked lines are the service's to protect. */
