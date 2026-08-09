@@ -6,7 +6,10 @@ import { useRef, useState, useTransition } from 'react';
 import { Button } from '@/components/ui/button';
 import { Chip } from '@/components/ui/surfaces';
 import { cn } from '@/lib/cn';
-import type { AddSuggestedResult } from '@/lib/shopping/actions-core';
+import {
+  shouldRotateRequestId,
+  type AddSuggestedOutcome,
+} from '@/lib/shopping/actions-core';
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
 import { addSuggestedShoppingItemsAction } from '../shopping/actions';
@@ -26,21 +29,27 @@ export function SuggestionCard({ suggestions }: { suggestions: ShoppingSuggestio
   // Nothing is ticked to begin with. The user chooses what to buy; a card
   // that arrives pre-selected is deciding for them.
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
-  const [result, setResult] = useState<AddSuggestedResult | null>(null);
+  const [outcome, setOutcome] = useState<AddSuggestedOutcome | null>(null);
   const [pending, startTransition] = useTransition();
 
   /*
-   * One key for this card, held until the run finishes. A double tap — or a
-   * resubmit after a dropped connection — arrives with the same key, and the
-   * server answers from its ledger instead of adding a second time. Generated
-   * once per card rather than per press, so the retry really is the same
-   * request rather than a new one.
+   * The request key for the press that is in flight.
+   *
+   * Held across a double tap and across a resubmit after a dropped
+   * connection, so both arrive with the same key and the ledger answers
+   * instead of adding a second time. Rotated only once a press has actually
+   * completed — `shouldRotateRequestId` owns that rule, because reusing a
+   * spent key silently replays the old result, and rotating an unspent one
+   * turns a retry into a second write.
    */
   const requestId = useRef<string>(crypto.randomUUID());
 
   if (suggestions.length === 0) return null;
 
-  const done = result !== null && result.added.length > 0;
+  const finished = outcome?.status === 'done';
+  // Nothing more to do here: the run either landed or cannot be resolved
+  // without the user looking at the list.
+  const closed = finished || outcome?.status === 'unknown';
 
   function toggle(name: string) {
     setPicked((current) => {
@@ -53,10 +62,10 @@ export function SuggestionCard({ suggestions }: { suggestions: ShoppingSuggestio
 
   function submit() {
     const chosen = suggestions.filter((entry) => picked.has(entry.name));
-    if (chosen.length === 0 || pending) return;
+    if (chosen.length === 0 || pending || closed) return;
 
     startTransition(async () => {
-      const outcome = await addSuggestedShoppingItemsAction(
+      const result = await addSuggestedShoppingItemsAction(
         requestId.current,
         chosen.map((entry) => ({
           name: entry.name,
@@ -64,7 +73,14 @@ export function SuggestionCard({ suggestions }: { suggestions: ShoppingSuggestio
           unit: entry.unit,
         })),
       );
-      setResult(outcome);
+
+      // Spend the key only when the run completed. An in-flight or
+      // unresolved outcome keeps it, so a retry is the same request.
+      if (shouldRotateRequestId(result.status)) {
+        requestId.current = crypto.randomUUID();
+      }
+
+      setOutcome(result);
     });
   }
 
@@ -83,7 +99,7 @@ export function SuggestionCard({ suggestions }: { suggestions: ShoppingSuggestio
                 <input
                   type="checkbox"
                   checked={checked}
-                  disabled={pending || done}
+                  disabled={pending || closed}
                   onChange={() => toggle(entry.name)}
                   className="size-6 shrink-0 accent-[var(--color-accent,currentColor)]"
                 />
@@ -112,22 +128,36 @@ export function SuggestionCard({ suggestions }: { suggestions: ShoppingSuggestio
         })}
       </ul>
 
-      {done ? (
+      {outcome?.status === 'done' ? (
         <div className="mt-2 space-y-1 px-1">
           <p className="text-sm text-fg">
-            {result.added.length}件を買い物リストに追加しました
-            {result.failed.length > 0 ? `（${result.failed.length}件は失敗しました）` : ''}
+            {outcome.added.length}件を買い物リストに追加しました
+            {outcome.failed.length > 0 ? `（${outcome.failed.length}件は失敗しました）` : ''}
           </p>
-          {result.notices.map((notice) => (
+          {outcome.notices.map((notice) => (
             <p key={notice} className="text-xs text-warn">
               {notice}
             </p>
           ))}
-          {result.failed.map((failure) => (
+          {outcome.failed.map((failure) => (
             <p key={failure.name} className="text-xs text-danger">
               {failure.name}: {failure.message}
             </p>
           ))}
+          <Link href="/shopping" className="inline-block text-xs text-accent">
+            買い物リストを見る
+          </Link>
+        </div>
+      ) : outcome?.status === 'unknown' ? (
+        /*
+         * Rows may or may not exist and we cannot tell. Offering a retry here
+         * is exactly how the same items get added twice, so the only way on is
+         * to go and look.
+         */
+        <div className="mt-2 space-y-1 px-1">
+          <p role="alert" className="text-sm text-danger">
+            {outcome.message}
+          </p>
           <Link href="/shopping" className="inline-block text-xs text-accent">
             買い物リストを見る
           </Link>
@@ -146,18 +176,20 @@ export function SuggestionCard({ suggestions }: { suggestions: ShoppingSuggestio
             {pending ? '追加中…' : `選んだ${picked.size}件を買い物リストに追加`}
           </Button>
 
-          {result?.error ? (
+          {outcome ? (
             <p role="alert" className="mt-2 px-1 text-sm text-danger">
-              {result.error}
+              {outcome.message}
             </p>
           ) : null}
         </>
       )}
 
       <p aria-live="polite" className="sr-only">
-        {done
-          ? `${result.added.length}件を買い物リストに追加しました`
-          : (result?.error ?? '')}
+        {outcome === null
+          ? ''
+          : outcome.status === 'done'
+            ? `${outcome.added.length}件を買い物リストに追加しました`
+            : outcome.message}
       </p>
     </div>
   );

@@ -2,7 +2,11 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import type { ServiceContext } from '@/lib/inventory/service';
-import { IdempotencyUnavailableError, runOnce } from '@/lib/ai/idempotency';
+import {
+  IdempotencyUnavailableError,
+  IdempotentWriteUnresolvedError,
+  runOnce,
+} from '@/lib/ai/idempotency';
 
 import { runAddSuggested, type ShoppingDeps } from './actions-core';
 import { createShoppingItem, listShoppingItems } from './service';
@@ -157,5 +161,67 @@ describe('confirming suggestions against the real ledger', () => {
 
     const rows = await listShoppingItems(signedIn);
     expect(rows.map((row) => row.name)).not.toContain('絶対に追加されない');
+  });
+
+  it('records the outcome, so a completed run replays rather than re-running', async () => {
+    const signedIn = await signIn();
+    const requestId = `req-${userId}-stored`;
+
+    const first = await runOnce(
+      signedIn,
+      requestId,
+      'add_suggested_shopping_items',
+      () => runAddSuggested(depsFor(signedIn), [{ name: 'ごぼう', quantity: null, unit: null }]),
+      { failClosed: true },
+    );
+
+    // `stored` is what tells the action it may report the result rather than
+    // 「結果を確定できません」.
+    expect(first.stored).toBe(true);
+
+    const before = (await listShoppingItems(signedIn)).filter((row) => row.name === 'ごぼう');
+    expect(before).toHaveLength(1);
+
+    await runOnce(
+      signedIn,
+      requestId,
+      'add_suggested_shopping_items',
+      () => runAddSuggested(depsFor(signedIn), [{ name: 'ごぼう', quantity: null, unit: null }]),
+      { failClosed: true },
+    );
+
+    const after = (await listShoppingItems(signedIn)).filter((row) => row.name === 'ごぼう');
+    expect(after).toHaveLength(1);
+  });
+
+  it('keeps the claim when the guarded write throws, so a retry cannot repeat it', async () => {
+    const signedIn = await signIn();
+    const requestId = `req-${userId}-throw`;
+
+    const halfWrite = async () => {
+      await createShoppingItem(signedIn, { name: 'れんこん' });
+      throw new Error('boom');
+    };
+
+    await expect(
+      runOnce(signedIn, requestId, 'add_suggested_shopping_items', halfWrite, {
+        failClosed: true,
+      }),
+    ).rejects.toBeInstanceOf(IdempotentWriteUnresolvedError);
+
+    // One row landed before the failure.
+    expect((await listShoppingItems(signedIn)).filter((r) => r.name === 'れんこん')).toHaveLength(1);
+
+    // The claim was not released, so the retry is answered instead of re-run.
+    const retry = await runOnce(
+      signedIn,
+      requestId,
+      'add_suggested_shopping_items',
+      halfWrite,
+      { failClosed: true },
+    );
+
+    expect(retry.duplicate).toBe(true);
+    expect((await listShoppingItems(signedIn)).filter((r) => r.name === 'れんこん')).toHaveLength(1);
   });
 });

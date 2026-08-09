@@ -14,6 +14,14 @@ export type RunOnceResult<T> = {
   value: T;
   /** True when this call had already been executed (or is executing). */
   duplicate: boolean;
+  /**
+   * False when the outcome could not be written back to the ledger.
+   *
+   * The work still happened; what is missing is the record of it. A retry of
+   * the same key will be refused rather than re-run, so a write caller should
+   * treat this as "cannot confirm" and send the user to check, not retry.
+   */
+  stored: boolean;
 };
 
 /**
@@ -28,6 +36,24 @@ export class IdempotencyUnavailableError extends Error {
   constructor() {
     super('Idempotency ledger unavailable');
     this.name = 'IdempotencyUnavailableError';
+  }
+}
+
+/**
+ * Raised when a guarded write started but its outcome cannot be established.
+ *
+ * Distinct from {@link IdempotencyUnavailableError}, which means nothing ran.
+ * Here the callback was entered, so rows may exist. The claim is kept so the
+ * same key cannot re-run, and the caller must send the user to look at the
+ * result rather than offer a retry.
+ *
+ * This is why the design is not described as exactly-once: it is
+ * at-most-once, and an unresolved outcome stops rather than guesses.
+ */
+export class IdempotentWriteUnresolvedError extends Error {
+  constructor() {
+    super('Guarded write outcome could not be established');
+    this.name = 'IdempotentWriteUnresolvedError';
   }
 }
 
@@ -46,7 +72,7 @@ export async function runOnce<T>(
   // No key supplied (e.g. the text loop, which guards per turn instead).
   if (!callId) {
     if (options.failClosed) throw new IdempotencyUnavailableError();
-    return { value: await run(), duplicate: false };
+    return { value: await run(), duplicate: false, stored: false };
   }
 
   const claim = await ctx.supabase
@@ -64,7 +90,7 @@ export async function runOnce<T>(
     if (options.failClosed) throw new IdempotencyUnavailableError();
     // Reads keep the old behaviour — never fail a user action because
     // bookkeeping failed, but say so loudly.
-    return { value: await run(), duplicate: false };
+    return { value: await run(), duplicate: false, stored: false };
   }
 
   const won = (claim.data ?? []).length > 0;
@@ -86,17 +112,27 @@ export async function runOnce<T>(
     }
 
     if (data?.status === 'done') {
-      return { value: data.result as T, duplicate: true };
+      return { value: data.result as T, duplicate: true, stored: true };
     }
-    return { value: IN_FLIGHT_RESULT as T, duplicate: true };
+    return { value: IN_FLIGHT_RESULT as T, duplicate: true, stored: true };
   }
 
   let value: T;
   try {
     value = await run();
   } catch (error) {
-    // Release the claim so a genuine retry can run rather than being told
-    // "already in flight" forever.
+    if (options.failClosed) {
+      // Do NOT release the claim. The callback may have written some of its
+      // work before failing, and a retry that re-ran it would add those rows a
+      // second time — the exact thing this ledger exists to stop. The claim
+      // stays, so the retry is refused, and the caller has to tell the user to
+      // go and look rather than press the button again.
+      console.error('[idempotency] write failed after claiming; claim kept:', error);
+      throw new IdempotentWriteUnresolvedError();
+    }
+
+    // Reads: release the claim so a genuine retry can run rather than being
+    // told "already in flight" forever. Nothing was written to undo.
     await ctx.supabase
       .from('ai_tool_calls')
       .delete()
@@ -113,5 +149,8 @@ export async function runOnce<T>(
 
   if (error) console.error('[idempotency] result store failed:', error.message);
 
-  return { value, duplicate: false };
+  // The claim is deliberately left in place when the result could not be
+  // stored. It stays `in_flight`, so a retry of the same key is refused rather
+  // than re-run — the work happened, we just cannot prove what it did.
+  return { value, duplicate: false, stored: !error };
 }

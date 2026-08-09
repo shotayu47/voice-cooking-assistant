@@ -8,6 +8,8 @@ import {
   runCreate,
   runDelete,
   runSetChecked,
+  MAX_PICKED_SUGGESTIONS,
+  type AddSuggestedOutcome,
   type AddSuggestedResult,
   type MutationOutcome,
   type PickedSuggestion,
@@ -20,7 +22,11 @@ import {
   deleteShoppingItem,
   setShoppingItemChecked,
 } from '@/lib/shopping/service';
-import { IdempotencyUnavailableError, runOnce } from '@/lib/ai/idempotency';
+import {
+  IdempotencyUnavailableError,
+  IdempotentWriteUnresolvedError,
+  runOnce,
+} from '@/lib/ai/idempotency';
 import { getServiceContext } from '@/lib/supabase/server';
 import type { ServiceContext } from '@/lib/inventory/service';
 
@@ -86,11 +92,20 @@ export async function clearCheckedShoppingItemsAction(): Promise<MutationOutcome
 export async function addSuggestedShoppingItemsAction(
   requestId: string,
   picked: PickedSuggestion[],
-): Promise<AddSuggestedResult> {
+): Promise<AddSuggestedOutcome> {
+  // Refused before the ledger is touched, so a rejected press does not burn
+  // the request key — the user fixes the selection and presses again.
+  if (!requestId || picked.length === 0) {
+    return { status: 'rejected', message: '追加するものを選んでください' };
+  }
+  if (picked.length > MAX_PICKED_SUGGESTIONS) {
+    return { status: 'rejected', message: '一度に追加できるのは30件までです' };
+  }
+
   const { ctx } = await getServiceContext();
 
   try {
-    const { value } = await runOnce(
+    const { value, stored } = await runOnce(
       ctx,
       requestId,
       'add_suggested_shopping_items',
@@ -99,25 +114,37 @@ export async function addSuggestedShoppingItemsAction(
     );
 
     // A concurrent submit holds the claim: the ledger answers with its own
-    // in-flight marker rather than a result, so it needs turning into one.
+    // in-flight marker rather than a result.
     if (!Array.isArray((value as AddSuggestedResult).added)) {
       return {
-        added: [],
-        failed: [],
-        notices: [],
-        error: '追加を処理中です。少し待ってから画面を確認してください。',
+        status: 'in_flight',
+        message: '追加を処理中です。少し待ってから買い物リストを確認してください。',
       };
     }
 
-    return value;
+    // The work happened but the ledger could not record it, so a retry would
+    // be refused and we cannot say what landed. Send them to look.
+    if (!stored) {
+      return {
+        status: 'unknown',
+        message: '結果を確定できません。買い物リストを確認してください。',
+      };
+    }
+
+    return { status: 'done', ...(value as AddSuggestedResult) };
   } catch (error) {
     if (error instanceof IdempotencyUnavailableError) {
-      // Nothing was attempted, so it is safe to say so and let them retry.
+      // Nothing ran, so the same key is still safe to reuse.
       return {
-        added: [],
-        failed: [],
-        notices: [],
-        error: '追加できませんでした。もう一度お試しください。',
+        status: 'unavailable',
+        message: '追加できませんでした。もう一度お試しください。',
+      };
+    }
+    if (error instanceof IdempotentWriteUnresolvedError) {
+      // Rows may exist. Offering a retry here is how a double-add happens.
+      return {
+        status: 'unknown',
+        message: '結果を確定できません。買い物リストを確認してください。',
       };
     }
     throw error;

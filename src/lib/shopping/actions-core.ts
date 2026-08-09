@@ -54,6 +54,38 @@ export type AddSuggestedResult = {
   error?: string;
 };
 
+/**
+ * What the confirmation action tells the caller.
+ *
+ * The distinction that matters is whether the request key was consumed:
+ *
+ * - `done` — the batch ran to completion (fully or partly). The key is spent,
+ *   so the next press must use a new one or the ledger will replay this.
+ * - `rejected` — refused before the ledger was touched. The key is untouched.
+ * - `in_flight` — a concurrent submit holds the claim. Same key, wait.
+ * - `unavailable` — the ledger could not be claimed, so nothing ran at all.
+ *   Safe to try the same key again.
+ * - `unknown` — the write started and its outcome cannot be established.
+ *   **Do not retry automatically.** Send the user to look at the list.
+ */
+export type AddSuggestedOutcome =
+  | ({ status: 'done' } & AddSuggestedResult)
+  | { status: 'rejected'; message: string }
+  | { status: 'in_flight'; message: string }
+  | { status: 'unavailable'; message: string }
+  | { status: 'unknown'; message: string };
+
+/**
+ * Whether the request key has been used up and a fresh one is needed.
+ *
+ * Only a completed run spends the key. Everything else either never reached
+ * the ledger or left the outcome open, and in both of those cases reusing the
+ * key is what keeps a retry from turning into a second write.
+ */
+export function shouldRotateRequestId(status: AddSuggestedOutcome['status']): boolean {
+  return status === 'done';
+}
+
 export type ShoppingDeps = {
   create: (input: {
     name: string;
