@@ -50,14 +50,37 @@ const MIGRATIONS = [
   { file: '0003_expiry_tracking.sql', probe: 'inventory_items?select=expiry_source&limit=1' },
   { file: '0004_cooking_progress.sql', probe: 'cooking_sessions?select=completed_steps&limit=1' },
   { file: '0005_shopping_list.sql', probe: 'shopping_items?select=id&limit=1' },
+  {
+    file: '0006_one_active_conversation.sql',
+    // This one adds an index and normalises rows, so there is no new column to
+    // select. What it guarantees is observable instead: no user is left with
+    // two active conversations. That is exactly the state the index forbids,
+    // and exactly the state this database was in before it.
+    verify: async (headers) => {
+      const response = await fetch(
+        `${BASE}/rest/v1/conversation_sessions?status=eq.active&select=user_id`,
+        { headers },
+      );
+      if (!response.ok) return false;
+
+      const seen = new Set();
+      for (const row of await response.json()) {
+        if (seen.has(row.user_id)) return false;
+        seen.add(row.user_id);
+      }
+      return true;
+    },
+  },
 ];
 
 const headers = { apikey: KEY, authorization: `Bearer ${KEY}` };
 let missing = 0;
 
 for (const migration of MIGRATIONS) {
-  const response = await fetch(`${BASE}/rest/v1/${migration.probe}`, { headers });
-  const applied = response.ok;
+  const applied = migration.verify
+    ? await migration.verify(headers)
+    : (await fetch(`${BASE}/rest/v1/${migration.probe}`, { headers })).ok;
+
   if (!applied) missing += 1;
   console.log(`${applied ? '✅ APPLIED ' : '❌ MISSING '} ${migration.file}`);
 }

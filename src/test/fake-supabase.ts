@@ -28,9 +28,16 @@ function nextId(): string {
  * happily accept a duplicate claim and an idempotency test would pass against
  * a guard that does not actually hold in Postgres.
  */
-const UNIQUE_KEYS: Record<string, string[]> = {
-  ai_tool_calls: ['user_id', 'call_id'],
-  profiles: ['id'],
+const UNIQUE_KEYS: Record<string, { columns: string[]; where?: (row: Row) => boolean }> = {
+  ai_tool_calls: { columns: ['user_id', 'call_id'] },
+  profiles: { columns: ['id'] },
+  // Partial, exactly as migration 0006 declares it: one *active* conversation
+  // per user. Without the predicate a user could never open a second
+  // conversation, which is the opposite of what the index says.
+  conversation_sessions: {
+    columns: ['user_id'],
+    where: (row) => row.status === 'active',
+  },
 };
 
 /** Column defaults the real schema would apply on insert. */
@@ -44,7 +51,7 @@ const TABLE_DEFAULTS: Record<string, () => Row> = {
   profiles: () => ({ locale: 'ja-JP', preferred_heat_scale: 'ih_10', cooking_skill_level: 'beginner' }),
 };
 
-type Result = { data: unknown; error: { message: string } | null };
+type Result = { data: unknown; error: { message: string; code?: string } | null };
 
 class Query implements PromiseLike<Result> {
   private filters: Filter[] = [];
@@ -167,10 +174,12 @@ class Query implements PromiseLike<Result> {
         ...this.payload,
       };
 
-      const uniqueKey = UNIQUE_KEYS[this.table];
-      if (uniqueKey) {
-        const clash = store.find((existing) =>
-          uniqueKey.every((column) => existing[column] === row[column]),
+      const unique = UNIQUE_KEYS[this.table];
+      if (unique && (unique.where?.(row) ?? true)) {
+        const clash = store.find(
+          (existing) =>
+            (unique.where?.(existing) ?? true) &&
+            unique.columns.every((column) => existing[column] === row[column]),
         );
         if (clash) {
           // `upsert(..., { ignoreDuplicates: true })` yields no rows; a plain
@@ -178,7 +187,10 @@ class Query implements PromiseLike<Result> {
           if (this.upsertOptions?.ignoreDuplicates) return this.shape([]);
           return {
             data: null,
-            error: { message: `duplicate key value violates unique constraint on ${this.table}` },
+            error: {
+              code: '23505',
+              message: `duplicate key value violates unique constraint on ${this.table}`,
+            },
           };
         }
       }

@@ -30,21 +30,44 @@ export type StoredMessage = {
   created_at: string;
 };
 
-export async function getOrCreateConversation(
-  ctx: ServiceContext,
-  cookingSessionId?: string | null,
-): Promise<string> {
-  const { data: existing, error: selectError } = await ctx.supabase
+/** Postgres unique-violation. Migration 0006 allows one active conversation. */
+const UNIQUE_VIOLATION = '23505';
+
+/** The user's current conversation, or null when they have none open. */
+async function selectActiveConversation(ctx: ServiceContext): Promise<string | null> {
+  const { data, error } = await ctx.supabase
     .from('conversation_sessions')
     .select('id')
     .eq('user_id', ctx.userId)
     .eq('status', 'active')
+    // Matches the ordering migration 0006 normalised on, so "newest" means the
+    // same thing here as it does there.
     .order('created_at', { ascending: false })
+    .order('id', { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  if (selectError) throw new ServiceError(selectError.message);
-  if (existing) return existing.id as string;
+  if (error) throw new ServiceError(error.message);
+  return (data?.id as string | undefined) ?? null;
+}
+
+/**
+ * The conversation to append to, creating one if the user has none.
+ *
+ * The read and the insert are not atomic — a page render and a POST can arrive
+ * together, both see nothing, and both try to create. The partial unique index
+ * from migration 0006 lets exactly one of them win; this handles being the
+ * loser by adopting the winner's conversation.
+ *
+ * Only 23505 is treated that way. Every other database error still fails, so a
+ * broken connection cannot quietly look like a race.
+ */
+export async function getOrCreateConversation(
+  ctx: ServiceContext,
+  cookingSessionId?: string | null,
+): Promise<string> {
+  const existing = await selectActiveConversation(ctx);
+  if (existing) return existing;
 
   const { data, error } = await ctx.supabase
     .from('conversation_sessions')
@@ -56,8 +79,67 @@ export async function getOrCreateConversation(
     .select('id')
     .single();
 
-  if (error) throw new ServiceError(error.message);
-  return data.id as string;
+  if (!error) return data.id as string;
+
+  const raced =
+    error.code === UNIQUE_VIOLATION ||
+    /duplicate key value violates unique constraint/i.test(error.message);
+
+  if (raced) {
+    const winner = await selectActiveConversation(ctx);
+    if (winner) return winner;
+  }
+
+  throw new ServiceError(error.message);
+}
+
+/**
+ * Closes the current conversation and returns the id of a fresh one.
+ *
+ * The point is to stop the model learning from its own earlier turns. PHASE 4
+ * blanked stale tool results for the same reason, but an assistant's *prose*
+ * cannot be blanked without rewriting history — so after a long conversation
+ * it keeps repeating what it said before. On a device that showed up as the
+ * assistant listing missing ingredients from the inventory in its prompt,
+ * calling no tools, and sending the user to a card that was never drawn.
+ *
+ * Nothing is deleted. The old conversation and every message in it stay
+ * exactly where they are, marked `closed`.
+ *
+ * Pressing this twice is safe: an already-empty conversation is left alone, so
+ * the second press is a no-op rather than another empty row.
+ */
+export async function startNewConversation(
+  ctx: ServiceContext,
+  cookingSessionId?: string | null,
+): Promise<string> {
+  const current = await selectActiveConversation(ctx);
+
+  if (current) {
+    const { data, error } = await ctx.supabase
+      .from('conversation_messages')
+      .select('id')
+      .eq('user_id', ctx.userId)
+      .eq('conversation_session_id', current)
+      .limit(1);
+
+    if (error) throw new ServiceError(error.message);
+
+    // Already a blank conversation — there is nothing to start away from.
+    if ((data ?? []).length === 0) return current;
+
+    const { error: closeError } = await ctx.supabase
+      .from('conversation_sessions')
+      .update({ status: 'closed' })
+      .eq('user_id', ctx.userId)
+      .eq('id', current);
+
+    if (closeError) throw new ServiceError(closeError.message);
+  }
+
+  // Race-safe: if a concurrent request created the replacement first, this
+  // adopts theirs rather than failing or making a second one.
+  return getOrCreateConversation(ctx, cookingSessionId ?? null);
 }
 
 export async function loadMessages(
