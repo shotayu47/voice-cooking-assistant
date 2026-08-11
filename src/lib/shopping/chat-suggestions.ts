@@ -45,3 +45,45 @@ export function assistantMessage(id: string, response: ChatTurnResponse): ChatMe
 export function hasSuggestionCard(message: ChatMessage): boolean {
   return (message.suggestions?.length ?? 0) > 0;
 }
+
+/**
+ * The caption shown above a card that came from a voice turn.
+ *
+ * Fixed text written here, never the assistant's sentence. The model is about
+ * to read the same names out loud, and using that sentence would make the
+ * card a reading of prose rather than of the tool's structured output.
+ */
+export const VOICE_SUGGESTION_CAPTION =
+  '音声で提案された候補です。追加するものを選んでください。';
+
+/**
+ * Adds a voice turn's candidates to the transcript, keyed by the function
+ * call that produced them.
+ *
+ * Two things make this idempotent, and both are needed: the relay to
+ * `/api/realtime/tool` can be retried, and the same `response.done` can be
+ * seen twice. Either way the card is replaced in place rather than added
+ * again. A second, *different* call keeps its own card, so a turn that asks
+ * for two dishes does not lose the first one's candidates.
+ */
+export function withVoiceSuggestions(
+  messages: ChatMessage[],
+  callId: string,
+  suggestions: ShoppingSuggestion[],
+): ChatMessage[] {
+  // Structured output only, and only when there is something to pick from.
+  if (suggestions.length === 0) return messages;
+
+  const id = `voice-${callId}`;
+  const card = assistantMessage(id, {
+    reply: VOICE_SUGGESTION_CAPTION,
+    shoppingSuggestions: suggestions,
+  });
+
+  const existing = messages.findIndex((message) => message.id === id);
+  if (existing === -1) return [...messages, card];
+
+  const next = [...messages];
+  next[existing] = card;
+  return next;
+}

@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
+
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
 
 /**
@@ -40,6 +42,18 @@ export type ToolEffect = {
   sessionId: string | null;
 };
 
+/**
+ * Structured shopping candidates from one voice tool call.
+ *
+ * `callId` travels with them so the page can key the card by it: a relay that
+ * is retried, or an event delivered twice, redraws the same card instead of
+ * stacking a second copy.
+ */
+export type VoiceSuggestions = {
+  callId: string;
+  suggestions: ShoppingSuggestion[];
+};
+
 const INITIAL_STATE: VoiceState = {
   status: 'idle',
   userTranscript: '',
@@ -60,6 +74,12 @@ type RealtimeEvent = {
 export function useRealtimeVoice(options: {
   /** Called after a tool call that changed persistent state. */
   onToolEffect?: (effect: ToolEffect) => void;
+  /**
+   * Called when a voice tool returned shopping candidates. Nothing has been
+   * written at this point — the card is how the user picks, exactly as on the
+   * text path.
+   */
+  onSuggestions?: (payload: VoiceSuggestions) => void;
 }) {
   const [state, setState] = useState<VoiceState>(INITIAL_STATE);
 
@@ -79,6 +99,11 @@ export function useRealtimeVoice(options: {
   useEffect(() => {
     onToolEffectRef.current = options.onToolEffect;
   }, [options.onToolEffect]);
+
+  const onSuggestionsRef = useRef(options.onSuggestions);
+  useEffect(() => {
+    onSuggestionsRef.current = options.onSuggestions;
+  }, [options.onSuggestions]);
 
   const teardown = useCallback(() => {
     channelRef.current?.close();
@@ -311,6 +336,7 @@ export function useRealtimeVoice(options: {
               result: unknown;
               effect: ToolEffect['effect'];
               session_id: string | null;
+              suggestions?: ShoppingSuggestion[] | null;
             })
           : {
               result: {
@@ -322,6 +348,7 @@ export function useRealtimeVoice(options: {
               },
               effect: null,
               session_id: null,
+              suggestions: null,
             };
 
         if (!response.ok) {
@@ -340,6 +367,13 @@ export function useRealtimeVoice(options: {
 
         if (body.effect) {
           onToolEffectRef.current?.({ effect: body.effect, sessionId: body.session_id });
+        }
+
+        // Only structured output draws a card. The assistant is about to say
+        // the same names out loud, and that sentence is never the source —
+        // an empty or missing list leaves the screen alone.
+        if (body.suggestions && body.suggestions.length > 0) {
+          onSuggestionsRef.current?.({ callId, suggestions: body.suggestions });
         }
       } catch {
         // Timed out or offline. Tell the model so it can say something rather

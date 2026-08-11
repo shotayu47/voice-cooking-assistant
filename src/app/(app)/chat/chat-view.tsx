@@ -9,6 +9,7 @@ import { VoicePanel } from '@/components/voice-panel';
 import {
   assistantMessage,
   hasSuggestionCard,
+  withVoiceSuggestions,
   type ChatMessage,
   type ChatTurnResponse,
 } from '@/lib/shopping/chat-suggestions';
@@ -246,6 +247,14 @@ export function ChatView({
         {error ? <p className="text-center text-sm text-danger">{error}</p> : null}
 
         <VoicePanel
+          /*
+           * The same card the text path draws, from the same structured
+           * candidates. Voice cannot operate a card mid-call, so the point is
+           * that it is waiting on screen when the call ends.
+           */
+          onSuggestions={({ callId, suggestions }) => {
+            setMessages((current) => withVoiceSuggestions(current, callId, suggestions));
+          }}
           onToolEffect={(effect) => {
             // Navigating would kill the live call mid-sentence, so surface the
             // 「調理画面へ」 header link instead and let the user switch over.

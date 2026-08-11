@@ -1,7 +1,11 @@
 'use client';
 
 import { cn } from '@/lib/cn';
-import { useRealtimeVoice, type ToolEffect } from '@/lib/voice/use-realtime-voice';
+import {
+  useRealtimeVoice,
+  type ToolEffect,
+  type VoiceSuggestions,
+} from '@/lib/voice/use-realtime-voice';
 
 /**
  * Hands-free voice mode for cooking (SPEC §21).
@@ -12,10 +16,13 @@ import { useRealtimeVoice, type ToolEffect } from '@/lib/voice/use-realtime-voic
  */
 export function VoicePanel({
   onToolEffect,
+  onSuggestions,
 }: {
   onToolEffect: (effect: ToolEffect) => void;
+  /** Structured candidates from a voice tool call, for the page to draw. */
+  onSuggestions?: (payload: VoiceSuggestions) => void;
 }) {
-  const { state, connect, disconnect } = useRealtimeVoice({ onToolEffect });
+  const { state, connect, disconnect } = useRealtimeVoice({ onToolEffect, onSuggestions });
 
   const live = state.status === 'live';
   const connecting = state.status === 'connecting';
@@ -84,6 +91,8 @@ const TOOL_LABELS: Record<string, string> = {
   consume_inventory_item: '在庫を減らす',
   search_meal_candidates: '献立を検討',
   create_recipe: 'レシピを作成',
+  adjust_recipe_amounts: '分量を調整',
+  suggest_shopping_items: '買い物候補を検討',
   start_cooking_session: '調理を開始',
   get_current_cooking_step: '工程を確認',
   advance_cooking_step: '次の工程へ',

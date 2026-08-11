@@ -54,6 +54,19 @@ export async function POST(request: Request) {
     // already caused.
     effect: duplicate ? null : (value.effect ?? null),
     session_id: value.sessionId ?? null,
+    /**
+     * Shopping candidates, for the browser to draw as a pickable card.
+     *
+     * `result` is what goes back to the model, and the model is told to read
+     * the candidates out and send the user to the screen — so without this
+     * field the card had nothing to draw from. The ledger shows the tool ran
+     * and produced candidates; they simply stopped here.
+     *
+     * Sent on a replay too, unlike `effect`. This is data the card renders,
+     * not an action to fire once, and the client keys cards by call id — so a
+     * retried relay redraws the same card rather than adding a second.
+     */
+    suggestions: value.suggestions ?? null,
     duplicate,
   });
 }
