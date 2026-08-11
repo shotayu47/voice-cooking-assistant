@@ -83,6 +83,28 @@ export async function POST() {
         audio: {
           input: {
             transcription: { model: 'gpt-4o-mini-transcribe', language: 'ja' },
+            /**
+             * Left unset, this resolves server-side to
+             * `server_vad, silence_duration_ms: 200` — measured against
+             * `gpt-realtime`, not assumed; the 500 in the public docs is not
+             * what this model returns. 200ms of quiet is shorter than the
+             * pause someone takes mid-sentence while deciding what they want,
+             * so a turn ended before the sentence did and the model answered
+             * half a request.
+             *
+             * `semantic_vad` ends the turn on whether the utterance sounds
+             * finished rather than on a stopwatch, which is the actual
+             * intent. `eagerness: 'low'` gives the longest grace — the panel
+             * is a continuous call ("タップで終了"), so a slightly later reply
+             * costs less than a truncated one. That trade is deliberate:
+             * responses begin a beat after the user stops speaking.
+             */
+            turn_detection: {
+              type: 'semantic_vad',
+              eagerness: 'low',
+              create_response: true,
+              interrupt_response: true,
+            },
           },
           output: { voice: 'marin' },
         },

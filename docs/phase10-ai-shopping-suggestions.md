@@ -267,7 +267,13 @@ Server Action 側で**選択件数（上限 30）・名前・数量・単位を�
 ### 制約と対応
 
 **書き込まない性質は両モードで同じ**なので安全性は変わらない。
-ただし**音声では確定カードを操作できない。**
+ただし**通話中は確定カードを操作できない**（手が濡れている前提の音声モードで、
+画面のチェックボックスを触らせる想定にはしていない）。
+
+> ⚠️ **§14 で更新。** 「操作できない」は**カードを出さない理由にはならなかった。**
+> 実機QAでカードが 1 枚も出ず、原因は `/api/realtime/tool` が構造化候補を
+> 返していなかったことだった。現在は音声でもテキストと同じカードが画面に出て、
+> 通話を終えたあとに選んで確定できる。読み上げるだけで終わらせない。
 
 そのため音声モード専用のプロンプト規則（`VOICE_SHOPPING_RULES`）を足し、
 
@@ -655,3 +661,152 @@ core の判断を返す）。Supabase のクエリは action に書かない。
 18. 「始める」を素早く 2 回押しても**空の会話が 2 つできない**
 19. 開始後、**過去のメッセージが DB から消えていない**
     （`conversation_messages` の件数が減っていないこと。§12.1 の SQL で確認できる）
+
+---
+
+## 14. 音声QA の結果 —— QA 9 FAIL / QA 10 PASS
+
+**PHASE 10 は引き続き `IN_PROGRESS`。**
+
+実機音声QAで 2 件の不具合が出た。QA 9（カード表示）と QA 10（勝手に追加されない）は
+**別々に判定した** —— 前者は FAIL、後者は PASS で、原因も別である。
+
+### 14.1 事実（実測）
+
+音声で買い物候補を尋ねたとき:
+
+- AI は候補を読み上げた（じゃがいも 2個 / にんじん 1本 / だし汁 300ml）
+- 「追加は画面で候補を選んでください」と案内した
+- **画面に候補カードは出なかった** → **QA 9 FAIL**
+
+### 14.2 ツールは本当に呼ばれたのか —— 呼ばれていた
+
+「読み上げた食材名」はツール実行の証拠にならないので、`ai_tool_calls` を読んだ。
+`/api/realtime/tool` は `runOnce` を通るため、音声のツール呼び出しは
+Realtime の `call_...` を key として**必ず台帳に残る**。
+
+```
+2026-08-10T13:00:37Z  VOICE  suggest_shopping_items  done  call_QX77ghwDvzWrJyA8
+  result.suggestions = [じゃがいも 2個 / にんじん 1本 / だし汁 300ml]
+  result.added = false
+```
+
+- **`suggest_shopping_items` は実際に呼ばれていた**（音声由来の実行が計 3 件）
+- **構造化候補は生成され、台帳に保存されていた**
+- 読み上げ内容と台帳の候補は**完全に一致** → モデルの作り話ではない
+
+つまり候補は正しく作られており、**壊れていたのは搬送だけ**だった。
+
+### 14.3 確定した欠落経路
+
+| 段 | 状態 |
+|---|---|
+| 1. Realtime セッション設定 | OK（tools 14 件、`suggest_shopping_items` 露出済み） |
+| 2. 音声入力 → function call | OK（`response.done` で検出） |
+| 3. `suggest_shopping_items` 実行 | OK（台帳に `done`） |
+| 4. `/api/realtime/tool` の応答 | ❌ **`suggestions` を返していない** |
+| 5. function call output を Realtime へ返却 | OK（`result` のみ返す。これは正しい） |
+| 6. クライアントが構造化データを受信 | ❌ 読む口が無い（型に `suggestions` が無い） |
+| 7. `ChatView` への反映 | ❌ 経路が存在しない（`onToolEffect` だけ） |
+| 8. `SuggestionCard` の描画 | ❌ 描くデータが届かない |
+
+**根本原因は 4。** `ToolOutcome.suggestions` はサーバー側に存在するのに、
+`route.ts` の `NextResponse.json({...})` が `result` / `effect` / `session_id` /
+`duplicate` しか載せておらず、そこで捨てられていた。6・7 はそもそも配線が無い。
+
+テキスト経路は `ToolOutcome.suggestions → TurnResult.shoppingSuggestions` を
+通るので影響が無く、だからテキストのQAだけ通っていた。
+
+### 14.4 QA 10 は PASS（カード未表示とは別問題）
+
+修正前後で `shopping_items` を読み取り専用で実測:
+
+```
+実装前: 3 行（じゃがいも 3個 / にんじん 1本 / じゃがいも 3個）
+実装後: 3 行（同一 id・同一内容）
+```
+
+- 台帳の `add_suggested_shopping_items` は **UI 由来（UUID key）の 3 件のみ**。
+  音声由来（`call_...`）の追加実行は**ゼロ**
+- `suggest_shopping_items` の結果は `added: false`
+
+**音声提案は買い物リストを変更していない** → **QA 10 PASS**。
+QA 9 の FAIL は「書き込んでしまった」ではなく「表示できなかった」である。
+
+### 14.5 修正（カード経路）
+
+カードは**構造化結果からのみ**生成する。読み上げ文の解析は行わない。
+
+| 変更 | 内容 |
+|---|---|
+| `api/realtime/tool/route.ts` | 応答に `suggestions` を追加。`effect` と違い**replay でも返す**（データであって発火するアクションではない） |
+| `use-realtime-voice.ts` | `suggestions` を受け取り、**1 件以上のときだけ** `onSuggestions({callId, suggestions})` |
+| `voice-panel.tsx` | `onSuggestions` を素通し。ツール名ラベルに `suggest_shopping_items` / `adjust_recipe_amounts` を追加（12→14 件） |
+| `chat-suggestions.ts` | `withVoiceSuggestions()` を追加。**テキストと同じ `assistantMessage` / `hasSuggestionCard`** を使う |
+| `chat-view.tsx` | 同じ `messages` state に載せ、**同じ `SuggestionCard`** で描画 |
+
+- 重複防止は **`callId` を key** にした置換（`voice-${callId}`）。
+  relay 再送でも `response.done` 再受信でも**カードは 1 枚**
+- 別の call は別カードとして残るので、**複数 tool call でも候補を失わない**
+- 0 件・欠落・null では**カードを作らない**（`assistantMessage` が空配列を捨てる既存規則）
+- カードのキャプションは**アプリ側の固定文**。assistant の発話は使わない
+- 再読込後に復元しない方針は不変（クライアント state のみ）
+- PHASE 9 の重複規則・`requestId`・at-most-once は**一切変更していない**
+
+### 14.6 修正（発話終了判定）
+
+**推測せず実効値を実測した。** 現行の session body で client secret を mint し、
+返ってきた `session.audio.input.turn_detection` を読んだ:
+
+```
+現行（turn_detection 未指定）:
+  {"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,
+   "silence_duration_ms":200,...}
+```
+
+⚠️ **既定は 500ms ではなく 200ms だった**（`gpt-realtime` で実測）。
+公開ドキュメントの 500 とは異なる。200ms の無音は、
+「何を買うか考えながら話す」ときの間より確実に短く、症状と完全に一致する。
+
+**音声UXは連続会話方式**（`VoicePanel` はタップで接続/切断のトグル、
+「タップで終了」はセッション終了）。したがってワンショット化はしない。
+
+採用: **`semantic_vad` / `eagerness: 'low'`**（実測で受理を確認済み）。
+
+| | 値 |
+|---|---|
+| type | `semantic_vad` |
+| eagerness | `low`（最も待つ） |
+| create_response | `true`（連続会話なので必須） |
+| interrupt_response | `true` |
+| silence_duration_ms | **送らない**（semantic_vad は使わない） |
+
+**トレードオフ:** 発話終了の判定が「無音の長さ」から「言い終わった感じか」に
+変わるため、**応答開始が一拍遅くなる。** 連続会話では、途中で切られて
+半分の依頼に答えられるコストの方が大きいと判断した。
+
+### 14.7 テスト
+
+計 **607 件**（586 → +21）。
+
+- `src/lib/shopping/voice-suggestions.test.ts`（11 件）
+  同一state / 0件・欠落・null / 発話文のみ / 二重受信 / 複数call
+- `src/app/api/realtime/realtime-routes.test.ts`（10 件）
+  応答に `suggestions` が載ること・plain JSON であること・replay 時の扱い・
+  書き込みが起きないこと・`turn_detection` の期待値・tools 14 件
+
+`realtime-routes.test.ts` は**このプロジェクト初の route テスト**。
+今回の不具合は「応答に項目が 1 つ足りない」だけで、
+route の応答形状にテストが無かったため誰にも見えなかった。
+
+### 14.8 修正後に必要な再QA（未実施）
+
+1. 文章の途中で 1〜2 秒の間を空けても**途中確定されない**
+2. 音声で買い物候補を依頼 → 候補を**読み上げる**
+3. 同じ候補が**画面カードにも出る**
+4. カードは初期状態で**すべて未選択**
+5. 提案表示だけでは**買い物リスト 3 行が変化しない**
+6. 選択した候補**だけ**追加できる
+7. 追加ボタン二重タップでも**二重登録されない**
+8. 音声終了後、**録音中表示が残らない**
+9. 応答開始が遅すぎて実用に耐えないほどではないこと（`eagerness` の再検討判断）
