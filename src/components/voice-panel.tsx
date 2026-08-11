@@ -22,7 +22,7 @@ export function VoicePanel({
   /** Structured candidates from a voice tool call, for the page to draw. */
   onSuggestions?: (payload: VoiceSuggestions) => void;
 }) {
-  const { state, connect, disconnect } = useRealtimeVoice({ onToolEffect, onSuggestions });
+  const { state, connect, disconnect, retry } = useRealtimeVoice({ onToolEffect, onSuggestions });
 
   const live = state.status === 'live';
   const connecting = state.status === 'connecting';
@@ -71,6 +71,40 @@ export function VoicePanel({
             <p className="text-xs text-accent">実行中: {toolLabel(state.activeTool)}</p>
           ) : null}
           {state.notice ? <p className="text-xs text-warn">{state.notice}</p> : null}
+        </div>
+      ) : null}
+
+      {live && state.stalled ? (
+        /*
+         * A committed turn that stopped producing an answer. The call is still
+         * up, so the mic indicator alone would say "listening" over a turn that
+         * is never going to be answered — the user is left talking to nothing,
+         * which is what "お願いします" into silence was.
+         */
+        <div
+          className="space-y-2 rounded-xl border border-warn/40 bg-warn/10 px-3 py-2"
+          role="status"
+          aria-live="polite"
+        >
+          <p className="text-sm text-fg">{state.stalled}</p>
+          <div className="flex gap-2">
+            {state.canRetry ? (
+              <button
+                type="button"
+                onClick={retry}
+                className="min-h-11 flex-1 rounded-lg border border-accent/50 px-3 text-sm text-accent active:bg-surface-2"
+              >
+                もう一度応答を試す
+              </button>
+            ) : null}
+            <button
+              type="button"
+              onClick={disconnect}
+              className="min-h-11 flex-1 rounded-lg border border-line px-3 text-sm text-fg active:bg-surface-2"
+            >
+              音声を終了してテキストで続ける
+            </button>
+          </div>
         </div>
       ) : null}
 

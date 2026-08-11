@@ -4,7 +4,21 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
+import { createEventLog, formatEventLog } from './event-log';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
+import {
+  canExecuteCall,
+  canRequestContinuation,
+  canRetry,
+  canSendToolOutput,
+  describeFailure,
+  INITIAL_TURN,
+  markOverdue,
+  overdue,
+  reduceTurn,
+  type TurnState,
+  type VoiceEvent,
+} from './turn-state';
 
 /**
  * WebRTC client for the OpenAI Realtime API (SPEC §21.2).
@@ -35,6 +49,14 @@ export type VoiceState = {
   /** Non-fatal problem worth showing without tearing the call down. */
   notice: string | null;
   error: string | null;
+  /**
+   * Set when a committed turn stopped producing an answer. The call is still
+   * up — this is the difference between "still thinking" and "nothing is
+   * coming", which the UI previously could not tell apart and so never said.
+   */
+  stalled: string | null;
+  /** Whether re-asking for a response on the unfinished turn is safe. */
+  canRetry: boolean;
 };
 
 export type ToolEffect = {
@@ -61,15 +83,29 @@ const INITIAL_STATE: VoiceState = {
   activeTool: null,
   notice: null,
   error: null,
+  stalled: null,
+  canRetry: false,
 };
 
 type RealtimeEvent = {
   type: string;
   delta?: string;
   transcript?: string;
-  response?: { output?: RealtimeFunctionCall[] };
+  item_id?: string;
+  call_id?: string;
+  response?: {
+    id?: string;
+    /** `completed` | `cancelled` | `failed` | `incomplete`. */
+    status?: string;
+    status_details?: { reason?: string; error?: { code?: string } };
+    output?: RealtimeFunctionCall[];
+  };
+  item?: { id?: string; type?: string };
   error?: { message?: string; code?: string };
 };
+
+/** How often the watchdog asks whether the current wait has gone on too long. */
+const WATCHDOG_INTERVAL_MS = 2_000;
 
 export function useRealtimeVoice(options: {
   /** Called after a tool call that changed persistent state. */
@@ -95,6 +131,15 @@ export function useRealtimeVoice(options: {
   /** call_ids already relayed, so a repeated event cannot run a tool twice. */
   const handledCallsRef = useRef<Set<string>>(new Set());
 
+  /**
+   * The turn's state machine. Held in a ref because the event handlers close
+   * over it and must read the value as it is *now*, not as it was when the
+   * handler was created.
+   */
+  const turnRef = useRef<TurnState>(INITIAL_TURN);
+  const logRef = useRef(createEventLog());
+  const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const onToolEffectRef = useRef(options.onToolEffect);
   useEffect(() => {
     onToolEffectRef.current = options.onToolEffect;
@@ -106,6 +151,11 @@ export function useRealtimeVoice(options: {
   }, [options.onSuggestions]);
 
   const teardown = useCallback(() => {
+    if (watchdogRef.current) {
+      clearInterval(watchdogRef.current);
+      watchdogRef.current = null;
+    }
+
     channelRef.current?.close();
     channelRef.current = null;
 
@@ -132,6 +182,7 @@ export function useRealtimeVoice(options: {
     }
 
     handledCallsRef.current.clear();
+    turnRef.current = INITIAL_TURN;
     startingRef.current = false;
   }, []);
 
@@ -217,7 +268,28 @@ export function useRealtimeVoice(options: {
         void handleEvent(JSON.parse(event.data) as RealtimeEvent);
       };
       channel.onopen = () => {
+        logRef.current.add('channel_open');
         setState((current) => ({ ...current, status: 'live' }));
+
+        /*
+         * Nothing else notices a turn that simply stops. Every other path here
+         * is driven by an event arriving; this is the one case defined by an
+         * event *not* arriving, so it needs a clock.
+         */
+        watchdogRef.current = setInterval(() => {
+          const failure = overdue(turnRef.current, Date.now());
+          if (!failure) return;
+
+          logRef.current.add('overdue', { status: failure });
+          turnRef.current = markOverdue(turnRef.current, failure, Date.now());
+          const stalled = describeFailure(turnRef.current);
+          setState((current) => ({
+            ...current,
+            stalled,
+            canRetry: canRetry(turnRef.current),
+            activeTool: null,
+          }));
+        }, WATCHDOG_INTERVAL_MS);
       };
       channel.onclose = () => {
         // The server ends the channel when the session's lifetime expires.
@@ -268,8 +340,72 @@ export function useRealtimeVoice(options: {
       failWith(describeConnectError(error));
     }
 
+    /**
+     * Advance the turn machine and mirror the parts of it the UI shows.
+     *
+     * Every transition goes through here, so there is exactly one place where
+     * "what state is this turn in" is decided.
+     */
+    function advance(event: VoiceEvent) {
+      const before = turnRef.current;
+      const after = reduceTurn(before, event);
+      turnRef.current = after;
+
+      if (after.phase !== before.phase) {
+        logRef.current.add('turn.phase', { phase: after.phase, status: after.failure ?? undefined });
+      }
+
+      const stalled = describeFailure(after);
+      setState((current) =>
+        current.stalled === stalled && current.canRetry === canRetry(after)
+          ? current
+          : { ...current, stalled, canRetry: canRetry(after) },
+      );
+    }
+
     async function handleEvent(event: RealtimeEvent) {
       switch (event.type) {
+        // ---- Turn lifecycle. Recorded for the trace, and for the machine. ----
+        case 'input_audio_buffer.speech_started':
+          logRef.current.add('speech_started');
+          advance({ type: 'speech_started', at: Date.now() });
+          break;
+
+        case 'input_audio_buffer.speech_stopped':
+          logRef.current.add('speech_stopped');
+          advance({ type: 'speech_stopped', at: Date.now() });
+          break;
+
+        case 'input_audio_buffer.committed':
+          logRef.current.add('committed', { itemId: event.item_id });
+          advance({ type: 'committed', at: Date.now() });
+          break;
+
+        case 'conversation.item.created':
+          logRef.current.add('item_created', { itemId: event.item?.id, status: event.item?.type });
+          break;
+
+        case 'response.output_item.added':
+          logRef.current.add('output_item_added', { responseId: event.response?.id });
+          break;
+
+        case 'response.function_call_arguments.done':
+          logRef.current.add('function_call_arguments_done', { callId: event.call_id });
+          break;
+
+        case 'conversation.item.input_audio_transcription.failed':
+          // The turn may still be answered, but the model heard nothing useful.
+          logRef.current.add('transcription_failed');
+          setState((current) => ({
+            ...current,
+            notice: '聞き取れませんでした。もう一度話しかけてください。',
+          }));
+          break;
+
+        case 'response.output_audio.done':
+          logRef.current.add('output_audio_done', { responseId: event.response?.id });
+          break;
+
         // Assistant speech transcript (streamed).
         case 'response.output_audio_transcript.delta':
           setState((current) => ({
@@ -286,40 +422,81 @@ export function useRealtimeVoice(options: {
 
         // A new assistant turn starts a fresh caption.
         case 'response.created':
-          setState((current) => ({ ...current, assistantTranscript: '' }));
+          logRef.current.add('response_created', { responseId: event.response?.id });
+          advance({
+            type: 'response_created',
+            at: Date.now(),
+            responseId: event.response?.id ?? 'unknown',
+          });
+          setState((current) => ({ ...current, assistantTranscript: '', stalled: null }));
           break;
 
         // What the user said.
         case 'conversation.item.input_audio_transcription.completed':
+          logRef.current.add('transcription_completed');
           if (event.transcript) {
-            setState((current) => ({
-              ...current,
-              userTranscript: event.transcript!.trim(),
-            }));
+            setState((current) => ({ ...current, userTranscript: event.transcript!.trim() }));
           }
           break;
 
-        // Completed model turn — run any function calls it contains.
+        // End of a model turn. Only a *completed* one may act.
         case 'response.done': {
+          const status = event.response?.status ?? 'completed';
+          logRef.current.add('response_done', {
+            responseId: event.response?.id,
+            status,
+          });
+
+          advance({
+            type: 'response_done',
+            at: Date.now(),
+            responseId: event.response?.id ?? 'unknown',
+            status,
+          });
+
+          if (status !== 'completed') {
+            /*
+             * A cancelled or failed response still carries whatever output it
+             * had produced, including whole function calls — and reading only
+             * the event name made those indistinguishable from a finished
+             * turn. Running them sends a `function_call_output` for a call the
+             * server has already abandoned, which it rejects, leaving the turn
+             * with no answer at all. That is the state the device reached.
+             */
+            logRef.current.add('calls_skipped', { status });
+            setState((current) => ({ ...current, activeTool: null }));
+            break;
+          }
+
           const calls = selectExecutableCalls(event.response?.output, handledCallsRef.current);
           for (const call of calls) {
+            if (!canExecuteCall(turnRef.current, call.callId)) continue;
             handledCallsRef.current.add(call.callId);
+            advance({ type: 'function_call_ready', at: Date.now(), callId: call.callId });
             await runTool(call.name, call.callId, call.arguments);
           }
           break;
         }
 
-        case 'error':
-          console.error('[voice] realtime error:', event.error?.message);
+        case 'error': {
+          const code = event.error?.code;
+          // Never the message: it can quote the conversation back.
+          logRef.current.add('error', { status: code });
+          console.error('[voice] realtime error code:', code ?? 'unknown');
+          advance({ type: 'api_error', at: Date.now() });
           setState((current) => ({
             ...current,
             notice: '聞き取りに問題がありました。もう一度話しかけてください。',
           }));
           break;
+        }
       }
     }
 
+
     async function runTool(name: string, callId: string, args: string) {
+      const startedAt = Date.now();
+      logRef.current.add('tool_start', { tool: name, callId });
       setState((current) => ({ ...current, activeTool: name, notice: null }));
       try {
         const response = await fetch('/api/realtime/tool', {
@@ -351,55 +528,102 @@ export function useRealtimeVoice(options: {
               suggestions: null,
             };
 
+        logRef.current.add('tool_done', {
+          tool: name,
+          callId,
+          status: response.ok ? 'ok' : String(response.status),
+          ms: Date.now() - startedAt,
+        });
+
         if (!response.ok) {
           setState((current) => ({ ...current, notice: '操作に失敗しました' }));
         }
 
-        send({
-          type: 'conversation.item.create',
-          item: {
-            type: 'function_call_output',
-            call_id: callId,
-            output: JSON.stringify(body.result),
-          },
-        });
-        send({ type: 'response.create' });
+        /*
+         * The card first, and unconditionally.
+         *
+         * It is built from structured output that has already arrived, so it
+         * is valid whether or not the spoken half of the turn survives. Drawing
+         * it after the sends meant a failure to deliver the output could take
+         * the card with it — losing the one part that worked.
+         */
+        if (body.suggestions && body.suggestions.length > 0) {
+          onSuggestionsRef.current?.({ callId, suggestions: body.suggestions });
+          advance({ type: 'card_shown', at: Date.now() });
+        }
 
         if (body.effect) {
           onToolEffectRef.current?.({ effect: body.effect, sessionId: body.session_id });
         }
 
-        // Only structured output draws a card. The assistant is about to say
-        // the same names out loud, and that sentence is never the source —
-        // an empty or missing list leaves the screen alone.
-        if (body.suggestions && body.suggestions.length > 0) {
-          onSuggestionsRef.current?.({ callId, suggestions: body.suggestions });
-        }
+        deliverToolOutput(callId, body.result);
       } catch {
         // Timed out or offline. Tell the model so it can say something rather
         // than waiting forever for an output that will never arrive.
+        logRef.current.add('tool_failed', { tool: name, callId, ms: Date.now() - startedAt });
         setState((current) => ({ ...current, notice: '操作がタイムアウトしました' }));
-        send({
-          type: 'conversation.item.create',
-          item: {
-            type: 'function_call_output',
-            call_id: callId,
-            output: JSON.stringify({
-              error: 'tool_unreachable',
-              message: 'サーバーに接続できませんでした。ユーザーに再試行を促してください。',
-            }),
-          },
+        deliverToolOutput(callId, {
+          error: 'tool_unreachable',
+          message: 'サーバーに接続できませんでした。ユーザーに再試行を促してください。',
         });
-        send({ type: 'response.create' });
       } finally {
         setState((current) => ({ ...current, activeTool: null }));
       }
     }
 
-    function send(payload: unknown) {
-      if (channelRef.current?.readyState === 'open') {
-        channelRef.current.send(JSON.stringify(payload));
+    /**
+     * Hand a tool's result back and ask for the reply that follows it.
+     *
+     * Both halves are guarded. The output goes at most once per call id, and
+     * the continuation at most once per turn and never while a response is
+     * still active — with `create_response: true` the server may already have
+     * started one, and a second concurrent request is refused, which is how a
+     * turn ended up with no reply rather than two.
+     */
+    function deliverToolOutput(callId: string, result: unknown) {
+      if (!canSendToolOutput(turnRef.current, callId)) {
+        logRef.current.add('output_suppressed', { callId });
+        return;
       }
+
+      const delivered = send({
+        type: 'conversation.item.create',
+        item: {
+          type: 'function_call_output',
+          call_id: callId,
+          output: JSON.stringify(result),
+        },
+      });
+
+      if (!delivered) {
+        // Silently dropping this used to leave the model waiting forever for
+        // an output that would never arrive — the turn simply went quiet.
+        logRef.current.add('output_undeliverable', { callId });
+        advance({ type: 'channel_lost', at: Date.now() });
+        return;
+      }
+
+      logRef.current.add('output_sent', { callId });
+      advance({ type: 'tool_output_sent', at: Date.now(), callId });
+
+      if (!canRequestContinuation(turnRef.current)) {
+        logRef.current.add('continuation_suppressed');
+        return;
+      }
+
+      if (send({ type: 'response.create' })) {
+        logRef.current.add('continuation_requested');
+        advance({ type: 'continuation_requested', at: Date.now() });
+      } else {
+        advance({ type: 'channel_lost', at: Date.now() });
+      }
+    }
+
+    /** Returns whether the payload actually went out. */
+    function send(payload: unknown): boolean {
+      if (channelRef.current?.readyState !== 'open') return false;
+      channelRef.current.send(JSON.stringify(payload));
+      return true;
     }
   }, [failWith, teardown]);
 
@@ -422,7 +646,37 @@ export function useRealtimeVoice(options: {
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   }, [failWith]);
 
-  return { state, connect, disconnect };
+  /**
+   * Ask again for a response to the turn that never got one.
+   *
+   * A bare `response.create`, with no new conversation item: the user's audio
+   * was committed before this went wrong, so the item is already in the
+   * conversation and re-sending it would add a second copy of what they said.
+   *
+   * Deliberately manual. When the outcome is unknown the safe move is to let
+   * the user decide, not to retry on a timer behind their back.
+   */
+  const retry = useCallback(() => {
+    if (!canRetry(turnRef.current)) return;
+    if (channelRef.current?.readyState !== 'open') {
+      setState((current) => ({
+        ...current,
+        stalled: '接続が切れています。音声を終了してもう一度開始してください。',
+        canRetry: false,
+      }));
+      return;
+    }
+
+    logRef.current.add('retry_requested');
+    turnRef.current = reduceTurn(turnRef.current, { type: 'retry_requested', at: Date.now() });
+    channelRef.current.send(JSON.stringify({ type: 'response.create' }));
+    setState((current) => ({ ...current, stalled: null, canRetry: false }));
+  }, []);
+
+  /** The redacted trace of this call, for a bug report. Never any content. */
+  const eventTrace = useCallback(() => formatEventLog(logRef.current.entries()), []);
+
+  return { state, connect, disconnect, retry, eventTrace };
 }
 
 function describeConnectError(error: unknown): string {
