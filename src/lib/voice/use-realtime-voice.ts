@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
 import { createEventLog, formatEventLog } from './event-log';
+import { classifyUtterance, decideLivenessAction, livenessInstructions } from './liveness';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
 import {
   canExecuteCall,
@@ -13,6 +14,7 @@ import {
   canSendToolOutput,
   describeFailure,
   INITIAL_TURN,
+  isUnresolved,
   markOverdue,
   overdue,
   reduceTurn,
@@ -435,7 +437,9 @@ export function useRealtimeVoice(options: {
         case 'conversation.item.input_audio_transcription.completed':
           logRef.current.add('transcription_completed');
           if (event.transcript) {
-            setState((current) => ({ ...current, userTranscript: event.transcript!.trim() }));
+            const transcript = event.transcript.trim();
+            setState((current) => ({ ...current, userTranscript: transcript }));
+            handleLivenessCheck(transcript);
           }
           break;
 
@@ -617,6 +621,32 @@ export function useRealtimeVoice(options: {
       } else {
         advance({ type: 'channel_lost', at: Date.now() });
       }
+    }
+
+    /**
+     * Answer "are you still there" from what is known about the turn.
+     *
+     * With `create_response: true` the server is already generating a reply to
+     * this utterance, and the only substantial context in the prompt is the
+     * cooking session — which is how a contentless question came back as the
+     * next cooking step of an unrelated dish. Cancelling that response and
+     * asking again with explicit instructions is what makes the answer depend
+     * on the turn's state instead of on what happens to be in the prompt.
+     */
+    function handleLivenessCheck(transcript: string) {
+      const action = decideLivenessAction(
+        classifyUtterance(transcript),
+        isUnresolved(turnRef.current),
+      );
+      if (action === 'pass_through') return;
+
+      logRef.current.add('liveness', { status: action });
+
+      send({ type: 'response.cancel' });
+      send({
+        type: 'response.create',
+        response: { instructions: livenessInstructions(action, describeFailure(turnRef.current)) },
+      });
     }
 
     /** Returns whether the payload actually went out. */

@@ -810,3 +810,145 @@ route の応答形状にテストが無かったため誰にも見えなかっ�
 7. 追加ボタン二重タップでも**二重登録されない**
 8. 音声終了後、**録音中表示が残らない**
 9. 応答開始が遅すぎて実用に耐えないほどではないこと（`eagerness` の再検討判断）
+
+---
+
+## 15. 音声Realtimeの会話継続性（`d6de106` 実機QAの残課題）
+
+**PHASE 10 は引き続き `IN_PROGRESS`。**
+
+`d6de106` で「カードが出ない」は解消した（§14）。残ったのは**ターンが完了しない**問題で、
+VAD調整の問題として片付けられるものではなかった。
+
+### 15.1 確定した根本原因 —— cancelled を completed として扱っていた
+
+`response.done` ハンドラが **`response.status` を一切見ていなかった。**
+
+```js
+case 'response.done': {
+  const calls = selectExecutableCalls(event.response?.output, handled);
+  for (const call of calls) { await runTool(...); }   // status を見ていない
+}
+```
+
+`interrupt_response: true` のため、ユーザーが話し始めると進行中Responseは
+**cancelled** になる。cancelled なResponseも**生成済みの output（function_call を含む）を
+保持している**ので、イベント名だけを見ると正常終了と区別がつかない。結果:
+
+1. cancelled なResponseの function call を**実行してしまう**
+2. サーバーが既に破棄した call_id に対して `function_call_output` を送る
+3. **これは拒否される** → モデルは tool 出力を永久に待つ
+4. ユーザーからは「受理されたのに応答しない」に見える
+
+ledger（`ai_tool_calls`）にこの痕跡が残っている。2026-08-11 15:15 台で
+`search_meal_candidates` が 3件（15:15:04 / 15:15:07 / 15:15:09）、
+`create_recipe` が 3件（15:15:19 / 15:15:49 / 15:15:58）—— **同じ意図の再呼び出し**が
+40秒間に繰り返されており、出力が届かずモデルがやり直していた形跡と整合する。
+
+### 15.2 併存していた欠陥（いずれもコード上で確認）
+
+| # | 欠陥 | 帰結 |
+|---|---|---|
+| 1 | `response.status` 未確認 | **上記。cancelled の function call を実行** |
+| 2 | `send()` が channel 未openで**黙って捨てる** | `function_call_output` が消失し、無言で停止 |
+| 3 | tool後の `response.create` に**活性Response判定が無い** | `create_response: true` の自動生成と衝突。並行Responseは拒否され、**応答ゼロ**になる |
+| 4 | **タイムアウトが存在しない** | 応答が来なくてもUIは「音声で操作中」のまま |
+| 5 | `error` イベントで**状態を戻さない** | notice を出すだけ。`activeTool` も残る |
+| 6 | ターン状態が個別booleanに散在 | 「未解決」という状態自体が**表現できない** |
+
+「もしもし？」で調理工程が出るのは 1〜4 の結果である。ターンが未解決のまま放置され、
+次の発話が新規要求として扱われ、プロンプト内で唯一内容の濃い
+**進行中の調理セッションへ誤ルーティング**されていた。
+ledger にも 15:19:29 に `start_cooking_session` が実在し、
+セッションが実際に動いていたことが裏付けられる。
+
+### 15.3 修正
+
+**ターン状態機械**（`src/lib/voice/turn-state.ts`・純粋・テスト済み）
+
+`listening / committing / waiting_for_response / responding / running_tool /
+continuing_after_tool / completed / recoverable_error / unresolved`
+
+不変条件を関数として強制:
+
+| 不変条件 | 実装 |
+|---|---|
+| 初回Responseは1ターン最大1回 | `responsesCreated` |
+| `function_call_output` は call_id ごと最大1回 | `canSendToolOutput()` |
+| tool後の継続 `response.create` は最大1回 | `canRequestContinuation()` |
+| 活性Response中は `response.create` を送らない | 同上（`activeResponseId` を見る） |
+| `completed` 以外を正常終了にしない | `reduceTurn` の `response_done` |
+| 結果不明時に勝手に進めない | `unresolved` + 手動 retry のみ |
+| カードは音声失敗でも消さない | `cardShown` を保持 |
+
+**タイムアウト（実測に基づく）**
+
+QA ledger の**同一ターン内の tool 往復は 1〜10秒**（最大10秒）。既存の tool fetch
+タイムアウトは30秒。その間に置いた:
+
+- `noResponseMs: 12_000` —— commit後にResponseが始まらない
+- `noContinuationMs: 20_000` —— tool出力後に応答が終わらない
+
+**無反応を黙って待たない**（`VoicePanel`）
+「応答を受け取れませんでした。」等を日本語で表示し、
+**「もう一度応答を試す」**と**「音声を終了してテキストで続ける」**を出す。
+retry は**新しい user item を追加せず**、commit済みターンに対して
+`response.create` のみを再送する。状態不明時は自動再試行しない。
+
+**疎通確認のルーティング**（`src/lib/voice/liveness.ts`・純粋・テスト済み）
+プロンプト依存にしない。未解決ターンがあれば**そのターンの状態**を返し、
+無ければ中立応答（「聞こえています。どの話を続けますか？」）。
+どちらも**調理工程の案内を明示的に禁止**する instructions を付けて `response.create` する。
+⚠️ **「お願いします」は疎通確認に含めない**（通常の依頼に使われるため。テストで固定）。
+
+**イベントトレース**（`src/lib/voice/event-log.ts`）
+STEP 1 の計測を継続可能にするため、**イベント名・時刻・ID・tool名・status・所要時間だけ**を
+記録する。許可フィールドは allowlist で、**それ以外は捨てる**（テストで固定）。
+音声・transcript・tool引数/結果・認証情報・在庫/レシピは記録しない。
+
+### 15.4 VAD は変更していない
+
+**根拠が無いため変更しなかった。**
+
+- mint し直して実効設定を再確認: `semantic_vad / eagerness: low /
+  create_response: true / interrupt_response: true`（送った通りに解決される）
+- **発話途中でcommitされた証拠は取得できていない。** 実機のイベント列が必要で、
+  それを取るための計測が §15.3 のトレースである
+- 15.1〜15.2 の欠陥は**VADと独立に**ターンを壊す。特に `interrupt_response` による
+  cancelled の誤処理は、**VADが正しく動くほど頻繁に起きる**
+
+したがって「間で切れる」という体感の一部は 15.1 の帰結である可能性が高く、
+**ターン管理修正後に再評価する**。それでも途中commitが残る場合の候補（未実装）:
+
+1. 接続を保ったまま使える「話し終わった」ボタン（連続会話を壊さない）
+2. 自動判定／タップ送信の選択
+3. `eagerness` を上げる、または `server_vad` + 延長した `silence_duration_ms`
+
+**大きなUX変更は無断で入れない。** 再QAの結果を見てから判断する。
+
+### 15.5 テスト
+
+**665件**（608 → +57）。
+
+| ファイル | 件数 | 内容 |
+|---|---|---|
+| `turn-state.test.ts` | 30 | 通常ターン / tool継続 / 二重イベント / failed・cancelled・incomplete / 各タイムアウト / カード保持 / 復帰 |
+| `liveness.test.ts` | 21 | 未解決時の疎通確認 / 中立応答 / 明示的な調理要求 / 「お願いします」を誤判定しない |
+| `event-log.test.ts` | 12 | 記録内容 / **禁止フィールドの遮断** / 上限 |
+
+既存のテキスト経路・カード経路の回帰テストはすべて維持（`npm test` 全件PASS）。
+
+### 15.6 再QA手順（未実施）
+
+1. 文章の途中で1〜2秒の間を空けても**途中確定されない**
+2. 音声で買い物候補を依頼 → **読み上げ + カード表示**の両方が起きる
+3. カードは**初期状態で全件未選択**
+4. 提案表示だけでは**買い物リスト3行が変化しない**
+5. 選択した候補**だけ**追加でき、二重タップでも二重登録されない
+6. **応答が来ない場合、無言のままにならず**日本語のメッセージとボタンが出る
+7. 「もう一度応答を試す」で**発話を繰り返さずに**応答が再生成される
+8. 未解決の状態で「もしもし？」→ **調理工程の案内をしない**
+9. 通常時の「もしもし？」→ 中立応答
+10. 「次の工程を教えて」→ **従来どおり調理案内が動く**
+11. 音声終了後、**録音中表示が残らない**
+12. 会話のキャッチボールが続く（複数往復）
