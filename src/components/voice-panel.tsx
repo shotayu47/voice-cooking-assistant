@@ -1,11 +1,18 @@
 'use client';
 
+import { useState, useSyncExternalStore } from 'react';
+
 import { cn } from '@/lib/cn';
+import { isVoiceDebugEnabled } from '@/lib/voice/debug-flag';
 import {
   useRealtimeVoice,
   type ToolEffect,
   type VoiceSuggestions,
 } from '@/lib/voice/use-realtime-voice';
+
+/** The flag is fixed once the page loads, so there is nothing to listen to. */
+const subscribeToNothing = () => () => {};
+const readDebugFlag = () => isVoiceDebugEnabled(window.location.search);
 
 /**
  * Hands-free voice mode for cooking (SPEC §21).
@@ -22,10 +29,21 @@ export function VoicePanel({
   /** Structured candidates from a voice tool call, for the page to draw. */
   onSuggestions?: (payload: VoiceSuggestions) => void;
 }) {
-  const { state, connect, disconnect, retry } = useRealtimeVoice({ onToolEffect, onSuggestions });
+  const { state, connect, disconnect, retry, eventTrace, resetTrace } = useRealtimeVoice({
+    onToolEffect,
+    onSuggestions,
+  });
 
   const live = state.status === 'live';
   const connecting = state.status === 'connecting';
+
+  /*
+   * The query string is browser state, not React state. Reading it through
+   * this is what lets the server render "off" and the client render the real
+   * answer without the two disagreeing — the flag never changes for the life
+   * of the page, so there is nothing to subscribe to.
+   */
+  const debug = useSyncExternalStore(subscribeToNothing, readDebugFlag, () => false);
 
   return (
     <div className="space-y-2">
@@ -112,6 +130,79 @@ export function VoicePanel({
         <p className="text-sm text-danger" role="alert">
           {state.error}
         </p>
+      ) : null}
+
+      {debug ? <VoiceDiagnostics trace={eventTrace} reset={resetTrace} /> : null}
+    </div>
+  );
+}
+
+/**
+ * The redacted trace, on a phone.
+ *
+ * Only rendered under `?voiceDebug=1`. It reads the log and nothing else — no
+ * handler here touches the call — so a diagnostic control cannot be the reason
+ * a cooking session misbehaves.
+ */
+function VoiceDiagnostics({ trace, reset }: { trace: () => string; reset: () => void }) {
+  const [text, setText] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  async function copy() {
+    // Must be called inside the tap: iOS Safari refuses clipboard writes that
+    // are not tied to a user gesture, and awaiting anything first loses it.
+    const contents = trace();
+    setCopied(false);
+
+    try {
+      await navigator.clipboard.writeText(contents);
+      setCopied(true);
+      setText(null);
+    } catch {
+      // Refused — show it instead so it can be selected by hand. Failing to
+      // copy must not mean failing to get the trace off the device.
+      setText(contents);
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-xl border border-dashed border-line px-3 py-2">
+      <p className="text-xs text-faint">音声診断（?voiceDebug=1）</p>
+
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => void copy()}
+          className="min-h-11 flex-1 rounded-lg border border-line px-3 text-sm text-fg active:bg-surface-2"
+        >
+          {copied ? 'コピーしました' : '音声診断をコピー'}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            reset();
+            setText(null);
+            setCopied(false);
+          }}
+          className="min-h-11 rounded-lg border border-line px-3 text-sm text-muted active:bg-surface-2"
+        >
+          リセット
+        </button>
+      </div>
+
+      {text !== null ? (
+        <>
+          <p className="text-xs text-warn">
+            コピーできませんでした。下のテキストを選択してコピーしてください。
+          </p>
+          <textarea
+            readOnly
+            value={text}
+            onFocus={(event) => event.currentTarget.select()}
+            rows={10}
+            className="w-full rounded-lg border border-line bg-surface px-2 py-1 font-mono text-[11px] text-fg"
+          />
+        </>
       ) : null}
     </div>
   );

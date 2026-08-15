@@ -142,6 +142,19 @@ export function useRealtimeVoice(options: {
   const logRef = useRef(createEventLog());
   const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  /**
+   * Trace-only bookkeeping. Neither of these changes what the client does —
+   * they exist so the log can say what the code was *trying* to do, which is
+   * the part that cannot be reconstructed from the events alone.
+   *
+   * The response a cancel was requested for. Currently always 'unspecified',
+   * because `response.cancel` is sent without a target id; recording that is
+   * the point.
+   */
+  const cancelWaitingRef = useRef<string | null>(null);
+  /** Whether a liveness reply has been asked for and not yet seen arrive. */
+  const livenessPendingRef = useRef(false);
+
   const onToolEffectRef = useRef(options.onToolEffect);
   useEffect(() => {
     onToolEffectRef.current = options.onToolEffect;
@@ -208,6 +221,11 @@ export function useRealtimeVoice(options: {
   const connect = useCallback(async () => {
     if (startingRef.current || pcRef.current) return;
     startingRef.current = true;
+    // Marks the boundary without clearing: one buffer can hold the failed
+    // call and the retry that followed it.
+    logRef.current.add('internal', 'session.start');
+    cancelWaitingRef.current = null;
+    livenessPendingRef.current = false;
     setState({ ...INITIAL_STATE, status: 'connecting' });
 
     // iOS Safari only allows audio playback that begins in a user gesture.
@@ -270,7 +288,7 @@ export function useRealtimeVoice(options: {
         void handleEvent(JSON.parse(event.data) as RealtimeEvent);
       };
       channel.onopen = () => {
-        logRef.current.add('channel_open');
+        logRef.current.add('internal', 'channel_open');
         setState((current) => ({ ...current, status: 'live' }));
 
         /*
@@ -282,7 +300,12 @@ export function useRealtimeVoice(options: {
           const failure = overdue(turnRef.current, Date.now());
           if (!failure) return;
 
-          logRef.current.add('overdue', { status: failure });
+          logRef.current.add('internal', 'watchdog.fire', {
+            status: failure,
+            from: turnRef.current.phase,
+            active: turnRef.current.activeResponseId ?? undefined,
+            pendingLiveness: livenessPendingRef.current,
+          });
           turnRef.current = markOverdue(turnRef.current, failure, Date.now());
           const stalled = describeFailure(turnRef.current);
           setState((current) => ({
@@ -353,8 +376,31 @@ export function useRealtimeVoice(options: {
       const after = reduceTurn(before, event);
       turnRef.current = after;
 
-      if (after.phase !== before.phase) {
-        logRef.current.add('turn.phase', { phase: after.phase, status: after.failure ?? undefined });
+      if (after.phase !== before.phase || after.activeResponseId !== before.activeResponseId) {
+        logRef.current.add('internal', 'turn.reduce', {
+          reason: event.type,
+          from: before.phase,
+          to: after.phase,
+          active: after.activeResponseId ?? undefined,
+          status: after.failure ?? undefined,
+          pendingLiveness: livenessPendingRef.current,
+        });
+      }
+
+      /*
+       * Whether the watchdog is watching anything is derived, not stored — so
+       * it is logged by observation rather than by changing how it works. A
+       * far-future `now` makes `overdue` answer "would this phase ever time
+       * out", which is exactly the arm/disarm question.
+       */
+      const armedBefore = overdue(before, Number.MAX_SAFE_INTEGER) !== null;
+      const armedAfter = overdue(after, Number.MAX_SAFE_INTEGER) !== null;
+      if (armedBefore !== armedAfter) {
+        logRef.current.add('internal', armedAfter ? 'watchdog.arm' : 'watchdog.clear', {
+          reason: event.type,
+          from: before.phase,
+          to: after.phase,
+        });
       }
 
       const stalled = describeFailure(after);
@@ -369,35 +415,35 @@ export function useRealtimeVoice(options: {
       switch (event.type) {
         // ---- Turn lifecycle. Recorded for the trace, and for the machine. ----
         case 'input_audio_buffer.speech_started':
-          logRef.current.add('speech_started');
+          logRef.current.add('in', 'input_audio_buffer.speech_started');
           advance({ type: 'speech_started', at: Date.now() });
           break;
 
         case 'input_audio_buffer.speech_stopped':
-          logRef.current.add('speech_stopped');
+          logRef.current.add('in', 'input_audio_buffer.speech_stopped');
           advance({ type: 'speech_stopped', at: Date.now() });
           break;
 
         case 'input_audio_buffer.committed':
-          logRef.current.add('committed', { itemId: event.item_id });
+          logRef.current.add('in', 'input_audio_buffer.committed', { item: event.item_id });
           advance({ type: 'committed', at: Date.now() });
           break;
 
         case 'conversation.item.created':
-          logRef.current.add('item_created', { itemId: event.item?.id, status: event.item?.type });
+          logRef.current.add('in', 'conversation.item.created', { item: event.item?.id, status: event.item?.type });
           break;
 
         case 'response.output_item.added':
-          logRef.current.add('output_item_added', { responseId: event.response?.id });
+          logRef.current.add('in', 'response.output_item.added', { resp: event.response?.id });
           break;
 
         case 'response.function_call_arguments.done':
-          logRef.current.add('function_call_arguments_done', { callId: event.call_id });
+          logRef.current.add('in', 'response.function_call_arguments.done', { call: event.call_id });
           break;
 
         case 'conversation.item.input_audio_transcription.failed':
           // The turn may still be answered, but the model heard nothing useful.
-          logRef.current.add('transcription_failed');
+          logRef.current.add('in', 'transcription.failed');
           setState((current) => ({
             ...current,
             notice: '聞き取れませんでした。もう一度話しかけてください。',
@@ -405,7 +451,7 @@ export function useRealtimeVoice(options: {
           break;
 
         case 'response.output_audio.done':
-          logRef.current.add('output_audio_done', { responseId: event.response?.id });
+          logRef.current.add('in', 'response.output_audio.done', { resp: event.response?.id });
           break;
 
         // Assistant speech transcript (streamed).
@@ -424,7 +470,14 @@ export function useRealtimeVoice(options: {
 
         // A new assistant turn starts a fresh caption.
         case 'response.created':
-          logRef.current.add('response_created', { responseId: event.response?.id });
+          logRef.current.add('in', 'response.created', {
+            resp: event.response?.id,
+            pendingLiveness: livenessPendingRef.current,
+          });
+          // Whatever this response is, a liveness reply is no longer merely
+          // pending — the trace can show whether it was the one asked for.
+          livenessPendingRef.current = false;
+          cancelWaitingRef.current = null;
           advance({
             type: 'response_created',
             at: Date.now(),
@@ -435,7 +488,7 @@ export function useRealtimeVoice(options: {
 
         // What the user said.
         case 'conversation.item.input_audio_transcription.completed':
-          logRef.current.add('transcription_completed');
+          logRef.current.add('in', 'transcription.completed');
           if (event.transcript) {
             const transcript = event.transcript.trim();
             setState((current) => ({ ...current, userTranscript: transcript }));
@@ -446,9 +499,14 @@ export function useRealtimeVoice(options: {
         // End of a model turn. Only a *completed* one may act.
         case 'response.done': {
           const status = event.response?.status ?? 'completed';
-          logRef.current.add('response_done', {
-            responseId: event.response?.id,
+          logRef.current.add('in', 'response.done', {
+            resp: event.response?.id,
             status,
+            // Which response the turn believed it was waiting for. If these
+            // disagree, the turn is being rewritten by an unrelated response.
+            active: turnRef.current.activeResponseId ?? undefined,
+            cancelWaiting: cancelWaitingRef.current ?? undefined,
+            pendingLiveness: livenessPendingRef.current,
           });
 
           advance({
@@ -467,7 +525,7 @@ export function useRealtimeVoice(options: {
              * server has already abandoned, which it rejects, leaving the turn
              * with no answer at all. That is the state the device reached.
              */
-            logRef.current.add('calls_skipped', { status });
+            logRef.current.add('internal', 'calls_skipped', { status, reason: 'response_not_completed' });
             setState((current) => ({ ...current, activeTool: null }));
             break;
           }
@@ -485,7 +543,7 @@ export function useRealtimeVoice(options: {
         case 'error': {
           const code = event.error?.code;
           // Never the message: it can quote the conversation back.
-          logRef.current.add('error', { status: code });
+          logRef.current.add('in', 'error', { code });
           console.error('[voice] realtime error code:', code ?? 'unknown');
           advance({ type: 'api_error', at: Date.now() });
           setState((current) => ({
@@ -500,7 +558,7 @@ export function useRealtimeVoice(options: {
 
     async function runTool(name: string, callId: string, args: string) {
       const startedAt = Date.now();
-      logRef.current.add('tool_start', { tool: name, callId });
+      logRef.current.add('internal', 'tool_start', { tool: name, call: callId });
       setState((current) => ({ ...current, activeTool: name, notice: null }));
       try {
         const response = await fetch('/api/realtime/tool', {
@@ -532,9 +590,9 @@ export function useRealtimeVoice(options: {
               suggestions: null,
             };
 
-        logRef.current.add('tool_done', {
+        logRef.current.add('internal', 'tool_done', {
           tool: name,
-          callId,
+          call: callId,
           status: response.ok ? 'ok' : String(response.status),
           ms: Date.now() - startedAt,
         });
@@ -564,7 +622,7 @@ export function useRealtimeVoice(options: {
       } catch {
         // Timed out or offline. Tell the model so it can say something rather
         // than waiting forever for an output that will never arrive.
-        logRef.current.add('tool_failed', { tool: name, callId, ms: Date.now() - startedAt });
+        logRef.current.add('internal', 'tool_failed', { tool: name, call: callId, ms: Date.now() - startedAt });
         setState((current) => ({ ...current, notice: '操作がタイムアウトしました' }));
         deliverToolOutput(callId, {
           error: 'tool_unreachable',
@@ -586,7 +644,7 @@ export function useRealtimeVoice(options: {
      */
     function deliverToolOutput(callId: string, result: unknown) {
       if (!canSendToolOutput(turnRef.current, callId)) {
-        logRef.current.add('output_suppressed', { callId });
+        logRef.current.add('internal', 'output_suppressed', { call: callId, reason: 'already_sent' });
         return;
       }
 
@@ -602,21 +660,21 @@ export function useRealtimeVoice(options: {
       if (!delivered) {
         // Silently dropping this used to leave the model waiting forever for
         // an output that would never arrive — the turn simply went quiet.
-        logRef.current.add('output_undeliverable', { callId });
+        logRef.current.add('internal', 'output_undeliverable', { call: callId, reason: 'channel_closed' });
         advance({ type: 'channel_lost', at: Date.now() });
         return;
       }
 
-      logRef.current.add('output_sent', { callId });
+      logRef.current.add('internal', 'output_sent', { call: callId });
       advance({ type: 'tool_output_sent', at: Date.now(), callId });
 
       if (!canRequestContinuation(turnRef.current)) {
-        logRef.current.add('continuation_suppressed');
+        logRef.current.add('internal', 'continuation_suppressed', { reason: 'guard' });
         return;
       }
 
       if (send({ type: 'response.create' })) {
-        logRef.current.add('continuation_requested');
+        logRef.current.add('internal', 'continuation_requested');
         advance({ type: 'continuation_requested', at: Date.now() });
       } else {
         advance({ type: 'channel_lost', at: Date.now() });
@@ -640,7 +698,16 @@ export function useRealtimeVoice(options: {
       );
       if (action === 'pass_through') return;
 
-      logRef.current.add('liveness', { status: action });
+      logRef.current.add('internal', 'liveness.decided', {
+        status: action,
+        from: turnRef.current.phase,
+        active: turnRef.current.activeResponseId ?? undefined,
+      });
+
+      // Recorded before the sends so the trace shows the intent even if the
+      // channel refuses them. `response.cancel` carries no target id today.
+      cancelWaitingRef.current = 'unspecified';
+      livenessPendingRef.current = true;
 
       send({ type: 'response.cancel' });
       send({
@@ -650,10 +717,20 @@ export function useRealtimeVoice(options: {
     }
 
     /** Returns whether the payload actually went out. */
-    function send(payload: unknown): boolean {
-      if (channelRef.current?.readyState !== 'open') return false;
-      channelRef.current.send(JSON.stringify(payload));
-      return true;
+    function send(payload: { type: string; [key: string]: unknown }): boolean {
+      const open = channelRef.current?.readyState === 'open';
+      if (open) channelRef.current!.send(JSON.stringify(payload));
+
+      // Only the event type is recorded. The payload can carry a tool result
+      // or the instructions text, and neither belongs in a trace.
+      logRef.current.add('out', payload.type, {
+        sent: open,
+        reason: open ? undefined : 'channel_not_open',
+        active: turnRef.current.activeResponseId ?? undefined,
+        pendingLiveness: livenessPendingRef.current,
+      });
+
+      return open;
     }
   }, [failWith, teardown]);
 
@@ -697,16 +774,26 @@ export function useRealtimeVoice(options: {
       return;
     }
 
-    logRef.current.add('retry_requested');
+    logRef.current.add('internal', 'retry_requested');
     turnRef.current = reduceTurn(turnRef.current, { type: 'retry_requested', at: Date.now() });
     channelRef.current.send(JSON.stringify({ type: 'response.create' }));
     setState((current) => ({ ...current, stalled: null, canRetry: false }));
   }, []);
 
-  /** The redacted trace of this call, for a bug report. Never any content. */
+  /**
+   * The redacted trace, for a bug report. Never any content.
+   *
+   * Deliberately not cleared on disconnect: the interesting traces end with a
+   * call that failed, and clearing on teardown would destroy the evidence at
+   * the exact moment it became worth having. Resetting is an explicit act.
+   */
   const eventTrace = useCallback(() => formatEventLog(logRef.current.entries()), []);
+  const resetTrace = useCallback(() => {
+    logRef.current.clear();
+    logRef.current.add('internal', 'trace.reset');
+  }, []);
 
-  return { state, connect, disconnect, retry, eventTrace };
+  return { state, connect, disconnect, retry, eventTrace, resetTrace };
 }
 
 function describeConnectError(error: unknown): string {
