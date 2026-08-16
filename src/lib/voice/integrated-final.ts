@@ -42,8 +42,55 @@ export function carriesIntegratedSuggestions(tool: string, result: unknown): boo
   if (!SUGGESTION_CARRYING_TOOLS.has(tool)) return false;
   if (!result || typeof result !== 'object') return false;
 
-  return (result as { shopping_suggestions_included?: unknown }).shopping_suggestions_included
+  return (result as { shopping_suggestions_handled?: unknown }).shopping_suggestions_handled
     === true;
+}
+
+/**
+ * The answer to "save this recipe" when the identical recipe was already saved
+ * this turn and only the candidate mode has changed.
+ *
+ * The row is not written again — the point of the whole path — so what the
+ * model gets back is the result of the first save, with the candidates it is
+ * now asking for read fresh against the recipe that already exists. The
+ * candidates half is replaced rather than merged: an older list computed under
+ * a different mode is not an answer to this request.
+ */
+export function reusedRecipeOutput(
+  previousResult: unknown,
+  suggestions: readonly unknown[] | null,
+): unknown {
+  const base =
+    previousResult && typeof previousResult === 'object'
+      ? { ...(previousResult as Record<string, unknown>) }
+      : {};
+
+  return {
+    ...base,
+    shopping_suggestions_handled: true,
+    // `null` is the read having failed, which is not the same answer as an
+    // empty list — and neither is a reason to save the recipe again.
+    shopping_suggestions:
+      suggestions === null
+        ? {
+            status: 'failed',
+            message:
+              'レシピは保存済みですが、買い物候補を取得できませんでした。レシピがあることを伝え、候補が必要ならもう一度尋ねるよう案内してください。',
+            retry_hint:
+              'このターンでレシピを作り直さないでください。候補は次のユーザー発話で suggest_shopping_items を使って取得できます。',
+          }
+        : {
+            status: suggestions.length === 0 ? 'empty' : 'ok',
+            suggestions,
+            added: false,
+            note:
+              suggestions.length === 0
+                ? '不足している材料はありませんでした。買い足すものはありません、と伝えてください。'
+                : 'まだ何も追加していません。画面のカードでユーザーが選んだものだけが買い物リストに入ります。「追加しました」と言わないでください。',
+          },
+    repeated: true,
+    note: 'このレシピは同じ内容ですでに保存済みです。作り直していないので、同じ recipe_id を使ってください。買い物候補だけを取得しました。',
+  };
 }
 
 /**

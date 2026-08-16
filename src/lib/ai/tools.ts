@@ -27,6 +27,12 @@ import {
   type SuggestionRecipe,
 } from '@/lib/shopping/suggest';
 import {
+  includesStaples,
+  statusForCount,
+  SUGGESTION_MODES,
+  suggestionModeOf,
+} from '@/lib/shopping/suggestion-mode';
+import {
   getCurrentStep,
   getOpenSession,
   getSession,
@@ -294,20 +300,21 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
       name: 'create_recipe',
       description:
         `レシピを保存する。steps は必ず1工程1動作に分割すること。返り値の recipe_id を start_cooking_session に渡す。
-同じ発話で買い物候補も求められている場合は include_shopping_suggestions を true にすること。
+同じ発話で買い物候補も求められている場合は shopping_suggestions_mode で指定すること。
 そうすれば候補はこの結果に同梱されて返るので、続けて suggest_shopping_items を呼ぶ必要はない。`,
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string' },
-          include_shopping_suggestions: {
-            type: 'boolean',
+          shopping_suggestions_mode: {
+            type: 'string',
+            enum: [...SUGGESTION_MODES],
             description:
               `このレシピの不足材料から買い物候補も同時に出すかどうか。
-true … 「レシピを作って、足りないものも教えて」のように、レシピと買い物候補の両方を求められた場合。
-false … レシピを作るだけの場合。
-既存レシピの候補だけを求められた場合は、このツールではなく suggest_shopping_items を使うこと。
-調味料も候補に含めたい場合も suggest_shopping_items（include_staples）を使う。`,
+none … レシピを作るだけの場合。
+missing_only … 「レシピを作って、足りないものも教えて」。不足している食材だけを候補にする。
+include_staples … 「調味料も含めて買い物候補を出して」。調味料・常備品も候補に含める。
+既存レシピの候補だけを求められた場合は、このツールではなく suggest_shopping_items を使うこと。`,
           },
           description: { type: ['string', 'null'] },
           servings: { type: 'integer' },
@@ -366,7 +373,7 @@ false … レシピを作るだけの場合。
           'difficulty',
           'ingredients',
           'steps',
-          'include_shopping_suggestions',
+          'shopping_suggestions_mode',
         ],
         additionalProperties: false,
       },
@@ -386,7 +393,7 @@ false … レシピを作るだけの場合。
 このツールを使うこと。口頭で「変更しました」と言うだけでは、実際には何も変わらない。
 source_recipe_id に元の recipe_id を渡し、**変更後の完全なレシピ**を create_recipe と同じ形で渡すこと。
 差分ではなく全体を渡す。返り値の recipe_id が新しい版で、以後はこちらを使う。
-買い物候補も求められている場合は include_shopping_suggestions を true にすること。
+買い物候補も求められている場合は shopping_suggestions_mode で指定すること。
 候補は新しい recipe_id で計算されてこの結果に同梱されるので、続けて suggest_shopping_items を呼ぶ必要はない。`,
       parameters: {
         type: 'object',
@@ -395,12 +402,14 @@ source_recipe_id に元の recipe_id を渡し、**変更後の完全なレシ�
             type: 'string',
             description: '変更元の recipe_id。この行は更新も削除もされない。',
           },
-          include_shopping_suggestions: {
-            type: 'boolean',
+          shopping_suggestions_mode: {
+            type: 'string',
+            enum: [...SUGGESTION_MODES],
             description:
               `変更後のレシピの不足材料から買い物候補も同時に出すかどうか。
-true … 「顆粒だしをやめて、足りないものも教えて」のように、変更と買い物候補の両方を求められた場合。
-false … レシピを変えるだけの場合。
+none … レシピを変えるだけの場合。
+missing_only … 「顆粒だしをやめて、足りないものも教えて」。不足している食材だけを候補にする。
+include_staples … 調味料・常備品も候補に含める。
 候補は必ず**新しい版**の材料から計算される。変更前の recipe_id で候補を出し直す必要はない。
 レシピを変えずに候補だけを求められた場合は、このツールではなく suggest_shopping_items を使うこと。`,
           },
@@ -463,7 +472,7 @@ false … レシピを変えるだけの場合。
           'difficulty',
           'ingredients',
           'steps',
-          'include_shopping_suggestions',
+          'shopping_suggestions_mode',
         ],
         additionalProperties: false,
       },
@@ -1364,30 +1373,28 @@ async function withRecipeSuggestions(
   recipe: StoredRecipe,
   base: Record<string, unknown>,
 ): Promise<ToolOutcome> {
-  if (args.include_shopping_suggestions !== true) return { result: base };
+  const mode = suggestionModeOf(args);
+  if (mode === 'none') return { result: base };
 
   try {
     const suggestions = await computeShoppingSuggestions(
       ctx,
       [{ id: recipe.id, title: recipe.title, ingredients: recipe.ingredients }],
-      // Staples stay out, as they do by default everywhere else. Asking for
-      // them is what `suggest_shopping_items` with `include_staples` is for.
-      { includeStaples: false },
+      { includeStaples: includesStaples(mode) },
     );
 
     return {
       result: {
         ...base,
-        shopping_suggestions_included: true,
-        shopping_suggestions: {
-          status: 'ok',
+        ...handledSuggestions({
+          status: statusForCount(suggestions.length),
           suggestions: publicSuggestions(suggestions),
           added: false,
           note:
             suggestions.length === 0
               ? '不足している材料はありませんでした。買い足すものはありません、と伝えてください。'
               : SUGGESTIONS_ADD_NOTHING_NOTE,
-        },
+        }),
       },
       suggestions,
     };
@@ -1399,17 +1406,33 @@ async function withRecipeSuggestions(
     return {
       result: {
         ...base,
-        shopping_suggestions_included: true,
-        shopping_suggestions: {
+        ...handledSuggestions({
           status: 'failed',
           message:
             'レシピは保存できましたが、買い物候補を取得できませんでした。レシピが保存できたことを伝え、候補が必要ならもう一度尋ねるよう案内してください。',
           retry_hint:
             'このターンでレシピを作り直さないでください。候補は次のユーザー発話で suggest_shopping_items を使って取得できます。',
-        },
+        }),
       },
     };
   }
+}
+
+/**
+ * The candidates half of a recipe result, kept in its own object.
+ *
+ * `status: 'failed'` sits under `shopping_suggestions`, never at the top
+ * level, because the two halves succeed and fail independently: the recipe is
+ * already written by the time any of this runs. A status the model could read
+ * as belonging to the whole result is the one that gets the recipe saved twice.
+ *
+ * `handled` says the call asked for candidates and they were dealt with —
+ * true for an empty list and a failure alike, since neither leaves anything
+ * for a follow-up tool to do. It is what the client reads to decide that the
+ * next response is the closing one.
+ */
+function handledSuggestions(suggestions: Record<string, unknown>) {
+  return { shopping_suggestions_handled: true, shopping_suggestions: suggestions };
 }
 
 /**

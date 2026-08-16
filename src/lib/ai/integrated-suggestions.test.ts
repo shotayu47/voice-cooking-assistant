@@ -98,7 +98,7 @@ function recipeArgs(overrides: Record<string, unknown> = {}) {
         safety_note: null,
       },
     ],
-    include_shopping_suggestions: true,
+    shopping_suggestions_mode: 'missing_only',
     ...overrides,
   };
 }
@@ -112,7 +112,7 @@ const revise = (ctx: ServiceContext, args: Record<string, unknown>) =>
 type IntegratedResult = {
   recipe_id?: string;
   supersedes_recipe_id?: string;
-  shopping_suggestions_included?: boolean;
+  shopping_suggestions_handled?: boolean;
   shopping_suggestions?: {
     status: string;
     suggestions?: { name: string; already_on_list: boolean; for_dishes: string[] }[];
@@ -125,7 +125,7 @@ type IntegratedResult = {
 
 const integrated = (result: unknown) => result as IntegratedResult;
 
-describe('create_recipe with include_shopping_suggestions', () => {
+describe('create_recipe with shopping_suggestions_mode', () => {
   it('saves one recipe and returns its candidates in the same result', async () => {
     const { ctx, tables } = setup({ inventory_items: [seedInventoryItem('じゃが芋')] });
 
@@ -172,11 +172,11 @@ describe('create_recipe with include_shopping_suggestions', () => {
   });
 });
 
-describe('create_recipe without include_shopping_suggestions', () => {
+describe('create_recipe with shopping_suggestions_mode none', () => {
   it('saves the recipe and returns no candidates at all', async () => {
     const { ctx, tables } = setup();
 
-    const outcome = await create(ctx, recipeArgs({ include_shopping_suggestions: false }));
+    const outcome = await create(ctx, recipeArgs({ shopping_suggestions_mode: 'none' }));
     const result = integrated(outcome.result);
 
     expect(tables.recipes).toHaveLength(1);
@@ -184,23 +184,23 @@ describe('create_recipe without include_shopping_suggestions', () => {
     expect(result.shopping_suggestions).toBeUndefined();
     // No marker: the client keeps the ordinary continuation, which is what
     // leaves the model free to reach for another tool.
-    expect(result.shopping_suggestions_included).toBeUndefined();
+    expect(result.shopping_suggestions_handled).toBeUndefined();
     expect(outcome.suggestions).toBeUndefined();
   });
 
-  it('treats a missing flag the same as false', async () => {
+  it('treats a missing or unreadable mode as none', async () => {
     const { ctx } = setup();
     const args = recipeArgs();
-    delete (args as Record<string, unknown>).include_shopping_suggestions;
+    delete (args as Record<string, unknown>).shopping_suggestions_mode;
 
     const outcome = await create(ctx, args);
 
-    expect(integrated(outcome.result).shopping_suggestions_included).toBeUndefined();
+    expect(integrated(outcome.result).shopping_suggestions_handled).toBeUndefined();
     expect(outcome.suggestions).toBeUndefined();
   });
 });
 
-describe('revise_recipe with include_shopping_suggestions', () => {
+describe('revise_recipe with shopping_suggestions_mode', () => {
   const revisionArgs = recipeArgs({
     source_recipe_id: SOURCE_RECIPE_ID,
     title: 'シンプルな卵と玉ねぎの味噌汁（昆布とかつお節でだしを取る）',
@@ -276,7 +276,7 @@ describe('revise_recipe with include_shopping_suggestions', () => {
 
     expect(tables.recipes).toHaveLength(0);
     expect((outcome.result as { error?: string }).error).toBeDefined();
-    expect(integrated(outcome.result).shopping_suggestions_included).toBeUndefined();
+    expect(integrated(outcome.result).shopping_suggestions_handled).toBeUndefined();
   });
 });
 
@@ -290,13 +290,15 @@ describe('no candidates is not a failure', () => {
     const result = integrated(outcome.result);
 
     expect(tables.recipes).toHaveLength(1);
-    expect(result.shopping_suggestions?.status).toBe('ok');
+    // `empty` rather than `ok`: nothing to buy is its own answer, and it is
+    // the one the model is told to say out loud.
+    expect(result.shopping_suggestions?.status).toBe('empty');
     expect(result.shopping_suggestions?.suggestions).toEqual([]);
     // Empty, not absent: the client draws a card only for a non-empty list, so
     // this is what "no card" looks like on the wire.
     expect(outcome.suggestions).toEqual([]);
     // The reply still has to happen — the marker is what asks for it.
-    expect(result.shopping_suggestions_included).toBe(true);
+    expect(result.shopping_suggestions_handled).toBe(true);
   });
 });
 
@@ -356,7 +358,7 @@ describe('a failed suggestion is not a failed recipe', () => {
     // Without the marker the turn would fall back to an ordinary continuation
     // and the model could try `suggest_shopping_items` against a database that
     // is currently unreachable.
-    expect(integrated((await create(ctx, recipeArgs())).result).shopping_suggestions_included)
+    expect(integrated((await create(ctx, recipeArgs())).result).shopping_suggestions_handled)
       .toBe(true);
   });
 });
@@ -406,6 +408,166 @@ describe('the standalone tool is unchanged', () => {
   });
 });
 
+describe('the modes agree with the standalone tool', () => {
+  /** A recipe whose required list mixes an ordinary ingredient with a staple. */
+  const withStaple = {
+    ingredients: [
+      { name: 'じゃが芋', amount: 3, unit: '個', required: true, substitute_options: null },
+      { name: '醤油', amount: 2, unit: '大さじ', required: true, substitute_options: null },
+    ],
+  };
+
+  /** Runs the standalone tool against whatever the folded call just saved. */
+  async function standaloneFor(ctx: ServiceContext, recipeId: string, includeStaples: boolean) {
+    const outcome = await executeTool(
+      ctx,
+      'suggest_shopping_items',
+      JSON.stringify({ recipe_ids: [recipeId], include_staples: includeStaples }),
+    );
+    return (outcome.result as { suggestions: { name: string }[] }).suggestions.map((e) => e.name);
+  }
+
+  it('missing_only matches include_staples: false', async () => {
+    const { ctx } = setup();
+
+    const outcome = await create(
+      ctx,
+      recipeArgs({ ...withStaple, shopping_suggestions_mode: 'missing_only' }),
+    );
+    const folded = integrated(outcome.result).shopping_suggestions?.suggestions?.map((e) => e.name);
+
+    expect(folded).toEqual(await standaloneFor(ctx, integrated(outcome.result).recipe_id!, false));
+    expect(folded).toEqual(['じゃが芋']);
+  });
+
+  it('include_staples matches include_staples: true', async () => {
+    const { ctx } = setup();
+
+    const outcome = await create(
+      ctx,
+      recipeArgs({ ...withStaple, shopping_suggestions_mode: 'include_staples' }),
+    );
+    const folded = integrated(outcome.result).shopping_suggestions?.suggestions?.map((e) => e.name);
+
+    expect(folded).toEqual(await standaloneFor(ctx, integrated(outcome.result).recipe_id!, true));
+    expect(folded).toContain('醤油');
+  });
+
+  it('is the difference between the two modes, and only that', async () => {
+    const { ctx } = setup();
+
+    const missing = await create(
+      ctx,
+      recipeArgs({ ...withStaple, shopping_suggestions_mode: 'missing_only' }),
+    );
+    const staples = await create(
+      ctx,
+      recipeArgs({ ...withStaple, title: '肉じゃが2', shopping_suggestions_mode: 'include_staples' }),
+    );
+
+    expect(missing.suggestions?.map((e) => e.name)).not.toContain('醤油');
+    expect(staples.suggestions?.map((e) => e.name)).toContain('醤油');
+  });
+});
+
+describe('asking again for a different mode adds no row', () => {
+  /**
+   * The other half of the client's repeat guard.
+   *
+   * When the same recipe is asked for twice with different candidate modes,
+   * the client does not run the recipe tool again — it reads candidates for
+   * the id the first call produced. This is that read, and what it must leave
+   * alone: the recipe table, the shopping list, and the inventory.
+   */
+  async function reuseRead(ctx: ServiceContext, recipeId: string, includeStaples: boolean) {
+    return executeTool(
+      ctx,
+      'suggest_shopping_items',
+      JSON.stringify({ recipe_ids: [recipeId], include_staples: includeStaples }),
+    );
+  }
+
+  it('goes none → missing_only on one recipe row', async () => {
+    const { ctx, tables } = setup();
+
+    const created = await create(ctx, recipeArgs({ shopping_suggestions_mode: 'none' }));
+    const recipeId = integrated(created.result).recipe_id!;
+    expect(tables.recipes).toHaveLength(1);
+
+    const reread = await reuseRead(ctx, recipeId, false);
+
+    // Still one recipe, and the candidates are for the recipe that exists.
+    expect(tables.recipes).toHaveLength(1);
+    expect(tables.recipes[0].id).toBe(recipeId);
+    expect(reread.suggestions?.length).toBeGreaterThan(0);
+    expect(
+      reread.suggestions?.every((entry) =>
+        entry.sourceRecipes.every((source) => source.recipeId === recipeId),
+      ),
+    ).toBe(true);
+  });
+
+  it('goes missing_only → include_staples on one recipe row', async () => {
+    const { ctx, tables } = setup();
+
+    const created = await create(
+      ctx,
+      recipeArgs({
+        shopping_suggestions_mode: 'missing_only',
+        ingredients: [
+          { name: 'じゃが芋', amount: 3, unit: '個', required: true, substitute_options: null },
+          { name: '醤油', amount: 2, unit: '大さじ', required: true, substitute_options: null },
+        ],
+      }),
+    );
+    const recipeId = integrated(created.result).recipe_id!;
+
+    expect(created.suggestions?.map((entry) => entry.name)).not.toContain('醤油');
+
+    const reread = await reuseRead(ctx, recipeId, true);
+
+    expect(tables.recipes).toHaveLength(1);
+    expect(reread.suggestions?.map((entry) => entry.name)).toContain('醤油');
+  });
+
+  it('leaves a revision at one new row with the original untouched', async () => {
+    const { ctx, tables } = setup({ recipes: [seedSourceRecipe()] });
+    const originalBefore = JSON.stringify(tables.recipes[0]);
+
+    const revised = await revise(
+      ctx,
+      recipeArgs({
+        source_recipe_id: SOURCE_RECIPE_ID,
+        title: '味噌汁（だしから）',
+        shopping_suggestions_mode: 'none',
+      }),
+    );
+    const newId = integrated(revised.result).recipe_id!;
+    expect(tables.recipes).toHaveLength(2);
+
+    await reuseRead(ctx, newId, false);
+
+    // No third row, and the version being replaced is byte-for-byte as it was.
+    expect(tables.recipes).toHaveLength(2);
+    expect(JSON.stringify(tables.recipes.find((row) => row.id === SOURCE_RECIPE_ID))).toBe(
+      originalBefore,
+    );
+  });
+
+  it('writes nothing anywhere on the re-read', async () => {
+    const { ctx, tables } = setup({ inventory_items: [seedInventoryItem('じゃが芋')] });
+
+    const created = await create(ctx, recipeArgs({ shopping_suggestions_mode: 'none' }));
+    const shoppingBefore = JSON.stringify(tables.shopping_items);
+    const inventoryBefore = JSON.stringify(tables.inventory_items);
+
+    await reuseRead(ctx, integrated(created.result).recipe_id!, true);
+
+    expect(JSON.stringify(tables.shopping_items)).toBe(shoppingBefore);
+    expect(JSON.stringify(tables.inventory_items)).toBe(inventoryBefore);
+  });
+});
+
 describe('the schema makes the model decide', () => {
   function schemaOf(name: string) {
     const tool = TOOL_DEFINITIONS.find(
@@ -413,7 +575,7 @@ describe('the schema makes the model decide', () => {
     );
     if (!tool || tool.type !== 'function') throw new Error(`${name} is not defined`);
     return tool.function.parameters as {
-      properties: Record<string, { type: string; description?: string }>;
+      properties: Record<string, { type: string; enum?: string[]; description?: string }>;
       required: string[];
     };
   }
@@ -424,15 +586,21 @@ describe('the schema makes the model decide', () => {
     // Required, not optional: whether the user asked for candidates is a
     // judgement about the request, and leaving it out would make silence the
     // answer. The app deliberately does not classify the utterance itself.
-    expect(schema.required).toContain('include_shopping_suggestions');
-    expect(schema.properties.include_shopping_suggestions.type).toBe('boolean');
+    expect(schema.required).toContain('shopping_suggestions_mode');
+    expect(schema.properties.shopping_suggestions_mode.type).toBe('string');
+    expect(schema.properties.shopping_suggestions_mode.enum).toEqual([
+      'none',
+      'missing_only',
+      'include_staples',
+    ]);
   });
 
   it.each(['create_recipe', 'revise_recipe'])('draws the boundary in the %s schema', (name) => {
-    const description = schemaOf(name).properties.include_shopping_suggestions.description ?? '';
+    const description = schemaOf(name).properties.shopping_suggestions_mode.description ?? '';
 
-    expect(description).toContain('true');
-    expect(description).toContain('false');
+    expect(description).toContain('none');
+    expect(description).toContain('missing_only');
+    expect(description).toContain('include_staples');
     expect(description).toContain('suggest_shopping_items');
   });
 
@@ -458,7 +626,7 @@ describe('the prompt draws the boundary between the two routes', () => {
   });
 
   it('sends a combined request through the flag', () => {
-    expect(prompt).toContain('include_shopping_suggestions');
+    expect(prompt).toContain('shopping_suggestions_mode');
     expect(prompt).toContain('そのあとに suggest_shopping_items を');
   });
 

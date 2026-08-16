@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { argumentSignature } from './arg-signature';
-import { decideRepeat, repeatKey, replayedOutput, REPEAT_SENSITIVE_TOOLS } from './tool-repeat';
+import { decideRepeat, replayedOutput, REPEAT_SENSITIVE_TOOLS } from './tool-repeat';
 import {
   canForceFinal,
   canRequestContinuation,
@@ -157,30 +157,36 @@ describe('the budget is finite', () => {
 describe('the same call is not made twice', () => {
   const args = '{"title":"肉じゃが","servings":2}';
   const signature = argumentSignature(args)!;
-  const ran = new Set([repeatKey('create_recipe', signature)]);
+  const both = { write: signature, request: signature };
+  /** What the first call left behind, as the client stores it. */
+  const prior = { requestSignature: signature, recipeId: 'r1' };
 
   it('replays instead of creating a second recipe', () => {
-    expect(decideRepeat('create_recipe', signature, ran)).toBe('replay');
+    expect(decideRepeat('create_recipe', both, prior)).toBe('replay');
   });
 
   it('ignores that the call id is different', () => {
     // The model issues a fresh id every time; identity is the tool and the
     // arguments, not the id.
-    expect(decideRepeat('create_recipe', signature, ran)).toBe('replay');
+    expect(decideRepeat('create_recipe', both, prior)).toBe('replay');
   });
 
   it('runs a genuinely different request', () => {
+    // A different recipe hashes to a different write, so the caller finds
+    // nothing stored under it.
     const other = argumentSignature('{"title":"肉じゃが","servings":4}')!;
 
     expect(other).not.toBe(signature);
-    expect(decideRepeat('create_recipe', other, ran)).toBe('execute');
+    expect(decideRepeat('create_recipe', { write: other, request: other }, undefined)).toBe(
+      'execute',
+    );
   });
 
   it('does not suppress read-only tools', () => {
     // Asking the same question twice is wasteful, not harmful, and the budget
     // already bounds it.
-    expect(decideRepeat('suggest_shopping_items', signature, ran)).toBe('execute');
-    expect(decideRepeat('search_meal_candidates', signature, ran)).toBe('execute');
+    expect(decideRepeat('suggest_shopping_items', both, prior)).toBe('execute');
+    expect(decideRepeat('search_meal_candidates', both, prior)).toBe('execute');
   });
 
   it('covers the creating tools', () => {
@@ -197,7 +203,7 @@ describe('the same call is not made twice', () => {
     // the tool rejected with invalid_arguments. Two payloads that could not be
     // compared are not known to be the same call, so the corrected retry runs.
     expect(argumentSignature('{"title":')).toBeNull();
-    expect(decideRepeat('create_recipe', null, ran)).toBe('execute');
+    expect(decideRepeat('create_recipe', { write: null, request: null }, prior)).toBe('execute');
   });
 
   it('still hands the model an output, so it does not wait forever', () => {

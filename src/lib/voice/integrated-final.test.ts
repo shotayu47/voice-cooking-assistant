@@ -8,12 +8,14 @@ import {
 import { initialCardState } from '@/lib/shopping/suggestion-card-state';
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
+import { argumentSignature, writeSignature } from './arg-signature';
 import {
   carriesIntegratedSuggestions,
   continuationAfterTool,
   INTEGRATED_FINAL_INSTRUCTIONS,
+  reusedRecipeOutput,
 } from './integrated-final';
-import { replayedOutput } from './tool-repeat';
+import { decideRepeat, replayedOutput } from './tool-repeat';
 import {
   canRequestContinuation,
   INITIAL_TURN,
@@ -46,7 +48,7 @@ function integratedResult(overrides: Record<string, unknown> = {}) {
     recipe_id: RECIPE_ID,
     title: '肉じゃが',
     total_steps: 4,
-    shopping_suggestions_included: true,
+    shopping_suggestions_handled: true,
     shopping_suggestions: { status: 'ok', suggestions: [{ name: '玉ねぎ' }], added: false },
     ...overrides,
   };
@@ -93,11 +95,11 @@ describe('recognising a result that already carries its candidates', () => {
     for (const result of [
       null,
       undefined,
-      'shopping_suggestions_included',
+      'shopping_suggestions_handled',
       42,
       {},
-      { shopping_suggestions_included: false },
-      { shopping_suggestions_included: 'true' },
+      { shopping_suggestions_handled: false },
+      { shopping_suggestions_handled: 'true' },
       { error: 'invalid_arguments' },
     ]) {
       expect(carriesIntegratedSuggestions('create_recipe', result)).toBe(false);
@@ -173,6 +175,148 @@ describe('the reply that follows the tool output', () => {
 
     expect(carriesIntegratedSuggestions('create_recipe', replayed)).toBe(true);
     expect(continuationAfterTool('create_recipe', replayed).purpose).toBe('integrated_final');
+  });
+
+  it.each(['ok', 'empty', 'failed'])('closes the turn on status %s', (status) => {
+    const result = integratedResult({ shopping_suggestions: { status } });
+
+    const { payload, purpose } = continuationAfterTool('create_recipe', result);
+
+    expect(purpose).toBe('integrated_final');
+    expect(payload.response?.tool_choice).toBe('none');
+  });
+});
+
+describe('the same recipe asked for again under a different mode', () => {
+  const created = '{"title":"肉じゃが","servings":2,"shopping_suggestions_mode":"none"}';
+  const withCandidates = '{"title":"肉じゃが","servings":2,"shopping_suggestions_mode":"missing_only"}';
+  const withStaples =
+    '{"title":"肉じゃが","servings":2,"shopping_suggestions_mode":"include_staples"}';
+  const differentRecipe = '{"title":"肉じゃが","servings":4,"shopping_suggestions_mode":"none"}';
+
+  const sig = (raw: string) => ({
+    write: writeSignature('create_recipe', raw),
+    request: argumentSignature(raw),
+  });
+
+  it('is the same write however the candidates are asked for', () => {
+    // The whole point: three requests, one recipe. Before the split these
+    // hashed apart and the row was inserted once per mode.
+    const write = writeSignature('create_recipe', created);
+
+    expect(writeSignature('create_recipe', withCandidates)).toBe(write);
+    expect(writeSignature('create_recipe', withStaples)).toBe(write);
+    expect(argumentSignature(created)).not.toBe(argumentSignature(withCandidates));
+  });
+
+  it('is still a different write when the recipe itself differs', () => {
+    expect(writeSignature('create_recipe', differentRecipe)).not.toBe(
+      writeSignature('create_recipe', created),
+    );
+  });
+
+  it('reuses the row rather than creating a second one', () => {
+    const prior = { requestSignature: argumentSignature(created), recipeId: 'r1' };
+
+    expect(decideRepeat('create_recipe', sig(withCandidates), prior)).toBe('reuse');
+  });
+
+  it('reuses it again when the mode widens to the staples', () => {
+    const prior = { requestSignature: argumentSignature(withCandidates), recipeId: 'r1' };
+
+    expect(decideRepeat('create_recipe', sig(withStaples), prior)).toBe('reuse');
+  });
+
+  it('replays outright when even the mode is identical', () => {
+    const prior = { requestSignature: argumentSignature(withCandidates), recipeId: 'r1' };
+
+    expect(decideRepeat('create_recipe', sig(withCandidates), prior)).toBe('replay');
+  });
+
+  it('applies to a revision the same way', () => {
+    const revision = (mode: string) =>
+      `{"source_recipe_id":"r0","title":"味噌汁","shopping_suggestions_mode":"${mode}"}`;
+    const prior = { requestSignature: argumentSignature(revision('none')), recipeId: 'r1' };
+
+    expect(writeSignature('revise_recipe', revision('missing_only'))).toBe(
+      writeSignature('revise_recipe', revision('none')),
+    );
+    expect(
+      decideRepeat(
+        'revise_recipe',
+        {
+          write: writeSignature('revise_recipe', revision('missing_only')),
+          request: argumentSignature(revision('missing_only')),
+        },
+        prior,
+      ),
+    ).toBe('reuse');
+  });
+
+  it('creates the recipe when nothing was stored for this write', () => {
+    expect(decideRepeat('create_recipe', sig(withCandidates), undefined)).toBe('execute');
+  });
+
+  it('falls back to a replay when there is no row to read against', () => {
+    // A stored call that produced no recipe id — a failed create, say — has
+    // nothing for the read-only path to point at. Answering from what came
+    // back before is still better than writing again.
+    const prior = { requestSignature: argumentSignature(created), recipeId: null };
+
+    expect(decideRepeat('create_recipe', sig(withCandidates), prior)).toBe('replay');
+  });
+
+  it('leaves tools with no display-only arguments hashing identically', () => {
+    // The split can only ever matter where a request can vary without the
+    // write varying. Everywhere else the two digests must agree, or a repeat
+    // of a genuine write could be mistaken for a mode change.
+    const args = '{"name":"かつお節","quantity":10}';
+
+    expect(writeSignature('add_inventory_item', args)).toBe(argumentSignature(args));
+    expect(writeSignature('start_cooking_session', args)).toBe(argumentSignature(args));
+  });
+});
+
+describe('what the model is told when the row was not written again', () => {
+  const previous = { recipe_id: RECIPE_ID, title: '肉じゃが', total_steps: 4 };
+
+  it('keeps the recipe id and says it was not recreated', () => {
+    const output = reusedRecipeOutput(previous, [{ name: '玉ねぎ' }]) as Record<string, unknown>;
+
+    expect(output.recipe_id).toBe(RECIPE_ID);
+    expect(output.repeated).toBe(true);
+    expect(String(output.note)).toContain('すでに保存済み');
+    expect(String(output.note)).toContain('作り直していない');
+  });
+
+  it('carries the freshly read candidates and closes the turn', () => {
+    const output = reusedRecipeOutput(previous, [{ name: '醤油' }]);
+    const block = (output as { shopping_suggestions: { status: string; suggestions: unknown[] } })
+      .shopping_suggestions;
+
+    expect(block.status).toBe('ok');
+    expect(block.suggestions).toEqual([{ name: '醤油' }]);
+    expect(continuationAfterTool('create_recipe', output).purpose).toBe('integrated_final');
+  });
+
+  it('reports an empty read as empty', () => {
+    const output = reusedRecipeOutput(previous, []);
+    const block = (output as { shopping_suggestions: { status: string } }).shopping_suggestions;
+
+    expect(block.status).toBe('empty');
+  });
+
+  it('reports a failed read as failed, without touching the recipe', () => {
+    const output = reusedRecipeOutput(previous, null) as Record<string, unknown>;
+    const block = output.shopping_suggestions as { status: string; retry_hint: string };
+
+    expect(block.status).toBe('failed');
+    expect(block.retry_hint).toContain('作り直さないでください');
+    // The recipe half is untouched, and there is no top-level error to read as
+    // "the save failed".
+    expect(output.recipe_id).toBe(RECIPE_ID);
+    expect(output.error).toBeUndefined();
+    expect(continuationAfterTool('create_recipe', output).purpose).toBe('integrated_final');
   });
 });
 

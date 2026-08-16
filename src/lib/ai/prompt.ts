@@ -177,11 +177,13 @@ const SHOPPING_SUGGESTION_RULES = `【買い物候補】
   **口頭で「変更しました」と言うだけでは、レシピは変わっていません。**
   元のレシピは残り、新しい recipe_id が返ります。
 - **レシピの作成・変更と買い物候補を同じ発話で求められたら、create_recipe /
-  revise_recipe の include_shopping_suggestions を true にしてください。**
+  revise_recipe の shopping_suggestions_mode で指定してください。**
   候補はその結果に同梱されて返ります。**そのあとに suggest_shopping_items を
   呼び直さないでください。** 同じ候補をもう一度計算することになります。
-- レシピを作る・変えるだけなら include_shopping_suggestions は false です。
-  **すでにあるレシピの候補だけを求められたときは suggest_shopping_items を使ってください。**
+  ・none … レシピを作る・変えるだけ
+  ・missing_only … 不足している食材だけを候補にする
+  ・include_staples … 「調味料も含めて」と言われたとき
+- **すでにあるレシピの候補だけを求められたときは suggest_shopping_items を使ってください。**
   候補のためだけにレシピを作り直さないでください。
 - 同梱した候補が status: 'failed' で返ったときは、**レシピは保存できています。**
   レシピが保存できたことを伝え、候補だけ取得できなかったと説明してください。

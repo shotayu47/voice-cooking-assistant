@@ -31,27 +31,57 @@ export type RepeatDecision =
   /** Run it. */
   | 'execute'
   /** Already ran with these arguments — answer from what it returned before. */
-  | 'replay';
+  | 'replay'
+  /**
+   * The same write, asked for with a different display option. The row exists;
+   * only the read-only half of the request is new.
+   */
+  | 'reuse';
 
 /** Identity of one call: what it does, and what it was asked to do it with. */
 export function repeatKey(tool: string, signature: string): string {
   return `${tool}::${signature}`;
 }
 
+/** What a previous call with the same write signature left behind. */
+export type PriorCall = {
+  /** The digest of the *whole* request, display options included. */
+  requestSignature: string | null;
+  /** The row it created, when it created one. */
+  recipeId: string | null;
+};
+
 /**
- * `signature` is null when the arguments could not be parsed. That case always
+ * Has this write already happened this turn, and if so, is anything new being
+ * asked for?
+ *
+ * Keyed on the write signature, not the whole request. A recipe asked for
+ * twice with different candidate modes is one recipe: hashing the mode into
+ * the identity made the second call look like a different write and inserted
+ * the row again.
+ *
+ * `write` is null when the arguments could not be parsed. That case always
  * executes: two unparseable payloads are not known to be the same call, and
  * refusing to run on a comparison that could not be made would be worse than
  * running twice.
  */
 export function decideRepeat(
   tool: string,
-  signature: string | null,
-  alreadyRun: ReadonlySet<string>,
+  signatures: { write: string | null; request: string | null },
+  prior: PriorCall | undefined,
 ): RepeatDecision {
-  if (signature === null) return 'execute';
+  if (signatures.write === null) return 'execute';
   if (!REPEAT_SENSITIVE_TOOLS.has(tool)) return 'execute';
-  return alreadyRun.has(repeatKey(tool, signature)) ? 'replay' : 'execute';
+  if (!prior) return 'execute';
+
+  // Identical request, down to the display options: the stored result answers
+  // it exactly, candidates included.
+  if (prior.requestSignature === signatures.request) return 'replay';
+
+  // Only the read-only half changed. Without a row to point at there is
+  // nothing to reuse, so fall back to answering from what was returned before
+  // rather than writing again.
+  return prior.recipeId === null ? 'replay' : 'reuse';
 }
 
 /**

@@ -4,7 +4,13 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
-import { argumentSignature, compareSignature } from './arg-signature';
+import {
+  includesStaples,
+  suggestionModeOf,
+  type SuggestionMode,
+} from '@/lib/shopping/suggestion-mode';
+
+import { argumentSignature, compareSignature, writeSignature } from './arg-signature';
 import { classifyErrorMessage, toolOutcomeCode } from './error-classify';
 import {
   afterRateLimit,
@@ -30,7 +36,7 @@ import {
   refusedAdvanceOutput,
   refusedPreviousOutput,
 } from './step-intent';
-import { continuationAfterTool } from './integrated-final';
+import { continuationAfterTool, reusedRecipeOutput } from './integrated-final';
 import { decideRepeat, repeatKey, replayedOutput } from './tool-repeat';
 import {
   canExecuteCall,
@@ -286,9 +292,17 @@ export function useRealtimeVoice(options: {
    * Calls already completed this turn, keyed by tool + argument digest, with
    * what they returned. Digests and results only — no arguments are retained.
    */
-  const ranThisTurnRef = useRef<Set<string>>(new Set());
   const lastResultRef = useRef<
-    Map<string, { result: unknown; suggestions: ShoppingSuggestion[] | null }>
+    Map<
+      string,
+      {
+        result: unknown;
+        suggestions: ShoppingSuggestion[] | null;
+        /** The whole request, display options included, for spotting an exact repeat. */
+        requestSignature: string | null;
+        recipeId: string | null;
+      }
+    >
   >(new Map());
 
   /**
@@ -626,7 +640,6 @@ export function useRealtimeVoice(options: {
           logRef.current.add('in', 'input_audio_buffer.committed', { item: event.item_id });
           // A new request may legitimately ask for the same recipe again, so
           // the repeat memory is scoped to the turn, exactly like the budget.
-          ranThisTurnRef.current.clear();
           lastResultRef.current.clear();
           lastSignatureRef.current.clear();
           // A new turn owns none of the last one's authority: its transcript,
@@ -850,6 +863,16 @@ export function useRealtimeVoice(options: {
       if (signature !== null) lastSignatureRef.current.set(name, signature);
 
       /*
+       * What gets written, separately from what was asked for. The candidate
+       * mode changes neither the recipe nor anything else in the database, so
+       * it is kept out of the identity that decides whether the row already
+       * exists — with it in, the same recipe asked for twice under two modes
+       * was two different calls, and the row was inserted twice.
+       */
+      const writeSig = writeSignature(name, args);
+      const mode = suggestionModeOf(parsedArguments(args));
+
+      /*
        * A repeat of the same call, not merely a repeat of the same id.
        * `create_recipe` ran twice in one QA turn with different ids — the
        * first failed on unparseable arguments and the model tried again —
@@ -921,10 +944,15 @@ export function useRealtimeVoice(options: {
         advancesThisTurnRef.current += 1;
       }
 
-      const repeat = decideRepeat(name, signature, ranThisTurnRef.current);
-      if (repeat === 'replay' && signature !== null) {
-        const key = repeatKey(name, signature);
-        const previous = lastResultRef.current.get(key);
+      const writeKey = writeSig === null ? null : repeatKey(name, writeSig);
+      const previous = writeKey === null ? undefined : lastResultRef.current.get(writeKey);
+      const repeat = decideRepeat(
+        name,
+        { write: writeSig, request: signature },
+        previous && { requestSignature: previous.requestSignature, recipeId: previous.recipeId },
+      );
+
+      if (repeat === 'replay') {
         logRef.current.add('internal', 'tool_repeat_skipped', {
           tool: name,
           call: callId,
@@ -939,17 +967,49 @@ export function useRealtimeVoice(options: {
          * recipe row, which is what a repeat would really have cost, is never
          * written a second time because the tool does not run.
          */
-        if (previous?.suggestions && previous.suggestions.length > 0) {
-          onSuggestionsRef.current?.({
-            callId,
-            suggestions: previous.suggestions,
-            chain: new Map(revisionChainRef.current),
-            revised: revisedThisTurnRef.current,
-          });
-          advance({ type: 'card_shown', at: Date.now() });
+        showCard(callId, previous?.suggestions ?? null);
+        deliverToolOutput(callId, replayedOutput(previous?.result), name);
+        return;
+      }
+
+      /*
+       * Same recipe, different candidate mode — 「やっぱり調味料も」. The row
+       * stays as it is and only the read runs, against the id the first call
+       * produced. `suggest_shopping_items` is that read: already read-only,
+       * already tested, and it cannot write even if this path is wrong.
+       */
+      if (repeat === 'reuse' && previous?.recipeId) {
+        logRef.current.add('internal', 'tool_repeat_reused', {
+          tool: name,
+          call: callId,
+          argsMatch,
+          reason: 'suggestions_only',
+        });
+
+        if (mode === 'none') {
+          // Nothing new is being asked for at all. The stored answer is the
+          // answer, and the card already on screen stays where it is.
+          deliverToolOutput(callId, replayedOutput(previous.result), name);
+          return;
         }
 
-        deliverToolOutput(callId, replayedOutput(previous?.result), name);
+        // A real round trip follows, so the panel says something is happening
+        // — the same as it does for a tool that actually runs.
+        setState((current) => ({ ...current, activeTool: name, notice: null }));
+        const reread = await readSuggestionsFor(previous.recipeId, mode, callId);
+        setState((current) => ({ ...current, activeTool: null }));
+
+        showCard(callId, reread.card);
+
+        if (writeKey !== null) {
+          lastResultRef.current.set(writeKey, {
+            ...previous,
+            requestSignature: signature,
+            suggestions: reread.card,
+          });
+        }
+
+        deliverToolOutput(callId, reusedRecipeOutput(previous.result, reread.forModel), name);
         return;
       }
 
@@ -1031,15 +1091,7 @@ export function useRealtimeVoice(options: {
           }
         }
 
-        if (body.suggestions && body.suggestions.length > 0) {
-          onSuggestionsRef.current?.({
-            callId,
-            suggestions: body.suggestions,
-            chain: new Map(revisionChainRef.current),
-            revised: revisedThisTurnRef.current,
-          });
-          advance({ type: 'card_shown', at: Date.now() });
-        }
+        showCard(callId, body.suggestions ?? null);
 
         if (body.effect) {
           onToolEffectRef.current?.({ effect: body.effect, sessionId: body.session_id });
@@ -1062,15 +1114,21 @@ export function useRealtimeVoice(options: {
             'error' in (body.result as Record<string, unknown>)
           );
 
-        if (succeeded && signature !== null) {
-          const key = repeatKey(name, signature);
-          ranThisTurnRef.current.add(key);
-          // The candidates are stored beside the result, not inside it: the
-          // card is drawn from this structured list, so a replay that kept
-          // only `result` would answer the model and leave the screen behind.
-          lastResultRef.current.set(key, {
+        if (succeeded && writeKey !== null) {
+          /*
+           * Keyed by what was written, and holding what was asked for.
+           *
+           * The candidates sit beside the result rather than inside it — the
+           * card is drawn from this structured list, so a replay that kept
+           * only `result` would answer the model and leave the screen behind.
+           * The recipe id is what a later call with a different candidate mode
+           * reads against instead of writing a second row.
+           */
+          lastResultRef.current.set(writeKey, {
             result: body.result,
             suggestions: body.suggestions ?? null,
+            requestSignature: signature,
+            recipeId: recipeIdOf(body.result),
           });
         }
 
@@ -1091,6 +1149,91 @@ export function useRealtimeVoice(options: {
       } finally {
         setState((current) => ({ ...current, activeTool: null }));
       }
+    }
+
+    /**
+     * Draw the card, if there is anything to draw.
+     *
+     * One place, so every route that produces candidates — a tool that ran, a
+     * replay, a re-read under a new mode — reaches the screen the same way and
+     * lands on the same card through the lineage key.
+     */
+    function showCard(callId: string, suggestions: ShoppingSuggestion[] | null) {
+      if (!suggestions || suggestions.length === 0) return;
+
+      onSuggestionsRef.current?.({
+        callId,
+        suggestions,
+        chain: new Map(revisionChainRef.current),
+        revised: revisedThisTurnRef.current,
+      });
+      advance({ type: 'card_shown', at: Date.now() });
+    }
+
+    /**
+     * Read candidates for a recipe that already exists.
+     *
+     * Goes through `suggest_shopping_items`, which is read-only by
+     * construction — so the path taken when a recipe must *not* be written
+     * again cannot write anything even if it is reached in error. Returns both
+     * shapes the caller needs: the structured list the card renders and the
+     * model-facing rows the server formatted.
+     */
+    async function readSuggestionsFor(
+      recipeId: string,
+      mode: SuggestionMode,
+      callId: string,
+    ): Promise<{ card: ShoppingSuggestion[] | null; forModel: unknown[] | null }> {
+      try {
+        const response = await fetch('/api/realtime/tool', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name: 'suggest_shopping_items',
+            arguments: JSON.stringify({
+              recipe_ids: [recipeId],
+              include_staples: includesStaples(mode),
+            }),
+            call_id: callId,
+          }),
+          signal: AbortSignal.timeout(30_000),
+        });
+
+        if (!response.ok) return { card: null, forModel: null };
+
+        const body = (await response.json()) as {
+          result?: { suggestions?: unknown[] };
+          suggestions?: ShoppingSuggestion[] | null;
+        };
+
+        return { card: body.suggestions ?? null, forModel: body.result?.suggestions ?? null };
+      } catch {
+        // Same treatment as any other unreachable tool: reported as a failed
+        // read, never as a reason to save the recipe again.
+        return { card: null, forModel: null };
+      }
+    }
+
+    /**
+     * The arguments as an object, for reading the candidate mode off them.
+     *
+     * Unparseable payloads are real — one turn's `create_recipe` failed on
+     * exactly that — and produce `null`, which `suggestionModeOf` reads as
+     * "no candidates" rather than guessing.
+     */
+    function parsedArguments(raw: string): unknown {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return null;
+      }
+    }
+
+    /** The row a tool result says it created, when it created one. */
+    function recipeIdOf(result: unknown): string | null {
+      if (!result || typeof result !== 'object') return null;
+      const id = (result as { recipe_id?: unknown }).recipe_id;
+      return typeof id === 'string' && id !== '' ? id : null;
     }
 
     /**

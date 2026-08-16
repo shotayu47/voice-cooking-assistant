@@ -11,6 +11,8 @@
  * FIRST. Past calls cannot be reconstructed from any of it.
  */
 
+import { SUGGESTION_MODE_ARG } from '@/lib/shopping/suggestion-mode';
+
 export type ArgumentComparison = 'FIRST' | 'SAME' | 'DIFFERENT' | 'UNREADABLE';
 
 /**
@@ -46,6 +48,44 @@ function digest(text: string): string {
 export function argumentSignature(rawArguments: string): string | null {
   try {
     return digest(JSON.stringify(canonicalise(JSON.parse(rawArguments))));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Arguments that change what is shown, not what is stored.
+ *
+ * `shopping_suggestions_mode` decides whether candidates are computed and
+ * whether staples count. It reads nothing into the recipe and writes nothing
+ * of its own — so two calls that differ only here are the same *write*, and
+ * hashing them apart would let the same recipe be inserted twice in one turn.
+ */
+const NON_WRITING_ARGS: Record<string, readonly string[]> = {
+  create_recipe: [SUGGESTION_MODE_ARG],
+  revise_recipe: [SUGGESTION_MODE_ARG],
+};
+
+/**
+ * A digest of the part of a call that decides what gets written.
+ *
+ * For every tool with no display-only arguments this is identical to
+ * `argumentSignature` — the split only exists where a request can vary without
+ * the write varying.
+ */
+export function writeSignature(tool: string, rawArguments: string): string | null {
+  const ignored = NON_WRITING_ARGS[tool];
+
+  try {
+    const parsed = JSON.parse(rawArguments) as unknown;
+
+    if (ignored && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const kept: Record<string, unknown> = { ...(parsed as Record<string, unknown>) };
+      for (const key of ignored) delete kept[key];
+      return digest(JSON.stringify(canonicalise(kept)));
+    }
+
+    return digest(JSON.stringify(canonicalise(parsed)));
   } catch {
     return null;
   }
