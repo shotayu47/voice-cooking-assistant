@@ -22,6 +22,7 @@
  */
 export const REPEAT_SENSITIVE_TOOLS = new Set([
   'create_recipe',
+  'revise_recipe',
   'add_inventory_item',
   'start_cooking_session',
 ]);

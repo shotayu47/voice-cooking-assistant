@@ -29,7 +29,7 @@ describe('realtimeToolDefinitions', () => {
   it('covers the SPEC §8 tools plus the §14 name resolver', () => {
     // 12 through PHASE 7, plus adjust_recipe_amounts (PHASE 8) and
     // suggest_shopping_items (PHASE 10).
-    expect(realtime).toHaveLength(14);
+    expect(realtime).toHaveLength(15);
     expect(realtime.map((tool) => tool.name)).toContain('find_inventory_item');
   });
 

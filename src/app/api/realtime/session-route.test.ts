@@ -90,10 +90,10 @@ describe('POST /api/realtime/session — how a turn ends', () => {
     expect(session.audio.input.transcription.language).toBe('ja');
   });
 
-  it('still exposes all 14 tools to voice', async () => {
+  it('still exposes all 15 tools to voice', async () => {
     const session = await sentSession();
 
-    expect(session.tools).toHaveLength(14);
+    expect(session.tools).toHaveLength(15);
     expect(session.tools.map((t: { name: string }) => t.name)).toContain('suggest_shopping_items');
   });
 });

@@ -252,6 +252,7 @@ const TOOL_LABELS: Record<string, string> = {
   consume_inventory_item: '在庫を減らす',
   search_meal_candidates: '献立を検討',
   create_recipe: 'レシピを作成',
+  revise_recipe: 'レシピを変更',
   adjust_recipe_amounts: '分量を調整',
   suggest_shopping_items: '買い物候補を検討',
   start_cooking_session: '調理を開始',

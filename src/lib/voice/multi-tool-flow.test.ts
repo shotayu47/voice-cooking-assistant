@@ -187,6 +187,7 @@ describe('the same call is not made twice', () => {
     expect([...REPEAT_SENSITIVE_TOOLS].sort()).toEqual([
       'add_inventory_item',
       'create_recipe',
+      'revise_recipe',
       'start_cooking_session',
     ]);
   });

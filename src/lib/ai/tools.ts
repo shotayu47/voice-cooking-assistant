@@ -18,7 +18,7 @@ import {
   updateInventoryItem,
   type ServiceContext,
 } from '@/lib/inventory/service';
-import { createRecipe, getRecipe, toRecipeSnapshot } from '@/lib/recipes/service';
+import { createRecipe, getRecipe, reviseRecipe, toRecipeSnapshot } from '@/lib/recipes/service';
 import { listShoppingItems } from '@/lib/shopping/service';
 import {
   buildShoppingSuggestions,
@@ -347,6 +347,92 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
           },
         },
         required: [
+          'title',
+          'description',
+          'servings',
+          'estimated_minutes',
+          'difficulty',
+          'ingredients',
+          'steps',
+        ],
+        additionalProperties: false,
+      },
+    },
+  },
+  // PHASE 10 follow-up. "レシピを変えて" had no tool at all: the model
+  // answered in prose and nothing changed, or it reached for add_inventory_item
+  // and wrote a possession instead. A revision is a whole recipe saved as a new
+  // row — the original stays readable, and sessions keep their snapshot.
+  {
+    type: 'function',
+    function: {
+      name: 'revise_recipe',
+      description:
+        `既存レシピを変更した**新しい版**を保存する。元のレシピは残る。
+「レシピを変えて」「材料を追加して」「顆粒だしではなく出汁から作りたい」「〜抜きにして」は
+このツールを使うこと。口頭で「変更しました」と言うだけでは、実際には何も変わらない。
+source_recipe_id に元の recipe_id を渡し、**変更後の完全なレシピ**を create_recipe と同じ形で渡すこと。
+差分ではなく全体を渡す。返り値の recipe_id が新しい版で、以後はこちらを使う。
+買い物候補も求められている場合は、成功後にその新しい recipe_id で suggest_shopping_items を呼ぶこと。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          source_recipe_id: {
+            type: 'string',
+            description: '変更元の recipe_id。この行は更新も削除もされない。',
+          },
+          title: { type: 'string' },
+          description: { type: ['string', 'null'] },
+          servings: { type: 'integer' },
+          estimated_minutes: { type: ['integer', 'null'] },
+          difficulty: { type: ['string', 'null'], enum: ['easy', 'medium', 'hard', null] },
+          ingredients: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                amount: { type: ['number', 'null'] },
+                unit: { type: ['string', 'null'] },
+                required: { type: 'boolean' },
+                substitute_options: {
+                  type: ['array', 'null'],
+                  items: { type: 'string' },
+                },
+              },
+              required: ['name', 'amount', 'unit', 'required', 'substitute_options'],
+              additionalProperties: false,
+            },
+          },
+          steps: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                instruction: { type: 'string', description: '1工程1動作' },
+                duration_seconds: { type: ['integer', 'null'] },
+                heat_value: {
+                  type: ['integer', 'null'],
+                  description: 'IH 10段階での火力 (1-10)',
+                },
+                heat_label: { type: ['string', 'null'], description: '中火 / 強火 など' },
+                ingredient_refs: { type: ['array', 'null'], items: { type: 'string' } },
+                safety_note: { type: ['string', 'null'] },
+              },
+              required: [
+                'instruction',
+                'duration_seconds',
+                'heat_value',
+                'heat_label',
+                'ingredient_refs',
+                'safety_note',
+              ],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: [
+          'source_recipe_id',
           'title',
           'description',
           'servings',
@@ -933,6 +1019,34 @@ async function dispatch(
           recipe_id: recipe.id,
           title: recipe.title,
           total_steps: recipe.steps.length,
+        },
+      };
+    }
+
+    case 'revise_recipe': {
+      const sourceId = typeof args.source_recipe_id === 'string' ? args.source_recipe_id.trim() : '';
+      if (!sourceId) {
+        return {
+          result: {
+            error: 'invalid_arguments',
+            message: '変更元の recipe_id が必要です',
+          },
+        };
+      }
+
+      const { recipe, supersedesRecipeId } = await reviseRecipe(
+        ctx,
+        sourceId,
+        toRecipeInput(args),
+      );
+
+      return {
+        result: {
+          recipe_id: recipe.id,
+          supersedes_recipe_id: supersedesRecipeId,
+          title: recipe.title,
+          total_steps: recipe.steps.length,
+          note: '新しい版を保存しました。元のレシピはそのまま残っています。以後はこの recipe_id を使ってください。',
         },
       };
     }

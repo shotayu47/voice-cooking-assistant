@@ -64,6 +64,44 @@ export async function createRecipe(
   return toStoredRecipe(data as RecipeRow);
 }
 
+/** What a revision produced, and what it was derived from. */
+export type RevisedRecipe = {
+  recipe: StoredRecipe;
+  supersedesRecipeId: string;
+};
+
+/**
+ * Saves a changed version of an existing recipe as a *new* row.
+ *
+ * Nothing is updated in place. "顆粒だしではなく出汁から" is a different recipe,
+ * and overwriting the original would erase what the user cooked yesterday —
+ * while leaving `cooking_sessions.recipe_id` pointing at a row whose contents
+ * had silently changed underneath it.
+ *
+ * A session is unaffected either way: it holds `recipe_snapshot`, which is the
+ * authority for what is being cooked right now. So a revision mid-cook cannot
+ * reorder the steps under someone's hands.
+ *
+ * The source is read through `getRecipe`, which scopes to `ctx.userId` — so a
+ * recipe belonging to someone else is simply not found, and nothing is
+ * written. Validation runs before the insert, so a malformed revision leaves
+ * no row behind either.
+ */
+export async function reviseRecipe(
+  ctx: ServiceContext,
+  sourceRecipeId: string,
+  input: unknown,
+): Promise<RevisedRecipe> {
+  const source = await getRecipe(ctx, sourceRecipeId);
+  if (!source) throw new ServiceError('元のレシピが見つかりません');
+
+  // Same schema as creating one: a revision is a whole recipe, not a patch.
+  // Validating first is what keeps a rejected revision from writing a row.
+  const recipe = await createRecipe(ctx, input, 'ai');
+
+  return { recipe, supersedesRecipeId: source.id };
+}
+
 export async function getRecipe(
   ctx: ServiceContext,
   id: string,
