@@ -1508,3 +1508,165 @@ running_tool --guard--> awaiting_forced_final --> forced_final_responding --> co
 | `arg-signature` / `error-classify` / `event-log` | redaction（引数・結果・transcript・message が出力に現れない） |
 
 既存の候補カード・`requestId`・at-most-once のテストはすべて維持。
+
+---
+
+## 21. 音声QA —— 1発話での複数ツール連携（`a462f0c`）
+
+| 項目 | 内容 |
+|---|---|
+| 対象 SHA | `a462f0c38d8421cee885c04ebd33ba093eb1dfc8` |
+| 環境 | **Vercel Preview**（Production ではない） |
+| 端末 | **iPhone 実機 / Safari** |
+| 実施日 | **2026-08-16** |
+| 結果 | **PASS** |
+
+### 21.1 実機で観測した事実
+
+発話（1回のみ、追加発話なし）:
+
+> 新しい「鮭とブロッコリーのクリーム煮」のレシピを作って、
+> そのレシピで足りない材料の買い物候補を出してください。
+
+| 観測項目 | 結果 |
+|---|---|
+| 追加発話なしで完了 | **PASS**（言い直し・「もしもし？」不要） |
+| 候補カード | **表示** |
+| 候補 | 鮭 / ブロッコリー / 牛乳 / バター / 薄力粉 |
+| 初期チェック | **全件 OFF** |
+| 最後まで読み上げ | **PASS** |
+| 「待って」と予告して停止 | **なし** |
+| エラー・再試行UI | **非表示** |
+
+スクリーンショットあり。
+
+**これで §14〜§20 の一連の修正が目指していた
+「1発話で `create_recipe → suggest_shopping_items → 候補カード表示` まで完走する」は
+実機 PASS。**
+
+### 21.2 ⚠️ 体感時間とトレース実測は別物
+
+| 種別 | 値 |
+|---|---|
+| **ユーザー体感** | 約1〜2秒 |
+| **トレース実測**: 発話終了 → 候補ツール完了 | **約12.4秒** |
+| **トレース実測**: 発話終了 → 最終Response完了 | **約17.0秒** |
+
+体感とトレースが大きく食い違う。**体感値は体感値として保持し、
+実測の代わりに使わない。**（読み上げが始まるまでの間に何が起きているかは
+ユーザーから見えないため、体感が短くなるのは自然だが、
+「速い」と記録すると次に遅くなったとき比較できない。）
+
+トレース実測の内訳:
+
+```
+35799ms  発話終了
+46633ms  create_recipe 開始
+47005ms  create_recipe 完了
+47784ms  suggest_shopping_items 開始
+48151ms  suggest_shopping_items 完了
+48271ms  最終Response 生成開始     ← 候補ツール完了から約0.1秒
+52828ms  最終音声完了
+52834ms  最終Response completed
+```
+
+発話終了から最初のツールまで約10.8秒かかっており、**ここが最も長い**。
+`semantic_vad / eagerness: low`（§14.6）のトレードオフを含む区間だが、
+**内訳は未分析。** 遅さが問題になる場合はここを最初に見る。
+
+### 21.3 トレース上の経路
+
+```
+1. create_recipe args=FIRST → tool_done status=ok
+2. conversation.item.create
+3. response.create                       ← 正規 continuation 1回目
+4. suggest_shopping_items args=FIRST → tool_done status=ok
+5. conversation.item.create
+6. response.create                       ← 正規 continuation 2回目
+7. 最終音声出力
+8. response.done status=completed
+```
+
+**2回の正規 continuation が両方成功している。** 予算を1から
+`MAX_TOOL_ROUNDS = 6` に変えた（§20.4 の後継修正）効果が、
+そのまま経路として現れている。
+
+トレースに**出ていない**もの:
+
+- `continuation_guard`
+- `forced_final_requested`
+- `tool_repeat_skipped`
+- `args=UNREADABLE`
+- watchdog fire
+- Realtime error
+
+### 21.4 DB 読み取り確認（書き込み・更新・削除なし）
+
+**1. `shopping_items` —— 増えていない**
+
+```
+rows: 3
+  2026-08-10T00:26:13  じゃがいも 3個  dbcbdd8c-b838-4494-a671-0f26dfe4f630
+  2026-08-10T00:27:54  にんじん 1本    1d777780-a5f3-44b4-85f9-ff0086792815
+  2026-08-10T00:34:11  じゃがいも 3個  debfe9a0-84f9-458b-b85a-2f7d71897929
+
+ids identical to the pre-QA snapshot: YES
+rows created on 2026-08-16: 0
+```
+
+**件数だけでなく ID を突き合わせた。** 比較対象は本作業セッション内で
+QA 直前に記録した正確な3件。**提案表示だけでは `shopping_items` を書き換えない**が
+実測で裏づけられた。
+
+**2. QA で作られたレシピ —— 1件のみ**
+
+| 項目 | 値 |
+|---|---|
+| `id` | `22d9272b-ca1f-4c9c-bcda-7a7faf4317bc` |
+| `user_id` | `285fadf6-6ac7-44cd-b12b-e7a28b89fb66` |
+| `title` | 鮭とブロッコリーのクリーム煮 |
+| `source_type` | `ai` |
+| `created_at` | `2026-08-16T07:14:25.233085+00:00` |
+
+- **同名レシピの重複なし**（この title の行はちょうど1件）
+- `recipes` を参照する FK は `cooking_sessions.recipe_id`（`on delete set null`）のみ。
+  **このレシピを参照する `cooking_sessions` は 0 件**
+
+⚠️ **削除していない。** テストデータとして残すか消すかはユーザー判断。
+参照 0 件なので削除しても他行に影響はないが、**判断を待つ。**
+
+**3. ツール台帳 —— 各1回、正常終了**
+
+```
+2026-08-16T07:14:25.161  VOICE  create_recipe           status=done  hasError=false
+2026-08-16T07:14:26.252  VOICE  suggest_shopping_items  status=done  hasError=false
+```
+
+`create_recipe` の結果は `{title, recipe_id, total_steps}`、
+`suggest_shopping_items` は `{note, added, suggestions}`。**どちらもエラーなし。**
+
+台帳の 2 件の間隔は約 1.09 秒で、トレースの
+`create_recipe 開始 46633ms → suggest 開始 47784ms`（1151ms）と**整合する**
+（記録タイミングの基準が違うため厳密一致ではない）。
+
+### 21.5 今回の QA で確認**できていない**こと
+
+**この1回の PASS を根拠に、他項目を PASS にしない。**
+
+| 項目 | 状態 |
+|---|---|
+| `args=UNREADABLE` / `invalid_arguments` の**発生原因** | **未解明。** 今回**再発しなかっただけ**。同日 06:46（前 SHA）には `create_recipe -> invalid_arguments` が実際に発生している |
+| 同一 signature の重複防止 | **今回は発動していない**（`tool_repeat_skipped` なし）。根拠は**自動テストのみ** |
+| 予算上限（`MAX_TOOL_ROUNDS`）到達時の挙動 | **今回は到達していない**（continuation は2回）。根拠は**自動テストのみ** |
+| forced final の「予告禁止」 | **今回は forced final に入っていない**。根拠は**自動テストのみ** |
+| 発話終了→最初のツールまでの約10.8秒 | **内訳未分析** |
+
+なお同日には `search_meal_candidates -> invalid_candidates` が 8 件出ている。
+これは JSON パース失敗（`invalid_arguments`）とは**別のドメイン検証エラー**であり、
+今回の QA ターンには含まれない。**未調査。**
+
+### 21.6 PHASE 10 の Status
+
+**`IN_PROGRESS` を維持。** §18 の未確認項目（停止時の復旧UI、疎通確認の分岐、
+二重タップ、録音中表示、複数往復、「新しい会話」の同時二重タップ 等）が残っている。
+`docs/implementation-roadmap.md` は**変更しない**。
