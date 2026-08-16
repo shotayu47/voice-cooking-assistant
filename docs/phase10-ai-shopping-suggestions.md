@@ -1356,3 +1356,155 @@ send({ type: 'response.create', response: { instructions: ... } });
 
 「トラブルがあったみたい」という発話は、モデルが会話内に
 エラー item を見た可能性を示唆するが、**これも未確認。**
+
+---
+
+## 20. 実トレースで確認した Realtime の失敗経路
+
+`31da5f1` / `c6bac06` の診断で取得したトレースから、**証拠のある経路**を記録する。
+推論と観測を分ける。
+
+### 20.1 確認済み —— continuation guard による `no_continuation`
+
+**これは実トレースで確認できた。**
+
+```
+R1 completed → search_meal_candidates C1 (389ms 成功)
+conversation.item.create 送信成功 → response.create 送信成功
+R2 が 2回目の search_meal_candidates C2 を要求 → C2 も成功
+function_call_output 送信成功
+continuation_suppressed reason=guard        ← ここで止まる
+（約21秒）
+watchdog.fire status=no_continuation
+UI「応答に失敗しました」
+再試行 → C3 成功 → 同じ guard → 再び約21秒後に失敗
+```
+
+- `response.status=failed` は**発生していない**
+- tool 実行も tool output 送信も**成功している**
+- **エラーUIの直接原因は、guard が最終応答の生成を止めたこと**
+
+### 20.2 読み取り調査で判明した guard の正体
+
+| 問い | 答え |
+|---|---|
+| guard の条件 | `continuationsRequested === 0 && activeResponseId === null` |
+| 回数上限か、tool名か、引数signatureか | **回数上限のみ**。1ターンにつき1回。tool名・引数の判定は**どこにも無い** |
+| `retry_requested` が戻すもの | phase / `activeResponseId` / `failure` / `waitingSince` |
+| `retry_requested` が戻さないもの | **`continuationsRequested`**。だから再試行が同じ guard に必ず当たる |
+| guard 発動後に `running_tool` に残る位置 | `deliverToolOutput` 内の早期 `return`（phase を変えない） |
+| なぜ 21秒後に失敗するか | `running_tool` は `noContinuationMs`(20s) の監視対象。**設計上そうなる** |
+
+つまり **1ターンで2回ツールを呼ぶと、最終回答が構造的に生成されない。**
+
+### 20.3 ⚠️ C1/C2/C3 の引数は 比較不能
+
+**引数はどこにも保存されていない。**
+
+- `ai_tool_calls` に arguments 列が**無い**（`result` のみ）
+- `/api/realtime/tool` は arguments を受け取るが**保存しない**
+- 音声経路は `conversation_messages` に**一切書かない**
+
+したがって、取得済みトレースの C1/C2/C3 が同一引数だったかは
+**推測も再構築もしない。比較不能とする。**
+
+今後の実行についてのみ、`arg-signature.ts` が
+**値を保存せず** canonical 化 → digest → 比較のみを行い、
+トレースには `args=SAME / DIFFERENT / FIRST / UNREADABLE` だけを残す。
+
+### 20.4 修正 —— guard 発動後は必ず終端する
+
+guard が止めるべきは**次のツール**であって**回答そのものではない**。
+結果は既に手元にあるので、guard は「1回だけの強制最終回答」へ落ちる。
+
+| 項目 | 内容 |
+|---|---|
+| `tool_choice` | **`'none'`** |
+| instructions | 取得済み結果だけで回答を完成させる旨 |
+| metadata | `{ purpose: 'forced_final' }` |
+| 回数 | **commit 済みユーザーターンにつき最大1回** |
+
+⚠️ **これらは推測で足していない。** インストール済み SDK の型
+（`node_modules/openai/resources/realtime/realtime.d.ts`）で確認した:
+
+- `RealtimeResponseCreateParams` に `tool_choice` / `metadata` / `instructions` が存在
+- `ToolChoiceOptions = 'none' | 'auto' | 'required'`
+- `ResponseCreateEvent` / `ResponseCancelEvent` に `event_id`、`ResponseCancelEvent` に `response_id`
+- `RealtimeError` に `type` / `code` / `param` / `event_id`
+- `status_details.reason` は `'turn_detected' | 'client_cancelled' | 'max_output_tokens' | 'content_filter'`
+
+**新しい状態:**
+
+```
+running_tool --guard--> awaiting_forced_final --> forced_final_responding --> completed
+                     \--(既に使用済み)--> unresolved（即時。20秒待たない）
+                                          \--(ツールを再要求)--> unresolved
+```
+
+- 強制最終回答が**さらにツールを要求したら再帰せず停止**（`forced_final_looped`）
+- どちらの終端でも `canRetry` は **false**。同じ道を辿らせない
+- **「もう一度応答を試す」は、tool output 送信済みなら強制最終回答経路へ**
+  （`retryShouldForceFinal`）。通常の tool 選択をやり直さない
+- ターン予算の初期化は **`committed` のみ**。
+  commit しない割り込み発話では予算を回復させない
+
+### 20.5 修正 —— liveness の cancel/create 順序
+
+トレース 13998ms で `response.cancel` と `response.create` が**同時刻に送信**、
+対象 R3 の `response.done(cancelled)` は 14227ms（**229ms 後**）。
+つまり**旧Responseが生成中のまま2本目を要求**していた。
+
+> ⚠️ **このトレース自体は成功ケース。** 60秒無応答そのものは捕捉できていない。
+> 競合が存在することは確認できたが、**過去の無応答の原因と断定はしない。**
+
+修正後の順序:
+
+```
+1. response.cancel（response_id を指定）→ phase: cancelling_response
+2. その ID に一致する response.done(cancelled) を待つ
+3. → phase: awaiting_liveness_create
+4. 中立応答の response.create を 1回だけ送信 → awaiting_liveness_response
+5. response.created → response.done(completed) → completed
+```
+
+**Response を ID で相関させた。** active でも cancelling でもない `response.done` は
+**現在のターンを変更しない**。トレース R2 で観測された
+「activeResponseId が無い状態の done が listening→unresolved を起こす」も、
+`completed` が `waitingSince` を null にして **watchdog を恒久解除する**経路も、
+これで閉じる。`speech_started` は旧 responseId を捨てず
+`interruptedResponseId` に保持する。
+
+監視対象は明示的に限定した ——
+`cancelling_response` / `awaiting_liveness_create` / `awaiting_liveness_response` /
+`awaiting_forced_final` / `forced_final_responding` / `running_tool` など。
+**通常の `listening` は無期限に許容**（連続会話では正常）。
+
+### 20.6 `cancelWaiting=R4` について
+
+旧トレースの `cancelWaiting=R4` は、当時の実装が
+**`response.cancel` に対象 ID を指定しておらず**、診断側が固定文字列
+`'unspecified'` を alias 名前空間（`R`）へ通していたため、
+**実在しない Response と同じ採番系列に並んで見えていた**もの。
+
+`R4` という Response は存在しない。**alias の付け方の問題**であって
+状態管理の問題ではない。現在は `response.cancel` が実 ID を指定するため、
+`cancelWaiting` は実在する Response の alias になる。
+
+### 20.7 未解明のまま残すもの
+
+**`response.done status=failed`（割り込み無しで 43ms 後に failed）は別経路。**
+今回の guard 修正で原因を確定したことに**しない**。
+`c6bac06` の診断（`status_details.type` / `reason` / `error.type` / `code` /
+`param`、`error.event_id` 相関）で、**次に再発したときに判定する。**
+
+### 20.8 テスト
+
+**738件**（722 → 実装前 697 から +41）。
+
+| ファイル | 内容 |
+|---|---|
+| `forced-final.test.ts` | 通常continuation / guard発動→強制最終1回 / `running_tool` に残らない / ループしない / 再試行が同じ停止を繰り返さない / 予算は commit で初期化 / 引数signature SAME・DIFFERENT |
+| `liveness-ordering.test.ts` | cancel→matching done→create の順序 / 無関係な done が現在ターンを変えない / watchdog が解除されない / liveness 不着で復旧UI / 通常 listening は無監視 |
+| `arg-signature` / `error-classify` / `event-log` | redaction（引数・結果・transcript・message が出力に現れない） |
+
+既存の候補カード・`requestId`・at-most-once のテストはすべて維持。
