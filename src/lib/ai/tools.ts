@@ -461,7 +461,13 @@ intent で「やった」のか「飛ばした」のかを区別する:
     type: 'function',
     function: {
       name: 'previous_cooking_step',
-      description: '工程を1つ戻す。',
+      description:
+        `工程を1つ戻す（データベースを更新する）。
+ユーザーが戻すことを明示した場合のみ呼ぶこと。例:「前の工程へ戻して」「ひとつ前に戻して」
+「工程を戻してください」。
+質問には呼ばない。「前の工程を教えて」「ひとつ前は何？」「さっきの手順を教えて」は"案内"の依頼で、
+get_current_cooking_step を使って答えること。
+単独の「前」だけでは判断できないので呼ばず、戻すのかを確認すること。`,
       parameters: {
         type: 'object',
         properties: { session_id: { type: 'string' } },

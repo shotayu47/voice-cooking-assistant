@@ -23,7 +23,12 @@ import {
   type LivenessAction,
 } from './liveness';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
-import { decideAdvance, refusedAdvanceOutput } from './step-intent';
+import {
+  decideAdvance,
+  decidePrevious,
+  refusedAdvanceOutput,
+  refusedPreviousOutput,
+} from './step-intent';
 import { decideRepeat, repeatKey, replayedOutput } from './tool-repeat';
 import {
   canExecuteCall,
@@ -278,7 +283,7 @@ export function useRealtimeVoice(options: {
    */
   const committedTurnRef = useRef(0);
   const turnTranscriptRef = useRef<{ turn: number; text: string } | null>(null);
-  /** Step advances already authorised this turn. At most one. */
+  /** Step moves already authorised this turn, either direction. At most one. */
   const advancesThisTurnRef = useRef(0);
 
   /** Latest `rate_limits.updated`, for pacing a refusal by the server's own numbers. */
@@ -814,23 +819,35 @@ export function useRealtimeVoice(options: {
        * marked two steps complete; the gate below is what stops that, and it
        * is fail-closed — no authorising utterance, no write.
        */
-      if (name === 'advance_cooking_step') {
+      if (name === 'advance_cooking_step' || name === 'previous_cooking_step') {
+        const goingBack = name === 'previous_cooking_step';
         const transcript = await transcriptForThisTurn();
-        const decision = decideAdvance(transcript, advancesThisTurnRef.current);
+        // One budget for both directions: a single committed utterance moves
+        // the cooking at most once, whichever way.
+        const decision = goingBack
+          ? decidePrevious(transcript, advancesThisTurnRef.current)
+          : decideAdvance(transcript, advancesThisTurnRef.current);
 
         if (decision !== 'allow') {
           // The decision and its reason are recorded; the utterance is not.
-          logRef.current.add('internal', 'step_advance_refused', {
+          logRef.current.add('internal', 'step_move_refused', {
             tool: name,
             call: callId,
             reason: decision,
           });
           setState((current) => ({ ...current, activeTool: null }));
-          deliverToolOutput(callId, refusedAdvanceOutput(decision, await readCurrentStep(args)));
+
+          const currentStep = await readCurrentStep(args);
+          deliverToolOutput(
+            callId,
+            goingBack
+              ? refusedPreviousOutput(decision, currentStep)
+              : refusedAdvanceOutput(decision, currentStep),
+          );
           return;
         }
 
-        logRef.current.add('internal', 'step_advance_allowed', { tool: name, call: callId });
+        logRef.current.add('internal', 'step_move_allowed', { tool: name, call: callId });
         advancesThisTurnRef.current += 1;
       }
 

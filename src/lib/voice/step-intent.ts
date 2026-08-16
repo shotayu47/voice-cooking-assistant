@@ -81,17 +81,60 @@ const ADVANCE_MARKERS = [
  * An utterance carrying both kinds of marker is `ambiguous`, not `advance` —
  * "完了したか教えて" asks a question about completion and must not perform one.
  */
-export function classifyStepUtterance(transcript: string | null | undefined): StepIntent {
-  if (typeof transcript !== 'string') return 'ambiguous';
+/**
+ * Asking for the step to be put *back*.
+ *
+ * Only the causative forms — "戻して", "戻す" — count. A bare 「戻って」 is left
+ * out on purpose: it reads just as naturally as "show me the previous step",
+ * which is a question, and this list decides whether to write.
+ */
+const BACK_MARKERS = ['戻して', 'もどして', '戻す', 'もどす', '前に戻', '前へ戻', '未完了に戻'];
 
+function normalise(transcript: string | null | undefined): string | null {
+  if (typeof transcript !== 'string') return null;
   const text = transcript.trim().replace(/[。、．，!！?？\s]/g, '');
-  if (text === '') return 'ambiguous';
+  return text === '' ? null : text;
+}
 
-  const asksAboutIt = READ_ONLY_MARKERS.some((marker) => text.includes(marker));
-  const declaresItDone = ADVANCE_MARKERS.some((marker) => text.includes(marker));
+function asksAboutIt(text: string): boolean {
+  return READ_ONLY_MARKERS.some((marker) => text.includes(marker));
+}
 
-  if (asksAboutIt && !declaresItDone) return 'read_only';
-  if (declaresItDone && !asksAboutIt) return 'advance';
+function declaresItDone(text: string): boolean {
+  // 「未完了に戻して」 contains 完了 and means the opposite of completing it, so
+  // that phrase is taken out before the completion markers are matched.
+  const withoutNegation = text.replaceAll('未完了', '');
+  return ADVANCE_MARKERS.some((marker) => withoutNegation.includes(marker));
+}
+
+export function classifyStepUtterance(transcript: string | null | undefined): StepIntent {
+  const text = normalise(transcript);
+  if (text === null) return 'ambiguous';
+
+  const asks = asksAboutIt(text);
+  const declares = declaresItDone(text);
+
+  if (asks && !declares) return 'read_only';
+  if (declares && !asks) return 'advance';
+  return 'ambiguous';
+}
+
+/**
+ * The same question for the other direction.
+ *
+ * `advance` here means "move the step back" — the write this gate authorises.
+ * "前の工程を教えて" and "ひとつ前は何？" are questions about a step, not
+ * permission to undo one.
+ */
+export function classifyPreviousUtterance(transcript: string | null | undefined): StepIntent {
+  const text = normalise(transcript);
+  if (text === null) return 'ambiguous';
+
+  const asks = asksAboutIt(text);
+  const wantsItBack = BACK_MARKERS.some((marker) => text.includes(marker));
+
+  if (asks && !wantsItBack) return 'read_only';
+  if (wantsItBack && !asks) return 'advance';
   return 'ambiguous';
 }
 
@@ -119,6 +162,22 @@ export function decideAdvance(
 }
 
 /**
+ * The same gate for moving a step back.
+ *
+ * `previous_cooking_step` writes too — it rewinds `current_step` — so "前の
+ * 工程を教えて" must no more undo a step than "次の工程を教えて" completed one.
+ * The turn budget is shared with `decideAdvance`: one committed utterance
+ * moves the cooking at most once, in one direction.
+ */
+export function decidePrevious(
+  transcript: string | null | undefined,
+  stepMovesThisTurn: number,
+): AdvanceDecision {
+  if (stepMovesThisTurn > 0) return 'refuse_already_advanced';
+  return classifyPreviousUtterance(transcript) === 'advance' ? 'allow' : 'refuse_unauthorised';
+}
+
+/**
  * What goes back to the model when a step change is refused.
  *
  * It still needs an output for that `call_id` or it waits forever, and it
@@ -134,6 +193,27 @@ export function refusedAdvanceOutput(decision: AdvanceDecision, currentStep: unk
 
   return {
     advanced: false,
+    reason: decision,
+    message,
+    ...(currentStep === undefined || currentStep === null ? {} : { current: currentStep }),
+  };
+}
+
+/**
+ * The refusal for a rewind.
+ *
+ * Carries the current step for the same reason: the question was almost
+ * certainly "what was the previous step", and that can be answered from the
+ * recipe without touching the database.
+ */
+export function refusedPreviousOutput(decision: AdvanceDecision, currentStep: unknown): unknown {
+  const message =
+    decision === 'refuse_already_advanced'
+      ? 'この発話ではすでに工程を1回動かしています。同じ依頼で二重に動かすことはできません。現在の工程を案内してください。'
+      : 'ユーザーは工程を戻すことを明示していません。工程は戻していません。現在の工程とその一つ前の内容を読み上げて答え、実際に戻す場合は「前の工程へ戻して」と言ってもらうよう促してください。';
+
+  return {
+    moved: false,
     reason: decision,
     message,
     ...(currentStep === undefined || currentStep === null ? {} : { current: currentStep }),

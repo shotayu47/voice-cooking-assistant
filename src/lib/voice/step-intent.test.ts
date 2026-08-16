@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  classifyPreviousUtterance,
   classifyStepUtterance,
   decideAdvance,
+  decidePrevious,
   refusedAdvanceOutput,
+  refusedPreviousOutput,
 } from './step-intent';
 
 /**
@@ -92,6 +95,74 @@ describe('6 — default deny', () => {
 
   it('refuses a non-string transcript', () => {
     expect(classifyStepUtterance(42 as unknown as string)).toBe('ambiguous');
+  });
+});
+
+describe('going back is a write too', () => {
+  it('refuses "前の工程を教えて" — the question, not the undo', () => {
+    expect(classifyPreviousUtterance('前の工程を教えて')).toBe('read_only');
+    expect(decidePrevious('前の工程を教えて', 0)).toBe('refuse_unauthorised');
+  });
+
+  for (const utterance of [
+    'ひとつ前は何？',
+    'さっきの手順を教えて',
+    'さっきの工程をもう一度教えて',
+    '前の工程は？',
+  ]) {
+    it(`refuses "${utterance}"`, () => {
+      expect(decidePrevious(utterance, 0)).toBe('refuse_unauthorised');
+    });
+  }
+
+  for (const utterance of [
+    '前の工程へ戻して',
+    'ひとつ前に戻して',
+    '工程を戻してください',
+    'さっきの工程を未完了に戻して',
+  ]) {
+    it(`allows "${utterance}"`, () => {
+      expect(classifyPreviousUtterance(utterance)).toBe('advance');
+      expect(decidePrevious(utterance, 0)).toBe('allow');
+    });
+  }
+
+  it('refuses a bare 前', () => {
+    expect(classifyPreviousUtterance('前')).toBe('ambiguous');
+    expect(decidePrevious('前', 0)).toBe('refuse_unauthorised');
+  });
+
+  it('refuses with no transcript, or one from another turn', () => {
+    expect(decidePrevious(null, 0)).toBe('refuse_unauthorised');
+    expect(decidePrevious(undefined, 0)).toBe('refuse_unauthorised');
+    expect(decidePrevious('', 0)).toBe('refuse_unauthorised');
+  });
+
+  it('refuses an utterance that both asks and directs', () => {
+    expect(decidePrevious('前に戻すか教えて', 0)).toBe('refuse_unauthorised');
+  });
+
+  it('moves at most once per turn, sharing the budget with advancing', () => {
+    // One committed utterance moves the cooking once, in one direction.
+    expect(decidePrevious('前の工程へ戻して', 1)).toBe('refuse_already_advanced');
+    expect(decideAdvance('できた', 1)).toBe('refuse_already_advanced');
+  });
+
+  it('does not let 未完了 read as a completion', () => {
+    // 「未完了に戻して」 contains 完了 and means the opposite.
+    expect(classifyStepUtterance('さっきの工程を未完了に戻して')).not.toBe('advance');
+  });
+
+  it('answers the model without touching the database', () => {
+    const output = refusedPreviousOutput('refuse_unauthorised', {
+      current_step: 3,
+      total_steps: 7,
+    }) as Record<string, unknown>;
+
+    expect(output.moved).toBe(false);
+    expect(String(output.message)).toContain('戻していません');
+    expect(String(output.message)).toContain('一つ前');
+    expect(output.current).toEqual({ current_step: 3, total_steps: 7 });
   });
 });
 
