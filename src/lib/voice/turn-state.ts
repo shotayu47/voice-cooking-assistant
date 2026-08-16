@@ -29,6 +29,9 @@ export type TurnPhase =
   | 'responding'
   | 'running_tool'
   | 'continuing_after_tool'
+  /** The continuation guard tripped; a tools-forbidden reply has been asked for. */
+  | 'awaiting_forced_final'
+  | 'forced_final_responding'
   | 'completed'
   | 'recoverable_error'
   | 'unresolved';
@@ -41,7 +44,11 @@ export type TurnFailure =
   | 'no_response'
   | 'no_continuation'
   | 'channel_lost'
-  | 'api_error';
+  | 'api_error'
+  /** The guard tripped and the one forced final had already been spent. */
+  | 'forced_final_unavailable'
+  /** The forced final asked for yet another tool instead of answering. */
+  | 'forced_final_looped';
 
 export type TurnState = {
   phase: TurnPhase;
@@ -55,6 +62,14 @@ export type TurnState = {
   outputsSent: string[];
   /** Continuation requests issued after a tool (invariant 3). */
   continuationsRequested: number;
+  /**
+   * Tools-forbidden replies asked for after the guard tripped.
+   *
+   * At most one per committed user turn. Without it the guard was a dead end:
+   * the tool result was delivered, no reply was ever requested, and the turn
+   * sat in `running_tool` until the watchdog called it stalled 21s later.
+   */
+  forcedFinalRequested: number;
   /** When the current wait began, for the timeout checks. */
   waitingSince: number | null;
   failure: TurnFailure | null;
@@ -74,6 +89,9 @@ export type VoiceEvent =
   | { type: 'function_call_ready'; at: number; callId: string }
   | { type: 'tool_output_sent'; at: number; callId: string }
   | { type: 'continuation_requested'; at: number }
+  | { type: 'forced_final_requested'; at: number }
+  | { type: 'forced_final_unavailable'; at: number }
+  | { type: 'forced_final_looped'; at: number }
   | { type: 'card_shown'; at: number }
   | { type: 'response_done'; at: number; responseId: string; status: string }
   | { type: 'channel_lost'; at: number }
@@ -87,6 +105,7 @@ export const INITIAL_TURN: TurnState = {
   callsSeen: [],
   outputsSent: [],
   continuationsRequested: 0,
+  forcedFinalRequested: 0,
   waitingSince: null,
   failure: null,
   cardShown: false,
@@ -108,28 +127,39 @@ export const TURN_TIMEOUTS = {
   noContinuationMs: 20_000,
 } as const;
 
-/** A fresh turn, keeping nothing from the last one. */
-function startTurn(at: number): TurnState {
-  return { ...INITIAL_TURN, phase: 'listening', waitingSince: at };
-}
-
 export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
   switch (event.type) {
     case 'speech_started':
-      // New speech during a response is an interruption, not a fresh turn —
-      // but the turn it interrupts is over either way, so the state resets.
-      return startTurn(event.at);
+      // Listening again — but the budget is deliberately *not* reset here.
+      // Speech that never commits is not a new request, and refreshing the
+      // tool allowance on every barge-in would hand the model another round
+      // of tools for a turn the user never finished making.
+      return { ...state, phase: 'listening', waitingSince: event.at, failure: null };
 
     case 'speech_stopped':
       return { ...state, phase: 'committing', waitingSince: event.at };
 
     case 'committed':
-      return { ...state, phase: 'waiting_for_response', waitingSince: event.at };
+      // A committed user turn is what earns a fresh budget.
+      return {
+        ...state,
+        phase: 'waiting_for_response',
+        waitingSince: event.at,
+        continuationsRequested: 0,
+        forcedFinalRequested: 0,
+        callsSeen: [],
+        outputsSent: [],
+        cardShown: false,
+        failure: null,
+      };
 
     case 'response_created':
       return {
         ...state,
-        phase: 'responding',
+        // The forced final is still a response, but it must stay
+        // distinguishable: a tool call arriving under it is a loop, whereas
+        // under an ordinary response it is normal traffic.
+        phase: state.phase === 'awaiting_forced_final' ? 'forced_final_responding' : 'responding',
         activeResponseId: event.responseId,
         responsesCreated: state.responsesCreated + 1,
         waitingSince: event.at,
@@ -158,6 +188,35 @@ export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
         ...state,
         phase: 'continuing_after_tool',
         continuationsRequested: state.continuationsRequested + 1,
+        waitingSince: event.at,
+      };
+
+    case 'forced_final_requested':
+      return {
+        ...state,
+        phase: 'awaiting_forced_final',
+        forcedFinalRequested: state.forcedFinalRequested + 1,
+        waitingSince: event.at,
+      };
+
+    case 'forced_final_unavailable':
+      // The guard tripped with the one forced final already spent. Say so now
+      // rather than leaving the turn to be declared stalled 20s later.
+      return {
+        ...state,
+        phase: 'unresolved',
+        failure: 'forced_final_unavailable',
+        waitingSince: event.at,
+      };
+
+    case 'forced_final_looped':
+      // It asked for another tool instead of answering. Asking again would be
+      // the loop the guard exists to prevent.
+      return {
+        ...state,
+        phase: 'unresolved',
+        activeResponseId: null,
+        failure: 'forced_final_looped',
         waitingSince: event.at,
       };
 
@@ -247,6 +306,34 @@ export function canRequestContinuation(state: TurnState): boolean {
   return state.continuationsRequested === 0 && state.activeResponseId === null;
 }
 
+/**
+ * May the client ask for a tools-forbidden final answer?
+ *
+ * This is what the guard falls through to. The tool ran and its result was
+ * delivered, so there *is* something to answer with — the only thing the guard
+ * should prevent is another round of tools, not the reply itself. One per
+ * committed turn, so a model that keeps reaching for tools still terminates.
+ */
+export function canForceFinal(state: TurnState): boolean {
+  return state.forcedFinalRequested === 0 && state.activeResponseId === null;
+}
+
+/** True while a forced final is outstanding, so a tool call under it is a loop. */
+export function isForcingFinal(state: TurnState): boolean {
+  return state.phase === 'awaiting_forced_final' || state.phase === 'forced_final_responding';
+}
+
+/**
+ * After a stall, is a plain "ask again" the wrong move?
+ *
+ * When tool output has already been delivered, re-running the ordinary path
+ * lets the model choose tools again and arrive back at the same guard — which
+ * is exactly what the retry button did. Route those through the forced final.
+ */
+export function retryShouldForceFinal(state: TurnState): boolean {
+  return state.outputsSent.length > 0 && state.forcedFinalRequested === 0;
+}
+
 /** True once the turn can no longer be trusted to produce an answer. */
 export function isUnresolved(state: TurnState): boolean {
   return state.phase === 'unresolved';
@@ -284,6 +371,8 @@ export function overdue(
     state.phase === 'responding' ||
     state.phase === 'running_tool' ||
     state.phase === 'continuing_after_tool' ||
+    state.phase === 'awaiting_forced_final' ||
+    state.phase === 'forced_final_responding' ||
     state.phase === 'recoverable_error'
   ) {
     return waited >= timeouts.noContinuationMs ? 'no_continuation' : null;
@@ -318,6 +407,10 @@ export function describeFailure(state: TurnState): string | null {
       return `応答が最後まで届きませんでした。${suffix}`;
     case 'channel_lost':
       return '接続が切れたため、応答を受け取れませんでした。';
+    case 'forced_final_unavailable':
+    case 'forced_final_looped':
+      // Distinct wording on purpose: the work was done, the sentence was not.
+      return `調べた結果はありますが、返答をまとめられませんでした。${suffix}`;
     case 'failed':
     case 'api_error':
     default:
@@ -337,5 +430,11 @@ export function canRetry(state: TurnState): boolean {
   if (state.phase !== 'unresolved') return false;
   // Nothing was ever committed, so there is no turn to answer.
   if (state.failure === 'channel_lost') return false;
+  // The forced final was the last resort and it did not land. Offering to try
+  // again would walk the same path into the same guard; the user is better
+  // served by the explicit way out.
+  if (state.failure === 'forced_final_unavailable' || state.failure === 'forced_final_looped') {
+    return false;
+  }
   return true;
 }

@@ -4,21 +4,25 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
+import { argumentSignature, compareSignature } from './arg-signature';
 import { classifyErrorMessage } from './error-classify';
 import { createEventLog, formatEventLog } from './event-log';
 import { classifyUtterance, decideLivenessAction, livenessInstructions } from './liveness';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
 import {
   canExecuteCall,
+  canForceFinal,
   canRequestContinuation,
   canRetry,
   canSendToolOutput,
   describeFailure,
   INITIAL_TURN,
+  isForcingFinal,
   isUnresolved,
   markOverdue,
   overdue,
   reduceTurn,
+  retryShouldForceFinal,
   type TurnState,
   type VoiceEvent,
 } from './turn-state';
@@ -139,6 +143,18 @@ export const CORRELATED_EVENTS = new Set([
 const WATCHDOG_INTERVAL_MS = 2_000;
 
 /**
+ * What the model is told when the guard has cut it off from further tools.
+ *
+ * It has results in hand; the only thing missing is the sentence. Saying so
+ * explicitly beats leaving it to infer why its tools stopped working.
+ */
+const FORCED_FINAL_INSTRUCTIONS = [
+  'すでに取得済みのツール結果だけを使って、ユーザーへの回答を今すぐ完成させてください。',
+  'これ以上ツールを呼び出すことはできません。追加の情報取得を試みないでください。',
+  '手元の結果で答えられない部分があれば、その旨を一言添えてください。',
+].join('\n');
+
+/**
  * Client-side id for one outbound payload.
  *
  * Only ever compared against `error.event_id` and aliased before it reaches
@@ -195,6 +211,16 @@ export function useRealtimeVoice(options: {
   const cancelWaitingRef = useRef<string | null>(null);
   /** Whether a liveness reply has been asked for and not yet seen arrive. */
   const livenessPendingRef = useRef(false);
+  /**
+   * Set by `connect`, because the sender lives in its closure. Lets the retry
+   * button reach the forced-final path instead of re-running tool selection.
+   */
+  const forceFinalRef = useRef<(() => void) | null>(null);
+  /**
+   * Last argument digest per tool name, for the SAME/DIFFERENT diagnostic.
+   * Digests only — the arguments are never retained.
+   */
+  const lastSignatureRef = useRef<Map<string, string>>(new Map());
 
   const onToolEffectRef = useRef(options.onToolEffect);
   useEffect(() => {
@@ -540,6 +566,8 @@ export function useRealtimeVoice(options: {
         // End of a model turn. Only a *completed* one may act.
         case 'response.done': {
           const status = event.response?.status ?? 'completed';
+          // Read before the reducer moves the phase on.
+          const wasForcingFinal = isForcingFinal(turnRef.current);
           const details = event.response?.status_details;
           logRef.current.add('in', 'response.done', {
             resp: event.response?.id,
@@ -579,6 +607,19 @@ export function useRealtimeVoice(options: {
           }
 
           const calls = selectExecutableCalls(event.response?.output, handledCallsRef.current);
+
+          if (calls.length > 0 && wasForcingFinal) {
+            /*
+             * The tools-forbidden reply asked for a tool anyway. Running it
+             * would start the loop again, and asking for another final would
+             * recurse — so this is where the turn stops and says so.
+             */
+            logRef.current.add('internal', 'forced_final_looped', { resp: event.response?.id });
+            advance({ type: 'forced_final_looped', at: Date.now() });
+            setState((current) => ({ ...current, activeTool: null }));
+            break;
+          }
+
           for (const call of calls) {
             if (!canExecuteCall(turnRef.current, call.callId)) continue;
             handledCallsRef.current.add(call.callId);
@@ -617,7 +658,17 @@ export function useRealtimeVoice(options: {
 
     async function runTool(name: string, callId: string, args: string) {
       const startedAt = Date.now();
-      logRef.current.add('internal', 'tool_start', { tool: name, call: callId });
+
+      /*
+       * Whether this repeats the previous call to the same tool. Only the
+       * verdict is kept — the digest is compared and discarded, and the
+       * arguments themselves are never held anywhere.
+       */
+      const signature = argumentSignature(args);
+      const argsMatch = compareSignature(lastSignatureRef.current.get(name), signature);
+      if (signature !== null) lastSignatureRef.current.set(name, signature);
+
+      logRef.current.add('internal', 'tool_start', { tool: name, call: callId, argsMatch });
       setState((current) => ({ ...current, activeTool: name, notice: null }));
       try {
         const response = await fetch('/api/realtime/tool', {
@@ -734,13 +785,19 @@ export function useRealtimeVoice(options: {
          * turn that calls two tools cannot ask for a reply after the second —
          * recording the count is what will show whether that is what happened.
          */
-        logRef.current.add('internal', 'continuation_suppressed', {
-          reason: 'guard',
+        logRef.current.add('internal', 'continuation_guard', {
+          reason:
+            turnRef.current.continuationsRequested > 0 ? 'budget_spent' : 'response_active',
           continuations: turnRef.current.continuationsRequested,
           hasActive: turnRef.current.activeResponseId !== null,
           from: turnRef.current.phase,
           pendingLiveness: livenessPendingRef.current,
         });
+
+        // The guard stops another round of *tools*, not the answer itself. The
+        // result is already delivered, so the turn ends one way or the other
+        // here rather than sitting in running_tool until the watchdog calls it.
+        requestForcedFinal();
         return;
       }
 
@@ -785,6 +842,42 @@ export function useRealtimeVoice(options: {
         type: 'response.create',
         response: { instructions: livenessInstructions(action, describeFailure(turnRef.current)) },
       });
+    }
+
+    /**
+     * Ask for one reply that uses what the tools already returned, with no
+     * further tools allowed.
+     *
+     * `tool_choice: 'none'` and a response-level `metadata` are both part of
+     * `response.create` in the installed Realtime schema — checked against the
+     * SDK's own types rather than assumed. The metadata is what lets the trace
+     * tell this response apart from an ordinary one.
+     */
+    forceFinalRef.current = requestForcedFinal;
+
+    function requestForcedFinal() {
+      if (!canForceFinal(turnRef.current)) {
+        logRef.current.add('internal', 'forced_final_unavailable', {
+          reason: 'already_spent',
+          from: turnRef.current.phase,
+        });
+        advance({ type: 'forced_final_unavailable', at: Date.now() });
+        return;
+      }
+
+      logRef.current.add('internal', 'forced_final_requested', { from: turnRef.current.phase });
+      advance({ type: 'forced_final_requested', at: Date.now() });
+
+      const ok = send({
+        type: 'response.create',
+        response: {
+          tool_choice: 'none',
+          metadata: { purpose: 'forced_final' },
+          instructions: FORCED_FINAL_INSTRUCTIONS,
+        },
+      });
+
+      if (!ok) advance({ type: 'channel_lost', at: Date.now() });
     }
 
     /** Returns whether the payload actually went out. */
@@ -855,7 +948,20 @@ export function useRealtimeVoice(options: {
       return;
     }
 
-    logRef.current.add('internal', 'retry_requested');
+    /*
+     * A stall that happened *after* tool output was delivered must not be
+     * retried by re-running the ordinary path: the model would pick tools
+     * again and arrive back at the same guard, which is exactly the loop the
+     * device showed — succeed, suppress, wait 21s, fail, repeat.
+     */
+    if (retryShouldForceFinal(turnRef.current) && forceFinalRef.current) {
+      logRef.current.add('internal', 'retry_requested', { reason: 'forced_final' });
+      forceFinalRef.current();
+      setState((current) => ({ ...current, stalled: null, canRetry: false }));
+      return;
+    }
+
+    logRef.current.add('internal', 'retry_requested', { reason: 'plain' });
     turnRef.current = reduceTurn(turnRef.current, { type: 'retry_requested', at: Date.now() });
 
     // Sent outside `send()` because that lives in the connect closure, so the

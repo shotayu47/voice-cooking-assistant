@@ -290,11 +290,28 @@ describe('recovery', () => {
     expect(state.phase).toBe('recoverable_error');
   });
 
-  it('starts a clean turn when the user speaks again', () => {
+  it('goes back to listening when the user speaks again', () => {
     const stalled = markOverdue(run(committed), 'no_response', T + 20_000);
     const fresh = reduceTurn(stalled, { type: 'speech_started', at: T + 30_000 });
 
     expect(fresh.phase).toBe('listening');
+    expect(fresh.failure).toBeNull();
+  });
+
+  it('starts a clean turn once the new speech is committed', () => {
+    // The budget is tied to a committed turn, not to speech — see
+    // `forced-final.test.ts` for why speech alone must not refresh it.
+    const stalled = markOverdue(run(committed), 'no_response', T + 20_000);
+    const fresh = run(
+      [
+        { type: 'speech_started', at: T + 30_000 },
+        { type: 'speech_stopped', at: T + 31_000 },
+        { type: 'committed', at: T + 31_100 },
+      ],
+      stalled,
+    );
+
+    expect(fresh.phase).toBe('waiting_for_response');
     expect(fresh.failure).toBeNull();
     expect(fresh.callsSeen).toEqual([]);
     expect(fresh.continuationsRequested).toBe(0);

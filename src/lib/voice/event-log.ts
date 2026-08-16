@@ -51,6 +51,8 @@ export type LoggedEvent = {
   detailReason?: string;
   errType?: string;
   errParam?: string;
+  /** SAME / DIFFERENT / FIRST — never the arguments themselves. */
+  argsMatch?: string;
   /** Continuation requests already made on this turn, when a guard fires. */
   continuations?: number;
   /** Whether a response was still active when a decision was taken. */
@@ -85,6 +87,7 @@ const TEXT_FIELDS = new Set([
   'detailReason',
   'errType',
   'errParam',
+  'argsMatch',
 ]);
 const BOOL_FIELDS = new Set(['pendingLiveness', 'sent', 'hasActive']);
 const NUM_FIELDS = new Set(['ms', 'continuations']);
@@ -168,6 +171,7 @@ export function createEventLog(now: () => number = () => Date.now()): EventLog {
                 | 'detailReason'
                 | 'errType'
                 | 'errParam'
+                | 'argsMatch'
             ] = value.slice(0, MAX_TEXT);
           }
           continue;
@@ -227,6 +231,7 @@ export function formatEventLog(entries: LoggedEvent[]): string {
     if (entry.errParam) parts.push(`errParam=${entry.errParam}`);
     if (entry.eventId) parts.push(`evt=${entry.eventId}`);
     if (entry.tool) parts.push(`tool=${entry.tool}`);
+    if (entry.argsMatch) parts.push(`args=${entry.argsMatch}`);
     if (entry.continuations !== undefined) parts.push(`continuations=${entry.continuations}`);
     if (entry.hasActive !== undefined) parts.push(`hasActive=${entry.hasActive}`);
     if (entry.resp) parts.push(`resp=${entry.resp}`);
