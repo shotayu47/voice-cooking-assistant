@@ -142,6 +142,12 @@ type RealtimeEvent = {
       error?: { type?: string; code?: string; param?: string; message?: string };
     };
     output?: RealtimeFunctionCall[];
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      total_tokens?: number;
+      input_token_details?: { cached_tokens?: number };
+    };
   };
   item?: { id?: string; type?: string };
   rate_limits?: RateLimitSnapshot[];
@@ -636,7 +642,17 @@ export function useRealtimeVoice(options: {
           // Kept so a refusal can be paced by what the server reported rather
           // than by a guess. Counts only — no identifiers.
           rateLimitSnapshotsRef.current = event.rate_limits ?? null;
-          logRef.current.add('in', 'rate_limits.updated');
+          // One line per allowance, so the trace can say which one is draining
+          // rather than only that a refusal happened. Counts and an enum name.
+          for (const limit of event.rate_limits ?? []) {
+            logRef.current.add('in', 'rate_limits.updated', {
+              limitName: limit.name,
+              limit: limit.limit,
+              remaining: limit.remaining,
+              resetSeconds: limit.reset_seconds,
+            });
+          }
+          if (!event.rate_limits?.length) logRef.current.add('in', 'rate_limits.updated');
           break;
 
         case 'response.output_audio.done':
@@ -694,7 +710,12 @@ export function useRealtimeVoice(options: {
           // Read before the reducer moves the phase on.
           const wasForcingFinal = isForcingFinal(turnRef.current);
           const details = event.response?.status_details;
+          const usage = event.response?.usage;
           logRef.current.add('in', 'response.done', {
+            inTokens: usage?.input_tokens,
+            outTokens: usage?.output_tokens,
+            totalTokens: usage?.total_tokens,
+            cachedTokens: usage?.input_token_details?.cached_tokens,
             resp: event.response?.id,
             status,
             // The whole point of this pass: `failed` on its own says nothing.
@@ -1020,7 +1041,7 @@ export function useRealtimeVoice(options: {
         return;
       }
 
-      if (send({ type: 'response.create' })) {
+      if (send({ type: 'response.create' }, 'continuation')) {
         logRef.current.add('internal', 'continuation_requested');
         advance({ type: 'continuation_requested', at: Date.now() });
       } else {
@@ -1070,7 +1091,7 @@ export function useRealtimeVoice(options: {
        * `response.done`, and nowhere else.
        */
       cancelWaitingRef.current = active;
-      send({ type: 'response.cancel', response_id: active });
+      send({ type: 'response.cancel', response_id: active }, 'liveness_cancel');
       advance({ type: 'liveness_cancel_sent', at: Date.now(), responseId: active });
     }
 
@@ -1088,7 +1109,7 @@ export function useRealtimeVoice(options: {
           metadata: { purpose: 'liveness' },
           instructions: livenessInstructions(action, describeFailure(turnRef.current)),
         },
-      });
+      }, 'liveness');
 
       if (ok) {
         advance({ type: 'liveness_create_sent', at: Date.now() });
@@ -1129,7 +1150,7 @@ export function useRealtimeVoice(options: {
           metadata: { purpose: 'forced_final' },
           instructions: FORCED_FINAL_INSTRUCTIONS,
         },
-      });
+      }, 'forced_final');
 
       if (!ok) advance({ type: 'channel_lost', at: Date.now() });
     }
@@ -1186,8 +1207,17 @@ export function useRealtimeVoice(options: {
       }
     }
 
+    /** The allowance closest to running out, for attributing a refusal. */
+    function tightestLimit(): RateLimitSnapshot | undefined {
+      const limits = rateLimitSnapshotsRef.current;
+      if (!limits?.length) return undefined;
+      return limits.reduce((lowest, l) =>
+        (l.remaining ?? Infinity) < (lowest.remaining ?? Infinity) ? l : lowest,
+      );
+    }
+
     /** Returns whether the payload actually went out. */
-    function send(payload: { type: string; [key: string]: unknown }): boolean {
+    function send(payload: { type: string; [key: string]: unknown }, purpose?: string): boolean {
       /*
        * An `event_id` on the payloads that can be rejected, so `error.event_id`
        * names which one failed instead of leaving it to be guessed from
@@ -1202,10 +1232,18 @@ export function useRealtimeVoice(options: {
 
       // Only the event type is recorded. The payload can carry a tool result
       // or the instructions text, and neither belongs in a trace.
+      // Purpose plus the tightest allowance at the moment of sending, so a
+      // refusal can be attributed to a kind of request rather than to the
+      // session as a whole.
+      const tightest = tightestLimit();
       logRef.current.add('out', payload.type, {
         sent: open,
         reason: open ? undefined : 'channel_not_open',
+        purpose,
         eventId,
+        limitName: tightest?.name,
+        remaining: tightest?.remaining,
+        resetSeconds: tightest?.reset_seconds,
         active: turnRef.current.activeResponseId ?? undefined,
         pendingLiveness: livenessPendingRef.current,
       });
@@ -1290,6 +1328,7 @@ export function useRealtimeVoice(options: {
     logRef.current.add('out', 'response.create', {
       sent: true,
       eventId,
+      purpose: 'retry',
       reason: 'retry',
       active: turnRef.current.activeResponseId ?? undefined,
     });

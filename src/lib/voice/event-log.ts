@@ -53,6 +53,18 @@ export type LoggedEvent = {
   errParam?: string;
   /** SAME / DIFFERENT / FIRST — never the arguments themselves. */
   argsMatch?: string;
+  /** Why a response.create was sent: continuation, forced_final, liveness, retry. */
+  purpose?: string;
+  /** One `rate_limits.updated` entry: which allowance, and how much is left. */
+  limitName?: string;
+  limit?: number;
+  remaining?: number;
+  resetSeconds?: number;
+  /** Token counts from `response.done.usage`. Counts only, never content. */
+  inTokens?: number;
+  outTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
   /** Continuation requests already made on this turn, when a guard fires. */
   continuations?: number;
   /** Whether a response was still active when a decision was taken. */
@@ -88,9 +100,21 @@ const TEXT_FIELDS = new Set([
   'errType',
   'errParam',
   'argsMatch',
+  'purpose',
+  'limitName',
 ]);
 const BOOL_FIELDS = new Set(['pendingLiveness', 'sent', 'hasActive']);
-const NUM_FIELDS = new Set(['ms', 'continuations']);
+const NUM_FIELDS = new Set([
+  'ms',
+  'continuations',
+  'limit',
+  'remaining',
+  'resetSeconds',
+  'inTokens',
+  'outTokens',
+  'totalTokens',
+  'cachedTokens',
+]);
 
 const MAX_ENTRIES = 400;
 const MAX_TEXT = 40;
@@ -172,6 +196,8 @@ export function createEventLog(now: () => number = () => Date.now()): EventLog {
                 | 'errType'
                 | 'errParam'
                 | 'argsMatch'
+                | 'purpose'
+                | 'limitName'
             ] = value.slice(0, MAX_TEXT);
           }
           continue;
@@ -182,7 +208,18 @@ export function createEventLog(now: () => number = () => Date.now()): EventLog {
         }
         if (NUM_FIELDS.has(key)) {
           if (typeof value === 'number' && Number.isFinite(value)) {
-            entry[key as 'ms' | 'continuations'] = Math.round(value);
+            entry[
+              key as
+                | 'ms'
+                | 'continuations'
+                | 'limit'
+                | 'remaining'
+                | 'resetSeconds'
+                | 'inTokens'
+                | 'outTokens'
+                | 'totalTokens'
+                | 'cachedTokens'
+            ] = Math.round(value);
           }
           continue;
         }
@@ -232,6 +269,15 @@ export function formatEventLog(entries: LoggedEvent[]): string {
     if (entry.eventId) parts.push(`evt=${entry.eventId}`);
     if (entry.tool) parts.push(`tool=${entry.tool}`);
     if (entry.argsMatch) parts.push(`args=${entry.argsMatch}`);
+    if (entry.purpose) parts.push(`purpose=${entry.purpose}`);
+    if (entry.limitName) parts.push(`limit=${entry.limitName}`);
+    if (entry.limit !== undefined) parts.push(`max=${entry.limit}`);
+    if (entry.remaining !== undefined) parts.push(`remaining=${entry.remaining}`);
+    if (entry.resetSeconds !== undefined) parts.push(`resetIn=${entry.resetSeconds}s`);
+    if (entry.inTokens !== undefined) parts.push(`in=${entry.inTokens}`);
+    if (entry.outTokens !== undefined) parts.push(`out=${entry.outTokens}`);
+    if (entry.totalTokens !== undefined) parts.push(`total=${entry.totalTokens}`);
+    if (entry.cachedTokens !== undefined) parts.push(`cached=${entry.cachedTokens}`);
     if (entry.continuations !== undefined) parts.push(`continuations=${entry.continuations}`);
     if (entry.hasActive !== undefined) parts.push(`hasActive=${entry.hasActive}`);
     if (entry.resp) parts.push(`resp=${entry.resp}`);

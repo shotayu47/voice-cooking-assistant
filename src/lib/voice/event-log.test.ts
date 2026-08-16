@@ -168,6 +168,73 @@ describe('why a response did not complete', () => {
   });
 });
 
+describe('what is being measured about rate limits', () => {
+  it('records each allowance separately, so the draining one is identifiable', () => {
+    const { instance } = log();
+    instance.add('in', 'rate_limits.updated', {
+      limitName: 'tokens',
+      limit: 20000,
+      remaining: 143,
+      resetSeconds: 47,
+    });
+
+    expect(instance.entries()[0]).toMatchObject({
+      limitName: 'tokens',
+      limit: 20000,
+      remaining: 143,
+      resetSeconds: 47,
+    });
+  });
+
+  it('records why a response was asked for', () => {
+    const { instance } = log();
+    instance.add('out', 'response.create', { purpose: 'continuation', sent: true });
+
+    expect(instance.entries()[0].purpose).toBe('continuation');
+  });
+
+  it('records token counts, which are numbers and not content', () => {
+    const { instance } = log();
+    instance.add('in', 'response.done', {
+      inTokens: 8123,
+      outTokens: 210,
+      totalTokens: 8333,
+      cachedTokens: 6400,
+    });
+
+    expect(instance.entries()[0]).toMatchObject({
+      inTokens: 8123,
+      outTokens: 210,
+      totalTokens: 8333,
+      cachedTokens: 6400,
+    });
+  });
+
+  it('renders the counts in the copied text', () => {
+    const { instance } = log();
+    instance.add('in', 'response.done', { inTokens: 8123, totalTokens: 8333 });
+
+    expect(formatEventLog(instance.entries())).toContain('in=8123');
+    expect(formatEventLog(instance.entries())).toContain('total=8333');
+  });
+
+  it('refuses a non-number in a count field', () => {
+    const { instance } = log();
+    instance.add('in', 'response.done', { inTokens: '肉じゃが' });
+
+    expect(instance.entries()[0].inTokens).toBeUndefined();
+    expect(JSON.stringify(instance.entries())).not.toContain('肉じゃが');
+  });
+
+  it('refuses a non-finite count', () => {
+    const { instance } = log();
+    instance.add('in', 'response.done', { inTokens: Number.NaN, outTokens: Infinity });
+
+    expect(instance.entries()[0].inTokens).toBeUndefined();
+    expect(instance.entries()[0].outTokens).toBeUndefined();
+  });
+});
+
 describe('what the trace must never record', () => {
   it('drops any field it does not explicitly allow', () => {
     const { instance } = log();
