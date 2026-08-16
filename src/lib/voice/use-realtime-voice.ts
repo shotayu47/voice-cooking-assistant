@@ -597,6 +597,9 @@ export function useRealtimeVoice(options: {
             at: Date.now(),
             responseId: event.response?.id ?? 'unknown',
             status,
+            // Read but never forwarded before, so the reducer could not tell a
+            // barge-in from a genuine cancellation.
+            reason: details?.reason,
           });
 
           // The cancel we were waiting on has reported. This is the only place

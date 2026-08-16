@@ -108,7 +108,18 @@ export type VoiceEvent =
   | { type: 'forced_final_unavailable'; at: number }
   | { type: 'forced_final_looped'; at: number }
   | { type: 'card_shown'; at: number }
-  | { type: 'response_done'; at: number; responseId: string; status: string }
+  | {
+      type: 'response_done';
+      at: number;
+      responseId: string;
+      status: string;
+      /**
+       * `status_details.reason`. `turn_detected` is the one that matters here:
+       * it means the server's VAD ended the response because the user started
+       * speaking, which is the feature working, not a failure.
+       */
+      reason?: string;
+    }
   | { type: 'channel_lost'; at: number }
   | { type: 'api_error'; at: number }
   | { type: 'retry_requested'; at: number };
@@ -288,6 +299,32 @@ export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
           cancellingResponseId: null,
           activeResponseId: null,
           waitingSince: event.at,
+        };
+      }
+
+      /*
+       * The user talked over the assistant.
+       *
+       * `cancelled` with `turn_detected` is the server's VAD reporting that a
+       * new utterance began — the barge-in that the interruption feature
+       * exists to allow. Reading only `status !== 'completed'` turned that
+       * into "応答に失敗しました" plus a retry button, 39ms after the user
+       * started a perfectly ordinary sentence, while the turn that followed
+       * went on to complete normally.
+       *
+       * So it clears the response and leaves everything else alone: the phase
+       * stays `listening`, no failure is recorded, and nothing is shown. Any
+       * other `cancelled`, and every `failed`, still becomes unresolved.
+       */
+      if (event.status === 'cancelled' && event.reason === 'turn_detected') {
+        return {
+          ...state,
+          activeResponseId:
+            state.activeResponseId === event.responseId ? null : state.activeResponseId,
+          interruptedResponseId:
+            state.interruptedResponseId === event.responseId
+              ? null
+              : state.interruptedResponseId,
         };
       }
 
