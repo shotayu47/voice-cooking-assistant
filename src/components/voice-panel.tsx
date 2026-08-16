@@ -92,6 +92,42 @@ export function VoicePanel({
         </div>
       ) : null}
 
+      {live && state.rateLimited ? (
+        /*
+         * Deliberately not the same box as a stall. A rate limit is not a
+         * broken turn — waiting fixes it, and retrying immediately does not,
+         * since refused requests count against the allowance too.
+         */
+        <div
+          className="space-y-2 rounded-xl border border-warn/40 bg-warn/10 px-3 py-2"
+          role="status"
+          aria-live="polite"
+        >
+          <p className="text-sm text-fg">{state.rateLimited.message}</p>
+          <div className="flex gap-2">
+            {state.rateLimited.exhausted ? null : (
+              <button
+                type="button"
+                onClick={retry}
+                disabled={state.rateLimited.secondsLeft > 0}
+                className="min-h-11 flex-1 rounded-lg border border-accent/50 px-3 text-sm text-accent disabled:opacity-40"
+              >
+                {state.rateLimited.secondsLeft > 0
+                  ? `再試行できるまで ${state.rateLimited.secondsLeft}秒`
+                  : 'もう一度応答を試す'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={disconnect}
+              className="min-h-11 flex-1 rounded-lg border border-line px-3 text-sm text-fg active:bg-surface-2"
+            >
+              音声を終了してテキストで続ける
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {live && state.stalled ? (
         /*
          * A committed turn that stopped producing an answer. The call is still

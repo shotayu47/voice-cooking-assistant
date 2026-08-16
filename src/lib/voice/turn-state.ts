@@ -52,7 +52,13 @@ export type TurnFailure =
   /** The guard tripped and the one forced final had already been spent. */
   | 'forced_final_unavailable'
   /** The forced final asked for yet another tool instead of answering. */
-  | 'forced_final_looped';
+  | 'forced_final_looped'
+  /**
+   * The account's token or request allowance ran out. Distinct because the
+   * remedy is different: waiting works, and retrying immediately does not —
+   * failed requests count against the limit too.
+   */
+  | 'rate_limited';
 
 export type TurnState = {
   phase: TurnPhase;
@@ -119,6 +125,8 @@ export type VoiceEvent =
        * speaking, which is the feature working, not a failure.
        */
       reason?: string;
+      /** `status_details.error.code`, e.g. `rate_limit_exceeded`. */
+      errorCode?: string;
     }
   | { type: 'channel_lost'; at: number }
   | { type: 'api_error'; at: number }
@@ -365,7 +373,9 @@ export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
         return {
           ...cleared,
           phase: 'unresolved',
-          failure: toFailure(event.status),
+          // A refusal on rate is not the same kind of failure as a broken
+          // turn, and must not be offered the same instant retry.
+          failure: event.errorCode === 'rate_limit_exceeded' ? 'rate_limited' : toFailure(event.status),
           waitingSince: event.at,
         };
       }
@@ -545,6 +555,10 @@ export function describeFailure(state: TurnState): string | null {
       return `応答が最後まで届きませんでした。${suffix}`;
     case 'channel_lost':
       return '接続が切れたため、応答を受け取れませんでした。';
+    case 'rate_limited':
+      // The wording and the wait live in `rate-limit.ts`; the panel shows that
+      // instead of this, which is only the fallback.
+      return '利用制限のため、少し待ってから再試行できます。';
     case 'forced_final_unavailable':
     case 'forced_final_looped':
       // Distinct wording on purpose: the work was done, the sentence was not.

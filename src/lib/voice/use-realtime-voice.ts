@@ -6,6 +6,15 @@ import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
 import { argumentSignature, compareSignature } from './arg-signature';
 import { classifyErrorMessage } from './error-classify';
+import {
+  afterRateLimit,
+  canRetryAfterRateLimit,
+  cooldownSecondsLeft,
+  describeRateLimit,
+  NO_RATE_LIMIT,
+  type RateLimitSnapshot,
+  type RateLimitState,
+} from './rate-limit';
 import { createEventLog, formatEventLog } from './event-log';
 import {
   classifyUtterance,
@@ -71,6 +80,12 @@ export type VoiceState = {
   stalled: string | null;
   /** Whether re-asking for a response on the unfinished turn is safe. */
   canRetry: boolean;
+  /**
+   * Set only when the API refused on rate. Separate from `stalled` so the UI
+   * never shows a rate limit as a generic failure, and so the wait can be
+   * counted down.
+   */
+  rateLimited: { message: string; secondsLeft: number; exhausted: boolean } | null;
 };
 
 export type ToolEffect = {
@@ -99,6 +114,7 @@ const INITIAL_STATE: VoiceState = {
   error: null,
   stalled: null,
   canRetry: false,
+  rateLimited: null,
 };
 
 type RealtimeEvent = {
@@ -123,6 +139,7 @@ type RealtimeEvent = {
     output?: RealtimeFunctionCall[];
   };
   item?: { id?: string; type?: string };
+  rate_limits?: RateLimitSnapshot[];
   error?: {
     type?: string;
     code?: string;
@@ -264,6 +281,10 @@ export function useRealtimeVoice(options: {
   /** Step advances already authorised this turn. At most one. */
   const advancesThisTurnRef = useRef(0);
 
+  /** Latest `rate_limits.updated`, for pacing a refusal by the server's own numbers. */
+  const rateLimitSnapshotsRef = useRef<RateLimitSnapshot[] | null>(null);
+  const rateLimitRef = useRef<RateLimitState>(NO_RATE_LIMIT);
+
   const onToolEffectRef = useRef(options.onToolEffect);
   useEffect(() => {
     onToolEffectRef.current = options.onToolEffect;
@@ -273,6 +294,17 @@ export function useRealtimeVoice(options: {
   useEffect(() => {
     onSuggestionsRef.current = options.onSuggestions;
   }, [options.onSuggestions]);
+
+  /** The rate-limit banner as the UI needs it, recomputed on each tick. */
+  const rateLimitView = useCallback(() => {
+    const now = Date.now();
+    const verdict = canRetryAfterRateLimit(rateLimitRef.current, now);
+    return {
+      message: describeRateLimit(rateLimitRef.current, now),
+      secondsLeft: cooldownSecondsLeft(rateLimitRef.current, now),
+      exhausted: verdict === 'exhausted',
+    };
+  }, []);
 
   const teardown = useCallback(() => {
     if (watchdogRef.current) {
@@ -406,6 +438,11 @@ export function useRealtimeVoice(options: {
          * event *not* arriving, so it needs a clock.
          */
         watchdogRef.current = setInterval(() => {
+          // Keep the cooldown label counting down while it is on screen.
+          if (turnRef.current.failure === 'rate_limited') {
+            setState((current) => ({ ...current, rateLimited: rateLimitView() }));
+          }
+
           const failure = overdue(turnRef.current, Date.now());
           if (!failure) return;
 
@@ -512,12 +549,32 @@ export function useRealtimeVoice(options: {
         });
       }
 
+      /*
+       * A rate limit gets its own state, its own words and its own wait.
+       * Showing it as "応答に失敗しました" with an enabled retry button is what
+       * produced five refusals in a row — and failed requests count against
+       * the allowance too, so impatience is self-defeating.
+       */
+      if (after.failure === 'rate_limited' && before.failure !== 'rate_limited') {
+        rateLimitRef.current = afterRateLimit(
+          rateLimitRef.current,
+          Date.now(),
+          rateLimitSnapshotsRef.current,
+        );
+        logRef.current.add('internal', 'rate_limited', {
+          reason: rateLimitSnapshotsRef.current ? 'server_reset' : 'backoff',
+          ms: rateLimitRef.current.cooldownUntil - Date.now(),
+          continuations: rateLimitRef.current.attempts,
+        });
+      }
+
       const stalled = describeFailure(after);
-      setState((current) =>
-        current.stalled === stalled && current.canRetry === canRetry(after)
-          ? current
-          : { ...current, stalled, canRetry: canRetry(after) },
-      );
+      setState((current) => ({
+        ...current,
+        stalled: after.failure === 'rate_limited' ? null : stalled,
+        canRetry: after.failure === 'rate_limited' ? false : canRetry(after),
+        rateLimited: after.failure === 'rate_limited' ? rateLimitView() : null,
+      }));
     }
 
     async function handleEvent(event: RealtimeEvent) {
@@ -545,6 +602,7 @@ export function useRealtimeVoice(options: {
           committedTurnRef.current += 1;
           turnTranscriptRef.current = null;
           advancesThisTurnRef.current = 0;
+          rateLimitRef.current = NO_RATE_LIMIT;
           advance({ type: 'committed', at: Date.now() });
           break;
 
@@ -567,6 +625,13 @@ export function useRealtimeVoice(options: {
             ...current,
             notice: '聞き取れませんでした。もう一度話しかけてください。',
           }));
+          break;
+
+        case 'rate_limits.updated':
+          // Kept so a refusal can be paced by what the server reported rather
+          // than by a guess. Counts only — no identifiers.
+          rateLimitSnapshotsRef.current = event.rate_limits ?? null;
+          logRef.current.add('in', 'rate_limits.updated');
           break;
 
         case 'response.output_audio.done':
@@ -648,6 +713,7 @@ export function useRealtimeVoice(options: {
             // Read but never forwarded before, so the reducer could not tell a
             // barge-in from a genuine cancellation.
             reason: details?.reason,
+            errorCode: details?.error?.code ?? undefined,
           });
 
           // The cancel we were waiting on has reported. This is the only place
@@ -1129,7 +1195,7 @@ export function useRealtimeVoice(options: {
 
       return open;
     }
-  }, [failWith, teardown]);
+  }, [failWith, teardown, rateLimitView]);
 
   /**
    * iOS suspends WebRTC when the tab is backgrounded or the screen locks. On
@@ -1161,7 +1227,20 @@ export function useRealtimeVoice(options: {
    * the user decide, not to retry on a timer behind their back.
    */
   const retry = useCallback(() => {
-    if (!canRetry(turnRef.current)) return;
+    /*
+     * A rate-limited turn has its own gate. Tapping through the cooldown, or
+     * past the per-turn ceiling, must not put another request on the wire.
+     */
+    if (turnRef.current.failure === 'rate_limited') {
+      const verdict = canRetryAfterRateLimit(rateLimitRef.current, Date.now());
+      if (verdict !== 'allowed') {
+        logRef.current.add('internal', 'retry_blocked', { reason: verdict });
+        setState((current) => ({ ...current, rateLimited: rateLimitView() }));
+        return;
+      }
+    }
+
+    if (!canRetry(turnRef.current) && turnRef.current.failure !== 'rate_limited') return;
     if (channelRef.current?.readyState !== 'open') {
       setState((current) => ({
         ...current,
@@ -1180,7 +1259,7 @@ export function useRealtimeVoice(options: {
     if (retryShouldForceFinal(turnRef.current) && forceFinalRef.current) {
       logRef.current.add('internal', 'retry_requested', { reason: 'forced_final' });
       forceFinalRef.current();
-      setState((current) => ({ ...current, stalled: null, canRetry: false }));
+      setState((current) => ({ ...current, stalled: null, canRetry: false, rateLimited: null }));
       return;
     }
 
@@ -1197,8 +1276,8 @@ export function useRealtimeVoice(options: {
       reason: 'retry',
       active: turnRef.current.activeResponseId ?? undefined,
     });
-    setState((current) => ({ ...current, stalled: null, canRetry: false }));
-  }, []);
+    setState((current) => ({ ...current, stalled: null, canRetry: false, rateLimited: null }));
+  }, [rateLimitView]);
 
   /**
    * The redacted trace, for a bug report. Never any content.
