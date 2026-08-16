@@ -14,6 +14,7 @@ import {
   type LivenessAction,
 } from './liveness';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
+import { decideRepeat, repeatKey, replayedOutput } from './tool-repeat';
 import {
   canExecuteCall,
   canForceFinal,
@@ -156,7 +157,12 @@ const WATCHDOG_INTERVAL_MS = 2_000;
 const FORCED_FINAL_INSTRUCTIONS = [
   'すでに取得済みのツール結果だけを使って、ユーザーへの回答を今すぐ完成させてください。',
   'これ以上ツールを呼び出すことはできません。追加の情報取得を試みないでください。',
-  '手元の結果で答えられない部分があれば、その旨を一言添えてください。',
+  // The device said "候補を上げるから待って" and then stopped: the response
+  // completed and nothing was pending. Nothing runs after this reply, so a
+  // promise to continue is a promise that will never be kept.
+  '「お待ちください」「あとで」「これから調べます」など、この応答のあとに何かを実行すると約束してはいけません。',
+  'この応答で完結させ、実行していない処理を予告しないでください。',
+  '手元の結果で答えられない部分があれば、「今回は取得できませんでした」と述べてください。',
 ].join('\n');
 
 /**
@@ -228,6 +234,12 @@ export function useRealtimeVoice(options: {
    * Digests only — the arguments are never retained.
    */
   const lastSignatureRef = useRef<Map<string, string>>(new Map());
+  /**
+   * Calls already completed this turn, keyed by tool + argument digest, with
+   * what they returned. Digests and results only — no arguments are retained.
+   */
+  const ranThisTurnRef = useRef<Set<string>>(new Set());
+  const lastResultRef = useRef<Map<string, unknown>>(new Map());
 
   const onToolEffectRef = useRef(options.onToolEffect);
   useEffect(() => {
@@ -500,6 +512,11 @@ export function useRealtimeVoice(options: {
 
         case 'input_audio_buffer.committed':
           logRef.current.add('in', 'input_audio_buffer.committed', { item: event.item_id });
+          // A new request may legitimately ask for the same recipe again, so
+          // the repeat memory is scoped to the turn, exactly like the budget.
+          ranThisTurnRef.current.clear();
+          lastResultRef.current.clear();
+          lastSignatureRef.current.clear();
           advance({ type: 'committed', at: Date.now() });
           break;
 
@@ -686,6 +703,27 @@ export function useRealtimeVoice(options: {
       const argsMatch = compareSignature(lastSignatureRef.current.get(name), signature);
       if (signature !== null) lastSignatureRef.current.set(name, signature);
 
+      /*
+       * A repeat of the same call, not merely a repeat of the same id.
+       * `create_recipe` ran twice in one QA turn with different ids — the
+       * first failed on unparseable arguments and the model tried again —
+       * and nothing in the id-based guard could see that they were the same
+       * request. The model still needs an output for this call_id, so the
+       * earlier result is replayed rather than the call being dropped.
+       */
+      const repeat = decideRepeat(name, signature, ranThisTurnRef.current);
+      if (repeat === 'replay' && signature !== null) {
+        const key = repeatKey(name, signature);
+        logRef.current.add('internal', 'tool_repeat_skipped', {
+          tool: name,
+          call: callId,
+          argsMatch,
+          reason: 'same_signature',
+        });
+        deliverToolOutput(callId, replayedOutput(lastResultRef.current.get(key)));
+        return;
+      }
+
       logRef.current.add('internal', 'tool_start', { tool: name, call: callId, argsMatch });
       setState((current) => ({ ...current, activeTool: name, notice: null }));
       try {
@@ -744,6 +782,29 @@ export function useRealtimeVoice(options: {
 
         if (body.effect) {
           onToolEffectRef.current?.({ effect: body.effect, sessionId: body.session_id });
+        }
+
+        /*
+         * Remember what this exact call produced, so a repeat is answered from
+         * it rather than run again — but only when it actually worked.
+         *
+         * `executeTool` returns failures as data with HTTP 200, so `ok` alone
+         * would record `invalid_arguments` as a completed call and block the
+         * corrected retry. That retry is the one thing this turn genuinely
+         * needed to be allowed to do.
+         */
+        const succeeded =
+          response.ok &&
+          !(
+            body.result &&
+            typeof body.result === 'object' &&
+            'error' in (body.result as Record<string, unknown>)
+          );
+
+        if (succeeded && signature !== null) {
+          const key = repeatKey(name, signature);
+          ranThisTurnRef.current.add(key);
+          lastResultRef.current.set(key, body.result);
         }
 
         deliverToolOutput(callId, body.result);

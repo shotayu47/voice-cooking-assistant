@@ -9,6 +9,7 @@ import {
   INITIAL_TURN,
   isUnresolved,
   markOverdue,
+  MAX_TOOL_ROUNDS,
   overdue,
   reduceTurn,
   TURN_TIMEOUTS,
@@ -134,12 +135,15 @@ describe('3 — one tool event, however many times it arrives', () => {
     expect(state.outputsSent).toEqual(['call_a']);
   });
 
-  it('asks for one continuation at most, per turn', () => {
-    const state = run([
-      ...committed,
-      { type: 'tool_output_sent', at: T + 3000, callId: 'call_a' },
-      { type: 'continuation_requested', at: T + 3100 },
-    ]);
+  it('bounds continuations to a finite budget per turn', () => {
+    // Was one, which could not express create_recipe → suggest_shopping_items
+    // — see `multi-tool-flow.test.ts`. It is still a hard ceiling.
+    let state = run([...committed, { type: 'tool_output_sent', at: T + 3000, callId: 'call_a' }]);
+
+    for (let i = 0; i < MAX_TOOL_ROUNDS; i += 1) {
+      expect(canRequestContinuation(state)).toBe(true);
+      state = reduceTurn(state, { type: 'continuation_requested', at: T + 3100 + i });
+    }
 
     expect(canRequestContinuation(state)).toBe(false);
   });

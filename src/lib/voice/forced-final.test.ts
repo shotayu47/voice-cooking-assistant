@@ -7,6 +7,7 @@ import {
   canRetry,
   describeFailure,
   INITIAL_TURN,
+  MAX_TOOL_ROUNDS,
   isForcingFinal,
   overdue,
   reduceTurn,
@@ -72,17 +73,31 @@ describe('A — a tool, its output, and a spoken answer', () => {
   });
 });
 
-describe('B/C — the guard trips on a second tool', () => {
-  /** R2 asks for another tool; its output is delivered; the budget is spent. */
+describe('B/C — the guard trips when the budget runs out', () => {
+  /**
+   * Every round the budget allows, then one more tool whose output has been
+   * delivered with nothing left to answer it.
+   *
+   * The budget used to be one, so this state was reached on the *second* tool
+   * — which is why the canonical create_recipe → suggest_shopping_items flow
+   * could never finish. It is now the ceiling in `multi-tool-flow.test.ts`;
+   * what happens once it is reached is what this file is about.
+   */
   const secondTool: VoiceEvent[] = [
     ...firstTool,
-    { type: 'response_created', at: T + 2300, responseId: 'R2' },
-    { type: 'function_call_ready', at: T + 2800, callId: 'C2' },
-    { type: 'response_done', at: T + 2900, responseId: 'R2', status: 'completed' },
-    { type: 'tool_output_sent', at: T + 3300, callId: 'C2' },
+    ...Array.from({ length: MAX_TOOL_ROUNDS - 1 }, (_, i) => [
+      { type: 'response_created' as const, at: T + 2300 + i * 100, responseId: `Rx${i}` },
+      { type: 'tool_output_sent' as const, at: T + 2340 + i * 100, callId: `Cx${i}` },
+      { type: 'response_done' as const, at: T + 2360 + i * 100, responseId: `Rx${i}`, status: 'completed' },
+      { type: 'continuation_requested' as const, at: T + 2380 + i * 100 },
+    ]).flat(),
+    { type: 'response_created', at: T + 4300, responseId: 'R2' },
+    { type: 'function_call_ready', at: T + 4800, callId: 'C2' },
+    { type: 'response_done', at: T + 4900, responseId: 'R2', status: 'completed' },
+    { type: 'tool_output_sent', at: T + 5300, callId: 'C2' },
   ];
 
-  it('refuses a second continuation', () => {
+  it('refuses a further continuation once the budget is spent', () => {
     expect(canRequestContinuation(run(secondTool))).toBe(false);
   });
 

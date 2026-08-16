@@ -15,7 +15,7 @@
  *
  *   1. at most one first response per user turn
  *   2. at most one `function_call_output` per call id
- *   3. at most one continuation `response.create` per turn
+ *   3. at most `MAX_TOOL_ROUNDS` continuation `response.create`s per turn
  *   4. never a `response.create` while a response is still active
  *   5. only `status === 'completed'` counts as a completed response
  *   6. an unresolved turn is never silently replaced by the next request
@@ -148,6 +148,27 @@ export const INITIAL_TURN: TurnState = {
  * the 30s fetch timeout the tool relay already uses, so a slow-but-working
  * turn is never cut off and a dead one does not hang indefinitely.
  */
+/**
+ * How many tool round trips one committed turn may take.
+ *
+ * It was 1, which cannot express the flows this app is built around. The
+ * canonical ones cost a continuation each:
+ *
+ *   create_recipe → suggest_shopping_items                     2
+ *   search_meal_candidates → create_recipe → suggest_shopping  3
+ *
+ * so a budget of 1 ended the turn after the first tool and the shopping
+ * suggestion was never reached — the model was cut off mid-plan and filled the
+ * silence with a promise to do it later.
+ *
+ * Six leaves room for those three rounds plus a retry at each stage, which the
+ * device needed: a `create_recipe` whose arguments failed to parse was retried
+ * and the retry alone exhausted the old budget. It stays a hard ceiling, so an
+ * endless tool loop still terminates — and repeats of the *same* call are
+ * caught earlier and more precisely by signature.
+ */
+export const MAX_TOOL_ROUNDS = 6;
+
 export const TURN_TIMEOUTS = {
   /** Committed, but no `response.created` came back. */
   noResponseMs: 12_000,
@@ -414,7 +435,7 @@ export function canSendToolOutput(state: TurnState, callId: string): boolean {
  * response — which the API rejects, leaving the turn with no answer at all.
  */
 export function canRequestContinuation(state: TurnState): boolean {
-  return state.continuationsRequested === 0 && state.activeResponseId === null;
+  return state.continuationsRequested < MAX_TOOL_ROUNDS && state.activeResponseId === null;
 }
 
 /**
