@@ -252,8 +252,10 @@ export function ChatView({
            * candidates. Voice cannot operate a card mid-call, so the point is
            * that it is waiting on screen when the call ends.
            */
-          onSuggestions={({ callId, suggestions }) => {
-            setMessages((current) => withVoiceSuggestions(current, callId, suggestions));
+          onSuggestions={({ callId, suggestions, chain, revised }) => {
+            setMessages((current) =>
+              withVoiceSuggestions(current, callId, suggestions, { chain, revised }),
+            );
           }}
           onToolEffect={(effect) => {
             // Navigating would kill the live call mid-sentence, so surface the

@@ -7,6 +7,12 @@
  * the API directly, which skips the client entirely.
  */
 
+import {
+  lineageKeyOf,
+  recipeIdsOf,
+  REVISED_CARD_NOTICE,
+  type RevisionChain,
+} from './card-lineage';
 import type { ShoppingSuggestion } from './suggest';
 
 /** The shape `/api/chat` returns, as far as the card is concerned. */
@@ -21,6 +27,12 @@ export type ChatMessage = {
   content: string;
   /** Absent unless this turn produced candidates. */
   suggestions?: ShoppingSuggestion[];
+  /**
+   * Which dish this card is about, stable across revisions of its recipe.
+   * A new result for the same lineage replaces the card rather than stacking
+   * a second one beside it.
+   */
+  lineageKey?: string;
 };
 
 /**
@@ -70,20 +82,37 @@ export function withVoiceSuggestions(
   messages: ChatMessage[],
   callId: string,
   suggestions: ShoppingSuggestion[],
+  options: { chain?: RevisionChain; revised?: boolean } = {},
 ): ChatMessage[] {
   // Structured output only, and only when there is something to pick from.
+  // A failed revision or a failed suggestion leaves the old card standing.
   if (suggestions.length === 0) return messages;
 
+  const chain = options.chain ?? new Map<string, string>();
+  const lineageKey = lineageKeyOf(recipeIdsOf(suggestions), chain);
+
   const id = `voice-${callId}`;
-  const card = assistantMessage(id, {
-    reply: VOICE_SUGGESTION_CAPTION,
-    shoppingSuggestions: suggestions,
-  });
+  const card: ChatMessage = {
+    ...assistantMessage(id, {
+      reply: options.revised ? REVISED_CARD_NOTICE : VOICE_SUGGESTION_CAPTION,
+      shoppingSuggestions: suggestions,
+    }),
+    lineageKey,
+  };
 
-  const existing = messages.findIndex((message) => message.id === id);
-  if (existing === -1) return [...messages, card];
+  /*
+   * Replace by lineage, not by call id.
+   *
+   * The old card is dropped and the new one appended rather than swapped in
+   * place, so the card remounts: a fresh card starts with everything
+   * unchecked, and any selection the user had made but not confirmed on the
+   * superseded card goes with it. Nothing already added to the shopping list
+   * is touched — that lives in the database and is the user's.
+   */
+  const kept = messages.filter(
+    (message) => !(hasSuggestionCard(message) && message.lineageKey === lineageKey),
+  );
 
-  const next = [...messages];
-  next[existing] = card;
-  return next;
+  // Cards for other dishes are untouched by all of this.
+  return [...kept, card];
 }

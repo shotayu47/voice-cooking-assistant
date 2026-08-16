@@ -50,7 +50,7 @@ describe('1 — a voice tool result lands in the same state as the text path', (
     expect(card.role).toBe('assistant');
   });
 
-  it('is identical to what the text path builds from the same candidates', () => {
+  it('carries the same card content as the text path', () => {
     const candidates = [suggestion('じゃがいも'), suggestion('だし汁')];
     const [voice] = withVoiceSuggestions([], 'call_1', candidates);
     const text = assistantMessage(voice.id, {
@@ -58,7 +58,12 @@ describe('1 — a voice tool result lands in the same state as the text path', (
       shoppingSuggestions: candidates,
     });
 
-    expect(voice).toEqual(text);
+    // The voice card additionally carries a lineage key, which is what lets a
+    // revised recipe replace its predecessor's card. Everything the card is
+    // rendered from is the same.
+    const { lineageKey, ...rendered } = voice;
+    expect(rendered).toEqual(text);
+    expect(lineageKey).toBeDefined();
   });
 
   it('captions the card with fixed text, not the assistant sentence', () => {
@@ -117,15 +122,27 @@ describe('5-6 — repeated and multiple tool calls', () => {
     expect(updated[0].suggestions).toHaveLength(2);
   });
 
-  it('keeps both cards when two different calls return candidates', () => {
+  it('keeps both cards when the calls are about different dishes', () => {
     const first = withVoiceSuggestions([], 'call_1', [suggestion('じゃがいも')]);
-    const second = withVoiceSuggestions(first, 'call_2', [suggestion('だし汁')]);
+    const second = withVoiceSuggestions(first, 'call_2', [
+      { ...suggestion('だし汁'), sourceRecipes: [{ recipeId: 'r2', title: '味噌汁' }] },
+    ]);
 
     expect(second).toHaveLength(2);
     expect(second.flatMap((m) => m.suggestions ?? []).map((s) => s.name)).toEqual([
       'じゃがいも',
       'だし汁',
     ]);
+  });
+
+  it('replaces rather than stacks when the dish is the same', () => {
+    // Both results are about recipe r1. Two cards for one dish is what left a
+    // stale set of candidates on screen beside the current one.
+    const first = withVoiceSuggestions([], 'call_1', [suggestion('じゃがいも')]);
+    const second = withVoiceSuggestions(first, 'call_2', [suggestion('だし汁')]);
+
+    expect(second).toHaveLength(1);
+    expect(second[0].suggestions?.map((s) => s.name)).toEqual(['だし汁']);
   });
 
   it('keeps the spoken transcript around the cards', () => {

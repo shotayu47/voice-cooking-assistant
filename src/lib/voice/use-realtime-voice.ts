@@ -109,6 +109,14 @@ export type ToolEffect = {
 export type VoiceSuggestions = {
   callId: string;
   suggestions: ShoppingSuggestion[];
+  /**
+   * Revisions seen in this turn: new recipe id → the one it replaced. Lets the
+   * page recognise candidates for a revised recipe as the same card, rather
+   * than a second one beside the now-stale original.
+   */
+  chain: Map<string, string>;
+  /** True when a revision in this turn produced these candidates. */
+  revised: boolean;
 };
 
 const INITIAL_STATE: VoiceState = {
@@ -290,6 +298,15 @@ export function useRealtimeVoice(options: {
    */
   const committedTurnRef = useRef(0);
   const turnTranscriptRef = useRef<{ turn: number; text: string } | null>(null);
+  /**
+   * Revisions made in this committed turn, newest recipe id → the one it
+   * supersedes. Held only for the turn: correlating a later suggestion with an
+   * earlier revision is the point, and nothing older is relevant.
+   */
+  const revisionChainRef = useRef<Map<string, string>>(new Map());
+  /** Whether a revision happened in this turn, for the card's wording. */
+  const revisedThisTurnRef = useRef(false);
+
   /** Step moves already authorised this turn, either direction. At most one. */
   const advancesThisTurnRef = useRef(0);
 
@@ -614,6 +631,8 @@ export function useRealtimeVoice(options: {
           committedTurnRef.current += 1;
           turnTranscriptRef.current = null;
           advancesThisTurnRef.current = 0;
+          revisionChainRef.current = new Map();
+          revisedThisTurnRef.current = false;
           rateLimitRef.current = NO_RATE_LIMIT;
           advance({ type: 'committed', at: Date.now() });
           break;
@@ -972,8 +991,30 @@ export function useRealtimeVoice(options: {
          * it after the sends meant a failure to deliver the output could take
          * the card with it — losing the one part that worked.
          */
+        /*
+         * A revision reports both ids. Recording it here — from the tool's
+         * structured result, never from what the assistant said — is what lets
+         * the next suggestion be recognised as the same card.
+         */
+        if (name === 'revise_recipe') {
+          const revision = body.result as { recipe_id?: unknown; supersedes_recipe_id?: unknown };
+          if (
+            typeof revision?.recipe_id === 'string' &&
+            typeof revision?.supersedes_recipe_id === 'string'
+          ) {
+            revisionChainRef.current.set(revision.recipe_id, revision.supersedes_recipe_id);
+            revisedThisTurnRef.current = true;
+            logRef.current.add('internal', 'recipe_revised', { call: callId });
+          }
+        }
+
         if (body.suggestions && body.suggestions.length > 0) {
-          onSuggestionsRef.current?.({ callId, suggestions: body.suggestions });
+          onSuggestionsRef.current?.({
+            callId,
+            suggestions: body.suggestions,
+            chain: new Map(revisionChainRef.current),
+            revised: revisedThisTurnRef.current,
+          });
           advance({ type: 'card_shown', at: Date.now() });
         }
 
