@@ -30,6 +30,7 @@ import {
   refusedAdvanceOutput,
   refusedPreviousOutput,
 } from './step-intent';
+import { continuationAfterTool } from './integrated-final';
 import { decideRepeat, repeatKey, replayedOutput } from './tool-repeat';
 import {
   canExecuteCall,
@@ -286,7 +287,9 @@ export function useRealtimeVoice(options: {
    * what they returned. Digests and results only — no arguments are retained.
    */
   const ranThisTurnRef = useRef<Set<string>>(new Set());
-  const lastResultRef = useRef<Map<string, unknown>>(new Map());
+  const lastResultRef = useRef<
+    Map<string, { result: unknown; suggestions: ShoppingSuggestion[] | null }>
+  >(new Map());
 
   /**
    * The recognition result for the current committed turn, and which turn it
@@ -878,7 +881,7 @@ export function useRealtimeVoice(options: {
             reason: decision,
           });
           setState((current) => ({ ...current, activeTool: null }));
-          deliverToolOutput(callId, refusedInventoryOutput(decision));
+          deliverToolOutput(callId, refusedInventoryOutput(decision), name);
           return;
         }
 
@@ -909,6 +912,7 @@ export function useRealtimeVoice(options: {
             goingBack
               ? refusedPreviousOutput(decision, currentStep)
               : refusedAdvanceOutput(decision, currentStep),
+            name,
           );
           return;
         }
@@ -920,13 +924,32 @@ export function useRealtimeVoice(options: {
       const repeat = decideRepeat(name, signature, ranThisTurnRef.current);
       if (repeat === 'replay' && signature !== null) {
         const key = repeatKey(name, signature);
+        const previous = lastResultRef.current.get(key);
         logRef.current.add('internal', 'tool_repeat_skipped', {
           tool: name,
           call: callId,
           argsMatch,
           reason: 'same_signature',
         });
-        deliverToolOutput(callId, replayedOutput(lastResultRef.current.get(key)));
+
+        /*
+         * The candidates come back too, from the same stored result rather
+         * than a second computation. Keyed by lineage, the card replaces the
+         * one the first run drew instead of appearing beside it — and the
+         * recipe row, which is what a repeat would really have cost, is never
+         * written a second time because the tool does not run.
+         */
+        if (previous?.suggestions && previous.suggestions.length > 0) {
+          onSuggestionsRef.current?.({
+            callId,
+            suggestions: previous.suggestions,
+            chain: new Map(revisionChainRef.current),
+            revised: revisedThisTurnRef.current,
+          });
+          advance({ type: 'card_shown', at: Date.now() });
+        }
+
+        deliverToolOutput(callId, replayedOutput(previous?.result), name);
         return;
       }
 
@@ -1042,19 +1065,29 @@ export function useRealtimeVoice(options: {
         if (succeeded && signature !== null) {
           const key = repeatKey(name, signature);
           ranThisTurnRef.current.add(key);
-          lastResultRef.current.set(key, body.result);
+          // The candidates are stored beside the result, not inside it: the
+          // card is drawn from this structured list, so a replay that kept
+          // only `result` would answer the model and leave the screen behind.
+          lastResultRef.current.set(key, {
+            result: body.result,
+            suggestions: body.suggestions ?? null,
+          });
         }
 
-        deliverToolOutput(callId, body.result);
+        deliverToolOutput(callId, body.result, name);
       } catch {
         // Timed out or offline. Tell the model so it can say something rather
         // than waiting forever for an output that will never arrive.
         logRef.current.add('internal', 'tool_failed', { tool: name, call: callId, ms: Date.now() - startedAt });
         setState((current) => ({ ...current, notice: '操作がタイムアウトしました' }));
-        deliverToolOutput(callId, {
-          error: 'tool_unreachable',
-          message: 'サーバーに接続できませんでした。ユーザーに再試行を促してください。',
-        });
+        deliverToolOutput(
+          callId,
+          {
+            error: 'tool_unreachable',
+            message: 'サーバーに接続できませんでした。ユーザーに再試行を促してください。',
+          },
+          name,
+        );
       } finally {
         setState((current) => ({ ...current, activeTool: null }));
       }
@@ -1069,7 +1102,7 @@ export function useRealtimeVoice(options: {
      * started one, and a second concurrent request is refused, which is how a
      * turn ended up with no reply rather than two.
      */
-    function deliverToolOutput(callId: string, result: unknown) {
+    function deliverToolOutput(callId: string, result: unknown, tool: string) {
       if (!canSendToolOutput(turnRef.current, callId)) {
         logRef.current.add('internal', 'output_suppressed', { call: callId, reason: 'already_sent' });
         return;
@@ -1118,8 +1151,19 @@ export function useRealtimeVoice(options: {
         return;
       }
 
-      if (send({ type: 'response.create' }, 'continuation')) {
-        logRef.current.add('internal', 'continuation_requested');
+      /*
+       * A recipe tool that brought its candidates back with it has answered
+       * both halves of the request, so what follows is the closing reply with
+       * `tool_choice: 'none'` rather than another round of tools. It still
+       * spends a continuation and stays under the same guard and watchdog —
+       * only the payload differs.
+       */
+      const continuation = continuationAfterTool(tool, result);
+
+      if (send(continuation.payload, continuation.purpose)) {
+        logRef.current.add('internal', 'continuation_requested', {
+          purpose: continuation.purpose,
+        });
         advance({ type: 'continuation_requested', at: Date.now() });
       } else {
         advance({ type: 'channel_lost', at: Date.now() });

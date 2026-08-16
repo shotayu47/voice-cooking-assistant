@@ -24,6 +24,7 @@ import {
   buildShoppingSuggestions,
   normalizeRecipeIds,
   type ShoppingSuggestion,
+  type SuggestionRecipe,
 } from '@/lib/shopping/suggest';
 import {
   getCurrentStep,
@@ -53,7 +54,7 @@ import {
   surplusItems,
 } from '@/lib/meals/classification';
 import { evaluateCandidates, MISSING_REASON_LABELS } from '@/lib/meals/evaluate';
-import type { InventoryItem, Recipe } from '@/types/domain';
+import type { InventoryItem, Recipe, StoredRecipe } from '@/types/domain';
 
 /**
  * Tool definitions (SPEC §8).
@@ -292,11 +293,22 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
     function: {
       name: 'create_recipe',
       description:
-        'レシピを保存する。steps は必ず1工程1動作に分割すること。返り値の recipe_id を start_cooking_session に渡す。',
+        `レシピを保存する。steps は必ず1工程1動作に分割すること。返り値の recipe_id を start_cooking_session に渡す。
+同じ発話で買い物候補も求められている場合は include_shopping_suggestions を true にすること。
+そうすれば候補はこの結果に同梱されて返るので、続けて suggest_shopping_items を呼ぶ必要はない。`,
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string' },
+          include_shopping_suggestions: {
+            type: 'boolean',
+            description:
+              `このレシピの不足材料から買い物候補も同時に出すかどうか。
+true … 「レシピを作って、足りないものも教えて」のように、レシピと買い物候補の両方を求められた場合。
+false … レシピを作るだけの場合。
+既存レシピの候補だけを求められた場合は、このツールではなく suggest_shopping_items を使うこと。
+調味料も候補に含めたい場合も suggest_shopping_items（include_staples）を使う。`,
+          },
           description: { type: ['string', 'null'] },
           servings: { type: 'integer' },
           estimated_minutes: { type: ['integer', 'null'] },
@@ -354,6 +366,7 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
           'difficulty',
           'ingredients',
           'steps',
+          'include_shopping_suggestions',
         ],
         additionalProperties: false,
       },
@@ -373,13 +386,23 @@ spoken_name にはユーザーが実際に言った食材名をそのまま入�
 このツールを使うこと。口頭で「変更しました」と言うだけでは、実際には何も変わらない。
 source_recipe_id に元の recipe_id を渡し、**変更後の完全なレシピ**を create_recipe と同じ形で渡すこと。
 差分ではなく全体を渡す。返り値の recipe_id が新しい版で、以後はこちらを使う。
-買い物候補も求められている場合は、成功後にその新しい recipe_id で suggest_shopping_items を呼ぶこと。`,
+買い物候補も求められている場合は include_shopping_suggestions を true にすること。
+候補は新しい recipe_id で計算されてこの結果に同梱されるので、続けて suggest_shopping_items を呼ぶ必要はない。`,
       parameters: {
         type: 'object',
         properties: {
           source_recipe_id: {
             type: 'string',
             description: '変更元の recipe_id。この行は更新も削除もされない。',
+          },
+          include_shopping_suggestions: {
+            type: 'boolean',
+            description:
+              `変更後のレシピの不足材料から買い物候補も同時に出すかどうか。
+true … 「顆粒だしをやめて、足りないものも教えて」のように、変更と買い物候補の両方を求められた場合。
+false … レシピを変えるだけの場合。
+候補は必ず**新しい版**の材料から計算される。変更前の recipe_id で候補を出し直す必要はない。
+レシピを変えずに候補だけを求められた場合は、このツールではなく suggest_shopping_items を使うこと。`,
           },
           title: { type: 'string' },
           description: { type: ['string', 'null'] },
@@ -440,6 +463,7 @@ source_recipe_id に元の recipe_id を渡し、**変更後の完全なレシ�
           'difficulty',
           'ingredients',
           'steps',
+          'include_shopping_suggestions',
         ],
         additionalProperties: false,
       },
@@ -1014,13 +1038,11 @@ async function dispatch(
 
     case 'create_recipe': {
       const recipe = await createRecipe(ctx, toRecipeInput(args), 'ai');
-      return {
-        result: {
-          recipe_id: recipe.id,
-          title: recipe.title,
-          total_steps: recipe.steps.length,
-        },
-      };
+      return withRecipeSuggestions(ctx, args, recipe, {
+        recipe_id: recipe.id,
+        title: recipe.title,
+        total_steps: recipe.steps.length,
+      });
     }
 
     case 'revise_recipe': {
@@ -1040,15 +1062,15 @@ async function dispatch(
         toRecipeInput(args),
       );
 
-      return {
-        result: {
-          recipe_id: recipe.id,
-          supersedes_recipe_id: supersedesRecipeId,
-          title: recipe.title,
-          total_steps: recipe.steps.length,
-          note: '新しい版を保存しました。元のレシピはそのまま残っています。以後はこの recipe_id を使ってください。',
-        },
-      };
+      // The lineage id stays in the base result, so folding candidates in
+      // cannot drop the one field the card uses to replace its predecessor.
+      return withRecipeSuggestions(ctx, args, recipe, {
+        recipe_id: recipe.id,
+        supersedes_recipe_id: supersedesRecipeId,
+        title: recipe.title,
+        total_steps: recipe.steps.length,
+        note: '新しい版を保存しました。元のレシピはそのまま残っています。以後はこの recipe_id を使ってください。',
+      });
     }
 
     case 'adjust_recipe_amounts': {
@@ -1257,29 +1279,15 @@ async function dispatch(
         };
       }
 
-      const [inventory, shoppingItems] = await Promise.all([
-        listInventory(ctx, { includeEmpty: true }),
-        listShoppingItems(ctx),
-      ]);
-
-      const suggestions = buildShoppingSuggestions(recipes, inventory, shoppingItems, {
+      const suggestions = await computeShoppingSuggestions(ctx, recipes, {
         includeStaples: args.include_staples === true,
       });
 
       return {
         result: {
-          suggestions: suggestions.map((entry) => ({
-            name: entry.name,
-            reason: entry.reason,
-            reason_label: entry.reasonLabel,
-            quantity: entry.quantity,
-            unit: entry.unit,
-            already_on_list: entry.alreadyOnList,
-            for_dishes: entry.sourceRecipes.map((source) => source.title),
-          })),
+          suggestions: publicSuggestions(suggestions),
           added: false,
-          note:
-            'まだ何も追加していません。画面のカードでユーザーが選んだものだけが買い物リストに入ります。「追加しました」と言わないでください。',
+          note: SUGGESTIONS_ADD_NOTHING_NOTE,
         },
         suggestions,
       };
@@ -1287,6 +1295,120 @@ async function dispatch(
 
     default:
       return { result: { error: 'unknown_tool', message: `未知のツール: ${name}` } };
+  }
+}
+
+/**
+ * Said on every set of candidates, whichever tool produced them.
+ *
+ * The one sentence PHASE 10 rests on: proposing is not adding. It travels with
+ * the result rather than living only in the prompt, because the result is what
+ * the model is looking at when it decides what to claim.
+ */
+const SUGGESTIONS_ADD_NOTHING_NOTE =
+  'まだ何も追加していません。画面のカードでユーザーが選んだものだけが買い物リストに入ります。「追加しました」と言わないでください。';
+
+/**
+ * Work out what is worth buying for these recipes.
+ *
+ * The reads live here so that `suggest_shopping_items` and a recipe tool that
+ * folds candidates into its own result compute them the same way — one
+ * definition of "missing", one set of inputs. Nothing in this path writes.
+ */
+async function computeShoppingSuggestions(
+  ctx: ServiceContext,
+  recipes: readonly SuggestionRecipe[],
+  options: { includeStaples: boolean },
+): Promise<ShoppingSuggestion[]> {
+  const [inventory, shoppingItems] = await Promise.all([
+    listInventory(ctx, { includeEmpty: true }),
+    listShoppingItems(ctx),
+  ]);
+
+  return buildShoppingSuggestions(recipes, inventory, shoppingItems, {
+    includeStaples: options.includeStaples,
+  });
+}
+
+/** The candidate shape the model reads. The card is drawn from `ToolOutcome.suggestions`. */
+function publicSuggestions(suggestions: readonly ShoppingSuggestion[]) {
+  return suggestions.map((entry) => ({
+    name: entry.name,
+    reason: entry.reason,
+    reason_label: entry.reasonLabel,
+    quantity: entry.quantity,
+    unit: entry.unit,
+    already_on_list: entry.alreadyOnList,
+    for_dishes: entry.sourceRecipes.map((source) => source.title),
+  }));
+}
+
+/**
+ * Attach the candidates to a recipe that was just saved, when they were asked
+ * for in the same breath.
+ *
+ * Why fold them in at all: "レシピを作って、足りないものも教えて" took three
+ * responses — the tool call, a continuation for `suggest_shopping_items`, and
+ * another for the sentence. Each one re-sends the whole conversation, and the
+ * project's Realtime token allowance is what actually runs out. Answering both
+ * halves from one tool result removes the middle response entirely.
+ *
+ * The recipe is already saved when this runs, and it stays saved. A failure to
+ * work out the candidates is reported inside a successful result rather than
+ * thrown: letting it escape would reach `describeToolFailure`, the model would
+ * see `create_recipe` fail, and it would create the recipe a second time.
+ */
+async function withRecipeSuggestions(
+  ctx: ServiceContext,
+  args: Record<string, unknown>,
+  recipe: StoredRecipe,
+  base: Record<string, unknown>,
+): Promise<ToolOutcome> {
+  if (args.include_shopping_suggestions !== true) return { result: base };
+
+  try {
+    const suggestions = await computeShoppingSuggestions(
+      ctx,
+      [{ id: recipe.id, title: recipe.title, ingredients: recipe.ingredients }],
+      // Staples stay out, as they do by default everywhere else. Asking for
+      // them is what `suggest_shopping_items` with `include_staples` is for.
+      { includeStaples: false },
+    );
+
+    return {
+      result: {
+        ...base,
+        shopping_suggestions_included: true,
+        shopping_suggestions: {
+          status: 'ok',
+          suggestions: publicSuggestions(suggestions),
+          added: false,
+          note:
+            suggestions.length === 0
+              ? '不足している材料はありませんでした。買い足すものはありません、と伝えてください。'
+              : SUGGESTIONS_ADD_NOTHING_NOTE,
+        },
+      },
+      suggestions,
+    };
+  } catch (error) {
+    // Server-side only. What goes back to the model is the fixed sentence
+    // below — never the driver's message, the query, or the arguments.
+    console.error('[ai] shopping suggestions failed after saving a recipe:', error);
+
+    return {
+      result: {
+        ...base,
+        shopping_suggestions_included: true,
+        shopping_suggestions: {
+          status: 'failed',
+          message:
+            'レシピは保存できましたが、買い物候補を取得できませんでした。レシピが保存できたことを伝え、候補が必要ならもう一度尋ねるよう案内してください。',
+          retry_hint:
+            'このターンでレシピを作り直さないでください。候補は次のユーザー発話で suggest_shopping_items を使って取得できます。',
+        },
+      },
+    };
   }
 }
 
