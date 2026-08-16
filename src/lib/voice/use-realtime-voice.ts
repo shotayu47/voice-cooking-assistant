@@ -22,6 +22,7 @@ import {
   livenessInstructions,
   type LivenessAction,
 } from './liveness';
+import { decideInventoryAdd, refusedInventoryOutput } from './inventory-intent';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
 import {
   decideAdvance,
@@ -840,6 +841,31 @@ export function useRealtimeVoice(options: {
        * marked two steps complete; the gate below is what stops that, and it
        * is fail-closed — no authorising utterance, no write.
        */
+      /*
+       * `add_inventory_item` writes a possession. "買い物候補に入れて" produced
+       * one — a claim that 10g of かつお節 was in the pantry, which then made
+       * it ineligible as a shopping candidate, so the request undid itself.
+       * Same fail-closed shape as the step gate: the food goes in the
+       * inventory only when the utterance says it is actually here.
+       */
+      if (name === 'add_inventory_item') {
+        const transcript = await transcriptForThisTurn();
+        const decision = decideInventoryAdd(transcript);
+
+        if (decision !== 'allow') {
+          logRef.current.add('internal', 'inventory_add_refused', {
+            tool: name,
+            call: callId,
+            reason: decision,
+          });
+          setState((current) => ({ ...current, activeTool: null }));
+          deliverToolOutput(callId, refusedInventoryOutput(decision));
+          return;
+        }
+
+        logRef.current.add('internal', 'inventory_add_allowed', { tool: name, call: callId });
+      }
+
       if (name === 'advance_cooking_step' || name === 'previous_cooking_step') {
         const goingBack = name === 'previous_cooking_step';
         const transcript = await transcriptForThisTurn();
