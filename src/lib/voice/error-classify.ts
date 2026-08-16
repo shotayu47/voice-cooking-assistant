@@ -28,6 +28,42 @@ export const ERROR_PATTERNS = [
 export type ErrorToken = (typeof ERROR_PATTERNS)[number]['token'] | 'unclassified';
 
 /**
+ * Error codes a tool may return, as the app itself defines them.
+ *
+ * An allowlist rather than a passthrough: `result.error` is app-authored today,
+ * but the trace should not become a place where a future free-text value can
+ * appear just because it was put in a field called `error`.
+ */
+const TOOL_ERROR_CODES = new Set([
+  'invalid_arguments',
+  'invalid_candidates',
+  'no_recipes',
+  'recipe_not_found',
+  'recipes_not_found',
+  'backend_unavailable',
+  'unknown_tool',
+  'tool_failed',
+  'tool_unreachable',
+]);
+
+/**
+ * The outcome of one tool call, for the trace.
+ *
+ * `tool_done status=ok` used to mean only that the HTTP relay succeeded — a
+ * `create_recipe` rejected for a bad `ingredients.4.amount` was recorded
+ * identically to one that wrote a row, which made a real failure invisible.
+ * Transport and outcome are now separate, and this reads the second.
+ */
+export function toolOutcomeCode(result: unknown): string | undefined {
+  if (!result || typeof result !== 'object') return undefined;
+
+  const error = (result as Record<string, unknown>).error;
+  if (typeof error !== 'string') return undefined;
+
+  return TOOL_ERROR_CODES.has(error) ? error : 'other';
+}
+
+/**
  * Returns a token, never any part of the input.
  *
  * `unclassified` is deliberate: an unrecognised message tells us a pattern is

@@ -55,6 +55,10 @@ export type LoggedEvent = {
   argsMatch?: string;
   /** Why a response.create was sent: continuation, forced_final, liveness, retry. */
   purpose?: string;
+  /** Whether the HTTP relay succeeded — not whether the tool did. */
+  transport?: string;
+  /** Whether the tool itself succeeded. Separate, because they differ. */
+  outcome?: string;
   /** One `rate_limits.updated` entry: which allowance, and how much is left. */
   limitName?: string;
   limit?: number;
@@ -102,6 +106,8 @@ const TEXT_FIELDS = new Set([
   'argsMatch',
   'purpose',
   'limitName',
+  'transport',
+  'outcome',
 ]);
 const BOOL_FIELDS = new Set(['pendingLiveness', 'sent', 'hasActive']);
 const NUM_FIELDS = new Set([
@@ -198,6 +204,8 @@ export function createEventLog(now: () => number = () => Date.now()): EventLog {
                 | 'argsMatch'
                 | 'purpose'
                 | 'limitName'
+                | 'transport'
+                | 'outcome'
             ] = value.slice(0, MAX_TEXT);
           }
           continue;
@@ -270,6 +278,8 @@ export function formatEventLog(entries: LoggedEvent[]): string {
     if (entry.tool) parts.push(`tool=${entry.tool}`);
     if (entry.argsMatch) parts.push(`args=${entry.argsMatch}`);
     if (entry.purpose) parts.push(`purpose=${entry.purpose}`);
+    if (entry.transport) parts.push(`transport=${entry.transport}`);
+    if (entry.outcome) parts.push(`outcome=${entry.outcome}`);
     if (entry.limitName) parts.push(`limit=${entry.limitName}`);
     if (entry.limit !== undefined) parts.push(`max=${entry.limit}`);
     if (entry.remaining !== undefined) parts.push(`remaining=${entry.remaining}`);

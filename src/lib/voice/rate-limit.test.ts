@@ -9,6 +9,7 @@ import {
   describeRateLimit,
   MAX_RATE_LIMIT_RETRIES,
   NO_RATE_LIMIT,
+  RESET_SAFETY_MS,
   waitFromSnapshots,
 } from './rate-limit';
 import { INITIAL_TURN, reduceTurn, describeFailure, type VoiceEvent } from './turn-state';
@@ -82,28 +83,43 @@ describe('7 — a rate limit is its own failure', () => {
 });
 
 describe('the server’s own numbers come first', () => {
-  it('uses reset_seconds for the limit that ran out', () => {
+  it('waits out the tokens window even though the allowance is not empty', () => {
+    /*
+     * The refusal that prompted this: remaining=4191, reset_seconds=54. The
+     * allowance was not exhausted — it was too small for what the next
+     * response needed. Requiring remaining<=0 threw those 54 seconds away and
+     * retried after 2.4s, straight back into the wall.
+     */
     expect(
       waitFromSnapshots([
-        { name: 'requests', remaining: 40, reset_seconds: 1 },
-        { name: 'tokens', remaining: 0, reset_seconds: 12 },
+        { name: 'requests', remaining: 90, reset_seconds: 2 },
+        { name: 'tokens', remaining: 4191, reset_seconds: 54 },
       ]),
-    ).toBe(12_000);
+    ).toBe(54_000 + RESET_SAFETY_MS);
   });
 
-  it('takes the longest wait when more than one is exhausted', () => {
-    // Waiting too long is recoverable; waiting too little spends another
-    // request on a refusal.
+  it('prefers the tokens window, since that is the one that runs short', () => {
     expect(
       waitFromSnapshots([
         { name: 'requests', remaining: 0, reset_seconds: 3 },
         { name: 'tokens', remaining: 0, reset_seconds: 20 },
       ]),
-    ).toBe(20_000);
+    ).toBe(20_000 + RESET_SAFETY_MS);
   });
 
-  it('falls back when nothing has run out', () => {
-    expect(waitFromSnapshots([{ name: 'tokens', remaining: 100, reset_seconds: 5 }])).toBeNull();
+  it('waits out the longest window when tokens is not reported', () => {
+    expect(
+      waitFromSnapshots([
+        { name: 'requests', remaining: 0, reset_seconds: 3 },
+        { name: 'other', remaining: 0, reset_seconds: 8 },
+      ]),
+    ).toBe(8_000 + RESET_SAFETY_MS);
+  });
+
+  it('lands past the reset rather than on it', () => {
+    // Returning at the exact boundary risks another refusal, and a refused
+    // request still counts against the allowance.
+    expect(waitFromSnapshots([{ name: 'tokens', reset_seconds: 10 }])).toBeGreaterThan(10_000);
   });
 
   it('falls back when the event was never received', () => {
@@ -111,10 +127,14 @@ describe('the server’s own numbers come first', () => {
     expect(waitFromSnapshots([])).toBeNull();
   });
 
-  it('prefers the reported reset over the backoff', () => {
-    const state = afterRateLimit(NO_RATE_LIMIT, T, [{ remaining: 0, reset_seconds: 9 }], steady);
+  it('falls back when no window was reported', () => {
+    expect(waitFromSnapshots([{ name: 'tokens', remaining: 0 }])).toBeNull();
+  });
 
-    expect(state.cooldownUntil).toBe(T + 9_000);
+  it('prefers the reported reset over the backoff', () => {
+    const state = afterRateLimit(NO_RATE_LIMIT, T, [{ name: 'tokens', remaining: 4191, reset_seconds: 9 }], steady);
+
+    expect(state.cooldownUntil).toBe(T + 9_000 + RESET_SAFETY_MS);
   });
 });
 

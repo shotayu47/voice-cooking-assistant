@@ -22,6 +22,9 @@ export type RateLimitSnapshot = {
 /** Manual retries allowed per committed turn. */
 export const MAX_RATE_LIMIT_RETRIES = 3;
 
+/** Added to a reported reset, so the retry lands after the window, not on it. */
+export const RESET_SAFETY_MS = 1_000;
+
 /** Bounds on the fallback wait, used only when the server tells us nothing. */
 export const BACKOFF = {
   baseMs: 2_000,
@@ -38,17 +41,39 @@ export const BACKOFF = {
  * among the exhausted limits — waiting too long is recoverable, waiting too
  * little spends another request on a refusal.
  */
-export function waitFromSnapshots(limits: readonly RateLimitSnapshot[] | null | undefined): number | null {
+export function waitFromSnapshots(
+  limits: readonly RateLimitSnapshot[] | null | undefined,
+): number | null {
   if (!limits || limits.length === 0) return null;
 
-  const exhausted = limits.filter(
-    (l) => typeof l.remaining === 'number' && l.remaining <= 0 && typeof l.reset_seconds === 'number',
-  );
-  const pool = exhausted.length > 0 ? exhausted : [];
-  if (pool.length === 0) return null;
+  /*
+   * `remaining` is not the test.
+   *
+   * The refusal that prompted this arrived with remaining=4191 and
+   * reset_seconds=54 — the allowance was not empty, it was merely too small
+   * for what the next response needed. Waiting only for limits at zero meant
+   * the server's own 54 seconds were discarded and a 2.4s backoff used
+   * instead, which is a retry into a wall.
+   *
+   * `remaining` also reflects the reservation a response makes when it is
+   * created, not just tokens already spent, so it cannot be compared against
+   * measured usage to decide what is left.
+   */
+  const reported = limits.filter((l) => typeof l.reset_seconds === 'number');
+  if (reported.length === 0) return null;
+
+  // The refusal names no limit. Tokens is the one that has run short every
+  // time it has been observed, so it wins when present; otherwise wait out
+  // the longest reported window.
+  const tokens = reported.filter((l) => l.name === 'tokens');
+  const pool = tokens.length > 0 ? tokens : reported;
 
   const seconds = Math.max(...pool.map((l) => l.reset_seconds as number));
-  return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : null;
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+
+  // A little past the reset: coming back at the exact boundary risks being
+  // refused again and spending another request to learn it.
+  return Math.round(seconds * 1000) + RESET_SAFETY_MS;
 }
 
 /**

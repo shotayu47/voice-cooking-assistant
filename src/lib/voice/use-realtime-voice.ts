@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
 import { argumentSignature, compareSignature } from './arg-signature';
-import { classifyErrorMessage } from './error-classify';
+import { classifyErrorMessage, toolOutcomeCode } from './error-classify';
 import {
   afterRateLimit,
   canRetryAfterRateLimit,
@@ -943,10 +943,20 @@ export function useRealtimeVoice(options: {
               suggestions: null,
             };
 
+        /*
+         * Transport and outcome are different questions. A create_recipe
+         * rejected for a malformed ingredient amount comes back over a
+         * perfectly good HTTP 200, and recording one 'ok' for both made that
+         * failure unreadable in the trace.
+         */
+        const outcomeCode = toolOutcomeCode(body.result);
         logRef.current.add('internal', 'tool_done', {
           tool: name,
           call: callId,
-          status: response.ok ? 'ok' : String(response.status),
+          transport: response.ok ? 'ok' : 'error',
+          status: response.ok ? undefined : String(response.status),
+          outcome: outcomeCode ? 'error' : 'ok',
+          code: outcomeCode,
           ms: Date.now() - startedAt,
         });
 

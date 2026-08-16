@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { classifyErrorMessage, ERROR_PATTERNS } from './error-classify';
+import { classifyErrorMessage, ERROR_PATTERNS, toolOutcomeCode } from './error-classify';
 
 /**
  * `error.message` is free text and can quote the conversation, so it must
@@ -37,6 +37,54 @@ describe('classifying a Realtime error', () => {
     expect(classifyErrorMessage('')).toBeUndefined();
     expect(classifyErrorMessage('   ')).toBeUndefined();
     expect(classifyErrorMessage({ message: 'x' })).toBeUndefined();
+  });
+});
+
+describe('a successful relay is not a successful tool', () => {
+  it('names the schema failure that used to read as ok', () => {
+    /*
+     * The exact case: create_recipe rejected for `ingredients.4.amount`,
+     * returned over HTTP 200, and logged as `tool_done status=ok`. Reading the
+     * trace, nothing had gone wrong; in the database, no recipe existed.
+     */
+    expect(toolOutcomeCode({ error: 'invalid_arguments', field: 'ingredients.4.amount' })).toBe(
+      'invalid_arguments',
+    );
+  });
+
+  it('says nothing for a result that succeeded', () => {
+    // undefined is what makes the trace read `outcome=ok`.
+    expect(toolOutcomeCode({ title: 'x', recipe_id: 'r1', total_steps: 7 })).toBeUndefined();
+    expect(toolOutcomeCode({})).toBeUndefined();
+    expect(toolOutcomeCode(null)).toBeUndefined();
+    expect(toolOutcomeCode('not an object')).toBeUndefined();
+  });
+
+  it('recognises the codes the tools actually return', () => {
+    for (const code of [
+      'invalid_arguments',
+      'invalid_candidates',
+      'no_recipes',
+      'recipe_not_found',
+      'recipes_not_found',
+      'backend_unavailable',
+      'unknown_tool',
+      'tool_failed',
+      'tool_unreachable',
+    ]) {
+      expect(toolOutcomeCode({ error: code })).toBe(code);
+    }
+  });
+
+  it('collapses anything unrecognised rather than passing it through', () => {
+    // The field is app-authored today; the trace should not become a way for
+    // free text to reach the output if that ever changes.
+    expect(toolOutcomeCode({ error: 'かつお節が見つかりません' })).toBe('other');
+    expect(toolOutcomeCode({ error: 'user someone@example.com failed' })).toBe('other');
+  });
+
+  it('ignores a non-string error field', () => {
+    expect(toolOutcomeCode({ error: { message: '肉じゃが' } })).toBeUndefined();
   });
 });
 
