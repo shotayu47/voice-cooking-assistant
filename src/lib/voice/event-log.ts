@@ -41,9 +41,20 @@ export type LoggedEvent = {
   active?: string;
   /** The response a cancel is outstanding for. */
   cancelWaiting?: string;
+  /** Alias of the client `event_id`, so an error can name what it rejected. */
+  eventId?: string;
   status?: string;
   code?: string;
   tool?: string;
+  /** `response.status_details`, which says why a response did not complete. */
+  detailType?: string;
+  detailReason?: string;
+  errType?: string;
+  errParam?: string;
+  /** Continuation requests already made on this turn, when a guard fires. */
+  continuations?: number;
+  /** Whether a response was still active when a decision was taken. */
+  hasActive?: boolean;
   /** Reducer phase either side of this event. */
   from?: string;
   to?: string;
@@ -55,11 +66,28 @@ export type LoggedEvent = {
 };
 
 /** Fields carrying an identifier. Aliased before storage. */
-const ID_FIELDS = new Set(['resp', 'call', 'item', 'active', 'cancelWaiting']);
-/** Short, bounded, non-identifying strings. */
-const TEXT_FIELDS = new Set(['status', 'code', 'tool', 'from', 'to', 'reason']);
-const BOOL_FIELDS = new Set(['pendingLiveness', 'sent']);
-const NUM_FIELDS = new Set(['ms']);
+const ID_FIELDS = new Set(['resp', 'call', 'item', 'active', 'cancelWaiting', 'eventId']);
+/**
+ * Short, bounded, non-identifying strings.
+ *
+ * Every one of these is an enum or a code in the API's own vocabulary.
+ * `error.message` is deliberately absent: it is free text that can quote the
+ * conversation, so it is classified into a token before it gets here.
+ */
+const TEXT_FIELDS = new Set([
+  'status',
+  'code',
+  'tool',
+  'from',
+  'to',
+  'reason',
+  'detailType',
+  'detailReason',
+  'errType',
+  'errParam',
+]);
+const BOOL_FIELDS = new Set(['pendingLiveness', 'sent', 'hasActive']);
+const NUM_FIELDS = new Set(['ms', 'continuations']);
 
 const MAX_ENTRIES = 400;
 const MAX_TEXT = 40;
@@ -68,6 +96,9 @@ const MAX_TEXT = 40;
 function aliasPrefix(field: string): string {
   if (field === 'call') return 'C';
   if (field === 'item') return 'I';
+  // Client event ids get their own namespace so an error can be matched to
+  // the exact payload it rejected.
+  if (field === 'eventId') return 'E';
   return 'R';
 }
 
@@ -117,24 +148,38 @@ export function createEventLog(now: () => number = () => Date.now()): EventLog {
 
         if (ID_FIELDS.has(key)) {
           const value_ = alias(key, value);
-          if (value_) entry[key as 'resp' | 'call' | 'item' | 'active' | 'cancelWaiting'] = value_;
+          if (value_) {
+            entry[key as 'resp' | 'call' | 'item' | 'active' | 'cancelWaiting' | 'eventId'] =
+              value_;
+          }
           continue;
         }
         if (TEXT_FIELDS.has(key)) {
           if (typeof value === 'string') {
-            entry[key as 'status' | 'code' | 'tool' | 'from' | 'to' | 'reason'] = value.slice(
-              0,
-              MAX_TEXT,
-            );
+            entry[
+              key as
+                | 'status'
+                | 'code'
+                | 'tool'
+                | 'from'
+                | 'to'
+                | 'reason'
+                | 'detailType'
+                | 'detailReason'
+                | 'errType'
+                | 'errParam'
+            ] = value.slice(0, MAX_TEXT);
           }
           continue;
         }
         if (BOOL_FIELDS.has(key)) {
-          entry[key as 'pendingLiveness' | 'sent'] = Boolean(value);
+          entry[key as 'pendingLiveness' | 'sent' | 'hasActive'] = Boolean(value);
           continue;
         }
         if (NUM_FIELDS.has(key)) {
-          if (typeof value === 'number' && Number.isFinite(value)) entry.ms = Math.round(value);
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            entry[key as 'ms' | 'continuations'] = Math.round(value);
+          }
           continue;
         }
         // Not on the allowlist. Dropped — this is what keeps a transcript out
@@ -175,8 +220,15 @@ export function formatEventLog(entries: LoggedEvent[]): string {
 
     if (entry.from || entry.to) parts.push(`phase=${entry.from ?? '?'}>${entry.to ?? '?'}`);
     if (entry.status) parts.push(`status=${entry.status}`);
+    if (entry.detailType) parts.push(`detailType=${entry.detailType}`);
+    if (entry.detailReason) parts.push(`detailReason=${entry.detailReason}`);
+    if (entry.errType) parts.push(`errType=${entry.errType}`);
     if (entry.code) parts.push(`code=${entry.code}`);
+    if (entry.errParam) parts.push(`errParam=${entry.errParam}`);
+    if (entry.eventId) parts.push(`evt=${entry.eventId}`);
     if (entry.tool) parts.push(`tool=${entry.tool}`);
+    if (entry.continuations !== undefined) parts.push(`continuations=${entry.continuations}`);
+    if (entry.hasActive !== undefined) parts.push(`hasActive=${entry.hasActive}`);
     if (entry.resp) parts.push(`resp=${entry.resp}`);
     if (entry.call) parts.push(`call=${entry.call}`);
     if (entry.item) parts.push(`item=${entry.item}`);

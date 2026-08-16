@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
+import { classifyErrorMessage } from './error-classify';
 import { createEventLog, formatEventLog } from './event-log';
 import { classifyUtterance, decideLivenessAction, livenessInstructions } from './liveness';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
@@ -99,15 +100,55 @@ type RealtimeEvent = {
     id?: string;
     /** `completed` | `cancelled` | `failed` | `incomplete`. */
     status?: string;
-    status_details?: { reason?: string; error?: { code?: string } };
+    /**
+     * Why it did not complete. Declared before but never read, which is why a
+     * `failed` response could only ever be reported as "failed".
+     */
+    status_details?: {
+      type?: string;
+      reason?: string;
+      error?: { type?: string; code?: string; param?: string; message?: string };
+    };
     output?: RealtimeFunctionCall[];
   };
   item?: { id?: string; type?: string };
-  error?: { message?: string; code?: string };
+  error?: {
+    type?: string;
+    code?: string;
+    param?: string;
+    message?: string;
+    /** The client payload this rejects, when the server can attribute it. */
+    event_id?: string;
+  };
 };
+
+/**
+ * Client events that carry an `event_id` so an error can name them.
+ *
+ * Exported so the set is pinned by a test: adding the id is the only change
+ * this instrumentation makes to what goes on the wire, and it must stay
+ * confined to payloads the server can reject.
+ */
+export const CORRELATED_EVENTS = new Set([
+  'response.create',
+  'response.cancel',
+  'conversation.item.create',
+]);
 
 /** How often the watchdog asks whether the current wait has gone on too long. */
 const WATCHDOG_INTERVAL_MS = 2_000;
+
+/**
+ * Client-side id for one outbound payload.
+ *
+ * Only ever compared against `error.event_id` and aliased before it reaches
+ * the trace, so the value itself is never recorded.
+ */
+let eventIdCounter = 0;
+function newEventId(): string {
+  eventIdCounter += 1;
+  return `ce_${eventIdCounter}_${Math.random().toString(36).slice(2, 8)}`;
+}
 
 export function useRealtimeVoice(options: {
   /** Called after a tool call that changed persistent state. */
@@ -499,9 +540,16 @@ export function useRealtimeVoice(options: {
         // End of a model turn. Only a *completed* one may act.
         case 'response.done': {
           const status = event.response?.status ?? 'completed';
+          const details = event.response?.status_details;
           logRef.current.add('in', 'response.done', {
             resp: event.response?.id,
             status,
+            // The whole point of this pass: `failed` on its own says nothing.
+            detailType: details?.type,
+            detailReason: details?.reason,
+            errType: details?.error?.type,
+            code: details?.error?.code ?? classifyErrorMessage(details?.error?.message),
+            errParam: details?.error?.param,
             // Which response the turn believed it was waiting for. If these
             // disagree, the turn is being rewritten by an unrelated response.
             active: turnRef.current.activeResponseId ?? undefined,
@@ -542,8 +590,19 @@ export function useRealtimeVoice(options: {
 
         case 'error': {
           const code = event.error?.code;
-          // Never the message: it can quote the conversation back.
-          logRef.current.add('in', 'error', { code });
+          // Never the message itself: it is free text and can quote the
+          // conversation back. Classified into a token when there is no code.
+          logRef.current.add('in', 'error', {
+            errType: event.error?.type,
+            code: code ?? classifyErrorMessage(event.error?.message),
+            errParam: event.error?.param,
+            // Names the payload this rejects, so a failed send is attributable
+            // rather than merely adjacent in the log.
+            eventId: event.error?.event_id,
+            from: turnRef.current.phase,
+            active: turnRef.current.activeResponseId ?? undefined,
+            pendingLiveness: livenessPendingRef.current,
+          });
           console.error('[voice] realtime error code:', code ?? 'unknown');
           advance({ type: 'api_error', at: Date.now() });
           setState((current) => ({
@@ -669,7 +728,19 @@ export function useRealtimeVoice(options: {
       advance({ type: 'tool_output_sent', at: Date.now(), callId });
 
       if (!canRequestContinuation(turnRef.current)) {
-        logRef.current.add('internal', 'continuation_suppressed', { reason: 'guard' });
+        /*
+         * Which half of the guard fired, and in what state. The guard allows
+         * one continuation per turn and none while a response is active, so a
+         * turn that calls two tools cannot ask for a reply after the second —
+         * recording the count is what will show whether that is what happened.
+         */
+        logRef.current.add('internal', 'continuation_suppressed', {
+          reason: 'guard',
+          continuations: turnRef.current.continuationsRequested,
+          hasActive: turnRef.current.activeResponseId !== null,
+          from: turnRef.current.phase,
+          pendingLiveness: livenessPendingRef.current,
+        });
         return;
       }
 
@@ -718,14 +789,24 @@ export function useRealtimeVoice(options: {
 
     /** Returns whether the payload actually went out. */
     function send(payload: { type: string; [key: string]: unknown }): boolean {
+      /*
+       * An `event_id` on the payloads that can be rejected, so `error.event_id`
+       * names which one failed instead of leaving it to be guessed from
+       * ordering. Nothing else about the send changes: the id is additive and
+       * the server echoes it back only on failure.
+       */
+      const eventId = CORRELATED_EVENTS.has(payload.type) ? newEventId() : undefined;
+      const wire = eventId ? { ...payload, event_id: eventId } : payload;
+
       const open = channelRef.current?.readyState === 'open';
-      if (open) channelRef.current!.send(JSON.stringify(payload));
+      if (open) channelRef.current!.send(JSON.stringify(wire));
 
       // Only the event type is recorded. The payload can carry a tool result
       // or the instructions text, and neither belongs in a trace.
       logRef.current.add('out', payload.type, {
         sent: open,
         reason: open ? undefined : 'channel_not_open',
+        eventId,
         active: turnRef.current.activeResponseId ?? undefined,
         pendingLiveness: livenessPendingRef.current,
       });
@@ -776,7 +857,17 @@ export function useRealtimeVoice(options: {
 
     logRef.current.add('internal', 'retry_requested');
     turnRef.current = reduceTurn(turnRef.current, { type: 'retry_requested', at: Date.now() });
-    channelRef.current.send(JSON.stringify({ type: 'response.create' }));
+
+    // Sent outside `send()` because that lives in the connect closure, so the
+    // id and the trace entry are added here to match.
+    const eventId = newEventId();
+    channelRef.current.send(JSON.stringify({ type: 'response.create', event_id: eventId }));
+    logRef.current.add('out', 'response.create', {
+      sent: true,
+      eventId,
+      reason: 'retry',
+      active: turnRef.current.activeResponseId ?? undefined,
+    });
     setState((current) => ({ ...current, stalled: null, canRetry: false }));
   }, []);
 

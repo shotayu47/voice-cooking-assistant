@@ -110,6 +110,64 @@ describe('correlation without exposing ids', () => {
   });
 });
 
+describe('why a response did not complete', () => {
+  it('records the status detail that "failed" alone does not give', () => {
+    const { instance } = log();
+    instance.add('in', 'response.done', {
+      resp: 'resp_2',
+      status: 'failed',
+      detailType: 'failed',
+      detailReason: 'server_error',
+      errType: 'invalid_request_error',
+      code: 'conversation_already_has_active_response',
+      errParam: 'response',
+    });
+
+    expect(instance.entries()[0]).toMatchObject({
+      status: 'failed',
+      detailType: 'failed',
+      detailReason: 'server_error',
+      errType: 'invalid_request_error',
+      code: 'conversation_already_has_active_response',
+      errParam: 'response',
+    });
+  });
+
+  it('matches an error to the payload it rejected', () => {
+    const { instance } = log();
+    instance.add('out', 'response.create', { eventId: 'ce_7_abc', sent: true });
+    instance.add('in', 'error', { eventId: 'ce_7_abc', code: 'x' });
+
+    const [sent, failed] = instance.entries();
+    expect(sent.eventId).toBe('E1');
+    expect(failed.eventId).toBe('E1');
+  });
+
+  it('keeps client event ids in their own namespace', () => {
+    const { instance } = log();
+    instance.add('out', 'response.create', { eventId: 'ce_1', resp: 'resp_1' });
+
+    expect(instance.entries()[0]).toMatchObject({ eventId: 'E1', resp: 'R1' });
+  });
+
+  it('records why a continuation was suppressed, and in what state', () => {
+    const { instance } = log();
+    instance.add('internal', 'continuation_suppressed', {
+      reason: 'guard',
+      continuations: 1,
+      hasActive: false,
+      from: 'running_tool',
+    });
+
+    expect(instance.entries()[0]).toMatchObject({
+      reason: 'guard',
+      continuations: 1,
+      hasActive: false,
+      from: 'running_tool',
+    });
+  });
+});
+
 describe('what the trace must never record', () => {
   it('drops any field it does not explicitly allow', () => {
     const { instance } = log();
@@ -125,6 +183,10 @@ describe('what the trace must never record', () => {
       client_secret: 'ek_abc',
       cookie: 'sb-access-token=xyz',
       payload: { type: 'response.done', response: { output: ['secret'] } },
+      // The one field most likely to be added by mistake: the API puts real
+      // detail in `message`, and it is free text.
+      message: 'Invalid value: 肉じゃが for user someone@example.com',
+      instructions: '「聞こえています。どの話を続けますか？」とだけ答えてください。',
     });
 
     expect(instance.entries()).toEqual([
