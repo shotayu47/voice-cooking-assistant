@@ -32,6 +32,10 @@ export type TurnPhase =
   /** The continuation guard tripped; a tools-forbidden reply has been asked for. */
   | 'awaiting_forced_final'
   | 'forced_final_responding'
+  /** A liveness check arrived mid-response: cancel sent, waiting for its done. */
+  | 'cancelling_response'
+  | 'awaiting_liveness_create'
+  | 'awaiting_liveness_response'
   | 'completed'
   | 'recoverable_error'
   | 'unresolved';
@@ -60,6 +64,15 @@ export type TurnState = {
   callsSeen: string[];
   /** call_ids whose output has been sent back (invariant 2, second half). */
   outputsSent: string[];
+  /**
+   * The response a cancel has been sent for and whose `done` is still owed.
+   *
+   * Kept separate from `activeResponseId` because both matter at once: the old
+   * response is being torn down while the liveness reply is queued behind it.
+   */
+  cancellingResponseId: string | null;
+  /** The response interrupted by new speech, kept rather than discarded. */
+  interruptedResponseId: string | null;
   /** Continuation requests issued after a tool (invariant 3). */
   continuationsRequested: number;
   /**
@@ -89,6 +102,8 @@ export type VoiceEvent =
   | { type: 'function_call_ready'; at: number; callId: string }
   | { type: 'tool_output_sent'; at: number; callId: string }
   | { type: 'continuation_requested'; at: number }
+  | { type: 'liveness_cancel_sent'; at: number; responseId: string }
+  | { type: 'liveness_create_sent'; at: number }
   | { type: 'forced_final_requested'; at: number }
   | { type: 'forced_final_unavailable'; at: number }
   | { type: 'forced_final_looped'; at: number }
@@ -101,6 +116,8 @@ export type VoiceEvent =
 export const INITIAL_TURN: TurnState = {
   phase: 'idle',
   activeResponseId: null,
+  cancellingResponseId: null,
+  interruptedResponseId: null,
   responsesCreated: 0,
   callsSeen: [],
   outputsSent: [],
@@ -134,7 +151,18 @@ export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
       // Speech that never commits is not a new request, and refreshing the
       // tool allowance on every barge-in would hand the model another round
       // of tools for a turn the user never finished making.
-      return { ...state, phase: 'listening', waitingSince: event.at, failure: null };
+      //
+      // The interrupted response's id is kept rather than discarded: the
+      // server is still winding it down and will report its `done`, which has
+      // to be recognisable as *that* response and not as an answer to what the
+      // user is saying now.
+      return {
+        ...state,
+        phase: 'listening',
+        waitingSince: event.at,
+        failure: null,
+        interruptedResponseId: state.activeResponseId ?? state.interruptedResponseId,
+      };
 
     case 'speech_stopped':
       return { ...state, phase: 'committing', waitingSince: event.at };
@@ -159,7 +187,13 @@ export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
         // The forced final is still a response, but it must stay
         // distinguishable: a tool call arriving under it is a loop, whereas
         // under an ordinary response it is normal traffic.
-        phase: state.phase === 'awaiting_forced_final' ? 'forced_final_responding' : 'responding',
+        phase:
+          state.phase === 'awaiting_forced_final'
+            ? 'forced_final_responding'
+            : state.phase === 'awaiting_liveness_response' ||
+                state.phase === 'awaiting_liveness_create'
+              ? 'awaiting_liveness_response'
+              : 'responding',
         activeResponseId: event.responseId,
         responsesCreated: state.responsesCreated + 1,
         waitingSince: event.at,
@@ -190,6 +224,17 @@ export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
         continuationsRequested: state.continuationsRequested + 1,
         waitingSince: event.at,
       };
+
+    case 'liveness_cancel_sent':
+      return {
+        ...state,
+        phase: 'cancelling_response',
+        cancellingResponseId: event.responseId,
+        waitingSince: event.at,
+      };
+
+    case 'liveness_create_sent':
+      return { ...state, phase: 'awaiting_liveness_response', waitingSince: event.at };
 
     case 'forced_final_requested':
       return {
@@ -224,6 +269,35 @@ export function reduceTurn(state: TurnState, event: VoiceEvent): TurnState {
       return { ...state, cardShown: true };
 
     case 'response_done': {
+      /*
+       * Which response finished decides whether this concerns the turn at all.
+       *
+       * An interruption puts several responses in flight at once — the one
+       * being torn down, the one the server started for the new utterance, and
+       * the liveness reply queued behind the cancel. Matching on the event name
+       * alone let any of them rewrite the turn: a stale `completed` cleared
+       * `waitingSince` and disarmed the watchdog for good, and a stale
+       * `cancelled` marked a healthy turn unresolved.
+       */
+      if (state.cancellingResponseId === event.responseId) {
+        // The cancel landed. The liveness reply may now be created — and only
+        // now, which is the ordering that was missing.
+        return {
+          ...state,
+          phase: 'awaiting_liveness_create',
+          cancellingResponseId: null,
+          activeResponseId: null,
+          waitingSince: event.at,
+        };
+      }
+
+      const concernsThisTurn =
+        state.activeResponseId === null || state.activeResponseId === event.responseId;
+      if (!concernsThisTurn) {
+        // Someone else's ending. Recorded by the caller, ignored here.
+        return state;
+      }
+
       // Invariant 5. `cancelled` carries partial output and reads exactly like
       // a finished turn if only the event name is checked — which is how a
       // cancelled response's function calls were being executed.
@@ -373,6 +447,12 @@ export function overdue(
     state.phase === 'continuing_after_tool' ||
     state.phase === 'awaiting_forced_final' ||
     state.phase === 'forced_final_responding' ||
+    // A cancel that never reports, or a liveness reply that never arrives,
+    // both leave the user talking to nothing. Ordinary `listening` stays
+    // unmonitored: a continuous call may sit silent indefinitely.
+    state.phase === 'cancelling_response' ||
+    state.phase === 'awaiting_liveness_create' ||
+    state.phase === 'awaiting_liveness_response' ||
     state.phase === 'recoverable_error'
   ) {
     return waited >= timeouts.noContinuationMs ? 'no_continuation' : null;

@@ -7,7 +7,12 @@ import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 import { argumentSignature, compareSignature } from './arg-signature';
 import { classifyErrorMessage } from './error-classify';
 import { createEventLog, formatEventLog } from './event-log';
-import { classifyUtterance, decideLivenessAction, livenessInstructions } from './liveness';
+import {
+  classifyUtterance,
+  decideLivenessAction,
+  livenessInstructions,
+  type LivenessAction,
+} from './liveness';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
 import {
   canExecuteCall,
@@ -211,6 +216,8 @@ export function useRealtimeVoice(options: {
   const cancelWaitingRef = useRef<string | null>(null);
   /** Whether a liveness reply has been asked for and not yet seen arrive. */
   const livenessPendingRef = useRef(false);
+  /** The liveness reply queued behind an outstanding cancel. */
+  const pendingLivenessActionRef = useRef<LivenessAction | null>(null);
   /**
    * Set by `connect`, because the sender lives in its closure. Lets the retry
    * button reach the forced-final path instead of re-running tool selection.
@@ -592,6 +599,14 @@ export function useRealtimeVoice(options: {
             status,
           });
 
+          // The cancel we were waiting on has reported. This is the only place
+          // the queued liveness reply is created.
+          if (turnRef.current.phase === 'awaiting_liveness_create') {
+            cancelWaitingRef.current = null;
+            sendLivenessCreate();
+            break;
+          }
+
           if (status !== 'completed') {
             /*
              * A cancelled or failed response still carries whatever output it
@@ -832,16 +847,51 @@ export function useRealtimeVoice(options: {
         active: turnRef.current.activeResponseId ?? undefined,
       });
 
-      // Recorded before the sends so the trace shows the intent even if the
-      // channel refuses them. `response.cancel` carries no target id today.
-      cancelWaitingRef.current = 'unspecified';
+      pendingLivenessActionRef.current = action;
       livenessPendingRef.current = true;
 
-      send({ type: 'response.cancel' });
-      send({
+      const active = turnRef.current.activeResponseId;
+      if (!active) {
+        // Nothing to tear down, so the reply can be asked for straight away.
+        sendLivenessCreate();
+        return;
+      }
+
+      /*
+       * Cancel first, and *wait*. `response.cancel` is asynchronous: the
+       * response is not gone until its `response.done` arrives. Sending the
+       * create in the same breath — which is what the trace shows at 13998ms —
+       * asks for a second response while the first is still active, and the
+       * server refuses it. The reply is created when the cancel reports, in
+       * `response.done`, and nowhere else.
+       */
+      cancelWaitingRef.current = active;
+      send({ type: 'response.cancel', response_id: active });
+      advance({ type: 'liveness_cancel_sent', at: Date.now(), responseId: active });
+    }
+
+    /** The neutral reply itself. Sent once, only after the cancel reported. */
+    function sendLivenessCreate() {
+      const action = pendingLivenessActionRef.current;
+      if (!action) return;
+      pendingLivenessActionRef.current = null;
+
+      logRef.current.add('internal', 'liveness.create', { status: action });
+
+      const ok = send({
         type: 'response.create',
-        response: { instructions: livenessInstructions(action, describeFailure(turnRef.current)) },
+        response: {
+          metadata: { purpose: 'liveness' },
+          instructions: livenessInstructions(action, describeFailure(turnRef.current)),
+        },
       });
+
+      if (ok) {
+        advance({ type: 'liveness_create_sent', at: Date.now() });
+      } else {
+        livenessPendingRef.current = false;
+        advance({ type: 'channel_lost', at: Date.now() });
+      }
     }
 
     /**
