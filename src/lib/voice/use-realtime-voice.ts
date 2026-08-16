@@ -14,6 +14,7 @@ import {
   type LivenessAction,
 } from './liveness';
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
+import { decideAdvance, refusedAdvanceOutput } from './step-intent';
 import { decideRepeat, repeatKey, replayedOutput } from './tool-repeat';
 import {
   canExecuteCall,
@@ -149,6 +150,15 @@ export const CORRELATED_EVENTS = new Set([
 const WATCHDOG_INTERVAL_MS = 2_000;
 
 /**
+ * How long a step-advancing call may wait for its turn's transcript.
+ *
+ * Transcription lands within a second or so in the observed traces; the model
+ * can ask for a tool before it does. Beyond this the correlation is not worth
+ * trusting, and an unauthorised write is worse than a refusal.
+ */
+const TRANSCRIPT_WAIT_MS = 2_000;
+
+/**
  * What the model is told when the guard has cut it off from further tools.
  *
  * It has results in hand; the only thing missing is the sentence. Saying so
@@ -240,6 +250,19 @@ export function useRealtimeVoice(options: {
    */
   const ranThisTurnRef = useRef<Set<string>>(new Set());
   const lastResultRef = useRef<Map<string, unknown>>(new Map());
+
+  /**
+   * The recognition result for the current committed turn, and which turn it
+   * belongs to.
+   *
+   * Held in memory only — never written to the trace, the console, or the
+   * database. It exists solely so a step-advancing tool call can be checked
+   * against what the user actually said in the *same* turn.
+   */
+  const committedTurnRef = useRef(0);
+  const turnTranscriptRef = useRef<{ turn: number; text: string } | null>(null);
+  /** Step advances already authorised this turn. At most one. */
+  const advancesThisTurnRef = useRef(0);
 
   const onToolEffectRef = useRef(options.onToolEffect);
   useEffect(() => {
@@ -517,6 +540,11 @@ export function useRealtimeVoice(options: {
           ranThisTurnRef.current.clear();
           lastResultRef.current.clear();
           lastSignatureRef.current.clear();
+          // A new turn owns none of the last one's authority: its transcript,
+          // and the step advance it may have permitted, both expire here.
+          committedTurnRef.current += 1;
+          turnTranscriptRef.current = null;
+          advancesThisTurnRef.current = 0;
           advance({ type: 'committed', at: Date.now() });
           break;
 
@@ -582,6 +610,9 @@ export function useRealtimeVoice(options: {
           logRef.current.add('in', 'transcription.completed');
           if (event.transcript) {
             const transcript = event.transcript.trim();
+            // Kept against the turn it belongs to, so a tool call can only be
+            // authorised by the utterance that actually preceded it.
+            turnTranscriptRef.current = { turn: committedTurnRef.current, text: transcript };
             setState((current) => ({ ...current, userTranscript: transcript }));
             handleLivenessCheck(transcript);
           }
@@ -711,6 +742,32 @@ export function useRealtimeVoice(options: {
        * request. The model still needs an output for this call_id, so the
        * earlier result is replayed rather than the call being dropped.
        */
+      /*
+       * A step advance writes to the database, so the model's choice of tool
+       * is not enough on its own. "次の工程を教えて" moved the session twice and
+       * marked two steps complete; the gate below is what stops that, and it
+       * is fail-closed — no authorising utterance, no write.
+       */
+      if (name === 'advance_cooking_step') {
+        const transcript = await transcriptForThisTurn();
+        const decision = decideAdvance(transcript, advancesThisTurnRef.current);
+
+        if (decision !== 'allow') {
+          // The decision and its reason are recorded; the utterance is not.
+          logRef.current.add('internal', 'step_advance_refused', {
+            tool: name,
+            call: callId,
+            reason: decision,
+          });
+          setState((current) => ({ ...current, activeTool: null }));
+          deliverToolOutput(callId, refusedAdvanceOutput(decision, await readCurrentStep(args)));
+          return;
+        }
+
+        logRef.current.add('internal', 'step_advance_allowed', { tool: name, call: callId });
+        advancesThisTurnRef.current += 1;
+      }
+
       const repeat = decideRepeat(name, signature, ranThisTurnRef.current);
       if (repeat === 'replay' && signature !== null) {
         const key = repeatKey(name, signature);
@@ -992,6 +1049,58 @@ export function useRealtimeVoice(options: {
       });
 
       if (!ok) advance({ type: 'channel_lost', at: Date.now() });
+    }
+
+    /**
+     * The transcript for the turn this tool call belongs to, or null.
+     *
+     * Transcription finishes asynchronously and can land after the model has
+     * already asked for a tool, so this waits — but only briefly, and only for
+     * *this* turn. Returning null is a real answer: the gate treats it as "not
+     * authorised" rather than guessing which utterance a write belongs to.
+     */
+    async function transcriptForThisTurn(): Promise<string | null> {
+      const turn = committedTurnRef.current;
+      const deadline = Date.now() + TRANSCRIPT_WAIT_MS;
+
+      for (;;) {
+        const held = turnTranscriptRef.current;
+        if (held && held.turn === turn) return held.text;
+        // The turn moved on while waiting: whatever arrives now belongs to a
+        // different utterance than the one that asked for this tool.
+        if (committedTurnRef.current !== turn) return null;
+        if (Date.now() >= deadline) return null;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+
+    /**
+     * The current step, for a refusal that still answers the question.
+     *
+     * Read-only, and best-effort: if it cannot be fetched the refusal goes out
+     * without it rather than failing.
+     */
+    async function readCurrentStep(rawArgs: string): Promise<unknown> {
+      try {
+        const sessionId = (JSON.parse(rawArgs) as { session_id?: unknown }).session_id;
+        if (typeof sessionId !== 'string') return null;
+
+        const response = await fetch('/api/realtime/tool', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name: 'get_current_cooking_step',
+            arguments: JSON.stringify({ session_id: sessionId }),
+            call_id: null,
+          }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) return null;
+
+        return ((await response.json()) as { result?: unknown }).result ?? null;
+      } catch {
+        return null;
+      }
     }
 
     /** Returns whether the payload actually went out. */
