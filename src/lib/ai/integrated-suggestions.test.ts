@@ -761,6 +761,98 @@ describe('the schema makes the model decide', () => {
   });
 });
 
+describe('when the prompt asks for an inventory tool call, and when it does not', () => {
+  /**
+   * The QA turn opened with `get_inventory`, which cost a whole response and
+   * changed nothing: the voice instructions already carry 【現在の在庫】, and
+   * the candidate computation reads the inventory server-side anyway.
+   *
+   * These pin the boundary in both directions. Narrowing "always check the
+   * inventory" is only safe if the cases that genuinely need a fresh read
+   * still say so — a stale answer to 「今いくつある?」 and an inventory write
+   * made against a snapshot are both worse than a wasted response.
+   */
+  const voice = buildSystemPrompt({
+    profile: null,
+    session: null,
+    today: '2026-08-17',
+    mode: 'voice',
+    inventory: [{ name: 'じゃがいも', quantity: 2, unit: '個', daysLeft: null }],
+  });
+
+  it('tells the model not to fetch the inventory first for a named dish', () => {
+    expect(voice).toContain(
+      '料理名を指定されてレシピを作る・変更するときは、先に get_inventory を呼ばないでください',
+    );
+    expect(voice).toContain('同じ発話で買い物候補も求められている場合も同じです');
+  });
+
+  it('says why: the server reads the inventory for the candidates', () => {
+    expect(voice).toContain('不足材料の確定計算はサーバーが最新の在庫を読んで行う');
+    expect(voice).toContain('応答が1回分増えるだけです');
+  });
+
+  it('points the model at the embedded snapshot for deciding recipe content', () => {
+    expect(voice).toContain('レシピの内容は【現在の在庫】を見て決められます');
+    expect(voice).toContain('【現在の在庫】');
+  });
+
+  it('still requires a tool call when asked about the inventory itself', () => {
+    expect(voice).toContain('最新の在庫そのものを聞かれたら get_inventory を呼んでください');
+    expect(voice).toContain('ユーザーが最新確認を求めたときも同様です');
+  });
+
+  it('still requires a tool call when the snapshot is unavailable', () => {
+    expect(voice).toContain('【現在の在庫】が無いとき');
+  });
+
+  it('keeps the rules that guard an inventory write', () => {
+    // Unchanged, and they must stay: a write decided from a snapshot is the
+    // failure this app already fixed once.
+    expect(voice).toContain('特定の食材を変更するときは find_inventory_item で item_id を特定');
+    expect(voice).toContain('以前の get_inventory の結果から推測しないでください');
+    expect(voice).toContain('needs_clarification が返ったら在庫は変更されていません');
+    expect(voice).toContain('在庫を変更する前に必ずツールで最新を確認してください');
+  });
+
+  it('keeps the two-call search_meal_candidates route for 「今あるもので」', () => {
+    expect(voice).toContain('search_meal_candidates を2回使ってください');
+    expect(voice).toContain('1回目は candidates を null にして在庫を取得');
+    expect(voice).toContain('mode: "fridge_cleanup"');
+  });
+
+  it('still forbids answering about the inventory from memory', () => {
+    // The narrowing is about which *source* is acceptable, not about letting
+    // the model guess.
+    expect(voice).toContain('記憶や推測で答えないでください');
+    expect(voice).toContain('根拠は【現在の在庫】かツール結果のどちらかです');
+  });
+
+  it('still forbids inventing the shortfall list, without demanding a fetch', () => {
+    expect(voice).toContain('ツールを呼ばずに「不足している食材」を列挙しないでください');
+    expect(voice).toContain('先に get_inventory を呼べという意味ではありません');
+  });
+
+  it('scopes "check the inventory first" to proposing a dish', () => {
+    expect(voice).toContain('何を作るかをこちらから提案する前に、必ず在庫を確認してください');
+    expect(voice).toContain('ユーザーが料理名を指定したときは提案ではない');
+  });
+
+  it('applies the same boundary in text mode', () => {
+    // The snapshot is voice-only, but the rule about the server computing the
+    // shortfall is not.
+    const text = buildSystemPrompt({
+      profile: null,
+      session: null,
+      today: '2026-08-17',
+      mode: 'text',
+    });
+
+    expect(text).toContain('料理名を指定されてレシピを作る・変更するときは、先に get_inventory を呼ばないでください');
+    expect(text).toContain('最新の在庫そのものを聞かれたら get_inventory を呼んでください');
+  });
+});
+
 describe('the prompt draws the boundary between the two routes', () => {
   const prompt = buildSystemPrompt({
     profile: null,
