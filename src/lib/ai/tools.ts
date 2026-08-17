@@ -329,12 +329,8 @@ include_staples … 「調味料も含めて買い物候補を出して」。調
                 amount: { type: ['number', 'null'] },
                 unit: { type: ['string', 'null'] },
                 required: { type: 'boolean' },
-                substitute_options: {
-                  type: ['array', 'null'],
-                  items: { type: 'string' },
-                },
               },
-              required: ['name', 'amount', 'unit', 'required', 'substitute_options'],
+              required: ['name', 'amount', 'unit', 'required'],
               additionalProperties: false,
             },
           },
@@ -427,12 +423,8 @@ include_staples … 調味料・常備品も候補に含める。
                 amount: { type: ['number', 'null'] },
                 unit: { type: ['string', 'null'] },
                 required: { type: 'boolean' },
-                substitute_options: {
-                  type: ['array', 'null'],
-                  items: { type: 'string' },
-                },
               },
-              required: ['name', 'amount', 'unit', 'required', 'substitute_options'],
+              required: ['name', 'amount', 'unit', 'required'],
               additionalProperties: false,
             },
           },
@@ -1521,7 +1513,22 @@ function toRecipeInput(args: Record<string, unknown>) {
         amount: ingredient.amount ?? undefined,
         unit: ingredient.unit ?? undefined,
         required: ingredient.required ?? true,
-        substituteOptions: (ingredient.substitute_options as string[] | null) ?? undefined,
+        /*
+         * `substituteOptions` is deliberately not built here.
+         *
+         * It was declared to the model as an array of strings and arrived as
+         * an array of objects, so `create_recipe` failed validation on
+         * `ingredients.0.substituteOptions.0` and the turn spent a whole
+         * response retrying before the recipe could be saved. Nothing reads
+         * the field — it is stored and never rendered — so the model is no
+         * longer asked for it, and the arguments are no longer read for it.
+         * Guessing what its objects meant would be inventing recipe content.
+         *
+         * Omitted rather than set to `[]`: the field is optional in the stored
+         * schema, and an absent key is exactly what a recipe with no
+         * substitutes already looks like. Recipes saved with substitutes
+         * before this change keep them and still load.
+         */
       };
     }),
     steps: steps.map((raw, index) => {

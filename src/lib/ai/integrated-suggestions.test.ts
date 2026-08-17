@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { createFakeSupabase, type Row, type Tables } from '@/test/fake-supabase';
 import type { ServiceContext } from '@/lib/inventory/service';
+import { recipeIngredientSchema } from '@/lib/recipes/schemas';
 
-import { executeTool, TOOL_DEFINITIONS } from './tools';
+import { executeTool, realtimeToolDefinitions, TOOL_DEFINITIONS } from './tools';
 import { buildSystemPrompt } from './prompt';
 
 /**
@@ -565,6 +566,149 @@ describe('asking again for a different mode adds no row', () => {
 
     expect(JSON.stringify(tables.shopping_items)).toBe(shoppingBefore);
     expect(JSON.stringify(tables.inventory_items)).toBe(inventoryBefore);
+  });
+});
+
+describe('substitute_options is no longer asked for', () => {
+  /**
+   * The QA turn lost a whole response to this field.
+   *
+   * `substitute_options` was declared as an array of strings and the model
+   * sent an array of objects, so `create_recipe` failed validation on
+   * `ingredients.0.substituteOptions.0` and had to be retried. Nothing reads
+   * the field — it is stored and never rendered — so it is no longer part of
+   * what the model is asked to produce. The stored schema still allows it, and
+   * recipes that already have it still load.
+   */
+  function ingredientSchemaOf(name: string) {
+    const tool = TOOL_DEFINITIONS.find(
+      (definition) => definition.type === 'function' && definition.function.name === name,
+    );
+    if (!tool || tool.type !== 'function') throw new Error(`${name} is not defined`);
+    const params = tool.function.parameters as {
+      properties: { ingredients: { items: { properties: Record<string, unknown>; required: string[] } } };
+    };
+    return params.properties.ingredients.items;
+  }
+
+  it.each(['create_recipe', 'revise_recipe'])('is absent from the %s schema', (name) => {
+    const items = ingredientSchemaOf(name);
+
+    expect(Object.keys(items.properties)).not.toContain('substitute_options');
+    expect(items.required).not.toContain('substitute_options');
+    // The fields that do matter are still all required.
+    expect(items.required).toEqual(['name', 'amount', 'unit', 'required']);
+  });
+
+  it('is absent from the tools the voice session is given', () => {
+    expect(JSON.stringify(realtimeToolDefinitions())).not.toContain('substitute_options');
+  });
+
+  it('saves exactly one recipe, and stores no substitutes', async () => {
+    const { ctx, tables } = setup();
+
+    await create(ctx, recipeArgs({ shopping_suggestions_mode: 'none' }));
+
+    expect(tables.recipes).toHaveLength(1);
+    const stored = tables.recipes[0].ingredients as Record<string, unknown>[];
+    expect(stored.every((entry) => !('substituteOptions' in entry))).toBe(true);
+  });
+
+  it('saves a recipe even when the arguments carry the shape that used to fail', async () => {
+    const { ctx, tables } = setup();
+
+    // Exactly what the device sent: objects where strings were declared.
+    const outcome = await create(
+      ctx,
+      recipeArgs({
+        shopping_suggestions_mode: 'none',
+        ingredients: [
+          {
+            name: 'じゃが芋',
+            amount: 3,
+            unit: '個',
+            required: true,
+            substitute_options: [{ name: 'さつまいも', note: '甘くなる' }],
+          },
+        ],
+      }),
+    );
+
+    // No invalid_arguments, one row, and the objects reached nothing.
+    expect((outcome.result as { error?: string }).error).toBeUndefined();
+    expect(tables.recipes).toHaveLength(1);
+    expect(JSON.stringify(tables.recipes[0].ingredients)).not.toContain('さつまいも');
+    expect(JSON.stringify(tables.recipes[0].ingredients)).not.toContain('substituteOptions');
+  });
+
+  it('stores ingredients that still satisfy the persistence schema', async () => {
+    const { ctx, tables } = setup();
+
+    await create(ctx, recipeArgs({ shopping_suggestions_mode: 'none' }));
+
+    for (const ingredient of tables.recipes[0].ingredients as unknown[]) {
+      expect(recipeIngredientSchema.safeParse(ingredient).success).toBe(true);
+    }
+  });
+
+  it('adds one revision without touching the original or copying its substitutes', async () => {
+    const withSubstitutes = seedSourceRecipe({
+      ingredients: [
+        { name: '卵', amount: 2, unit: '個', required: true, substituteOptions: ['うずら卵'] },
+        { name: '顆粒だし', amount: 1, unit: '小さじ', required: true },
+      ],
+    });
+    const { ctx, tables } = setup({ recipes: [withSubstitutes] });
+    const originalBefore = JSON.stringify(tables.recipes[0]);
+
+    const outcome = await revise(
+      ctx,
+      recipeArgs({
+        source_recipe_id: SOURCE_RECIPE_ID,
+        title: '味噌汁（だしから）',
+        shopping_suggestions_mode: 'none',
+        ingredients: [
+          { name: '卵', amount: 2, unit: '個', required: true },
+          { name: '昆布', amount: 5, unit: 'g', required: true },
+        ],
+      }),
+    );
+
+    expect(tables.recipes).toHaveLength(2);
+    // The original keeps its substitutes, byte for byte.
+    expect(JSON.stringify(tables.recipes.find((row) => row.id === SOURCE_RECIPE_ID))).toBe(
+      originalBefore,
+    );
+    // The new row does not inherit them — a revision is new input, not a patch.
+    const revisedRow = tables.recipes.find(
+      (row) => row.id === integrated(outcome.result).recipe_id,
+    );
+    expect(JSON.stringify(revisedRow?.ingredients)).not.toContain('うずら卵');
+    expect(JSON.stringify(revisedRow?.ingredients)).not.toContain('substituteOptions');
+  });
+
+  it('still reads a recipe that was saved with substitutes before the change', async () => {
+    const legacy = seedSourceRecipe({
+      ingredients: [
+        { name: '卵', amount: 2, unit: '個', required: true, substituteOptions: ['うずら卵'] },
+        { name: '玉ねぎ', amount: 1, unit: '個', required: true },
+      ],
+    });
+    const { ctx } = setup({ recipes: [legacy] });
+
+    // Read back through a tool that walks the ingredients.
+    const outcome = await executeTool(
+      ctx,
+      'suggest_shopping_items',
+      JSON.stringify({ recipe_ids: [SOURCE_RECIPE_ID], include_staples: null }),
+    );
+
+    expect((outcome.result as { error?: string }).error).toBeUndefined();
+    expect(outcome.suggestions?.map((entry) => entry.name)).toEqual(['卵', '玉ねぎ']);
+    // And the stored row still parses under the schema that kept the field.
+    for (const ingredient of legacy.ingredients as unknown[]) {
+      expect(recipeIngredientSchema.safeParse(ingredient).success).toBe(true);
+    }
   });
 });
 
