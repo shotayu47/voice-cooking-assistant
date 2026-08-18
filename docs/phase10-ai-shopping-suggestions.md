@@ -1768,7 +1768,8 @@ id=e746748d-5747-4316-a9f9-323c27405b35
 原因調査は §20 と `b49cc3f` の計測で進んでおり、
 **枯渇枠が `tokens`（max=40000）であることは確定**しているが、
 **消費構造（Response数 × 会話長、出力枠の予約）は未確定**。
-E（Response削減・`max_output_tokens`・コンテキスト圧縮）は**未実装**。
+E のうち **Response 削減は実装した（§23）**。`max_output_tokens` とコンテキスト圧縮は**未実装**。
+発生頻度そのものへの効果は、1 回の QA では**未確定**（§23.6）。
 
 ### 22.6 この QA で確認できていないこと
 
@@ -1778,5 +1779,275 @@ E（Response削減・`max_output_tokens`・コンテキスト圧縮）は**未�
 - 改訂後に**古い recipe_id** で `suggest_shopping_items` を呼ぶ失敗は再現していない
 - 「かつお節を候補に入れて」→ revise への誘導は**未検証**
 - 改訂**失敗時**に古いカードが残ることは**自動テストのみ**が根拠
+
+**PHASE 10 は `IN_PROGRESS` を維持。** `docs/implementation-roadmap.md` は変更しない。
+
+---
+
+## 23. 音声QA —— Response 統合（`fe6aeb8` 〜 `d35a179`）
+
+| 項目 | 内容 |
+|---|---|
+| 対象 SHA | `d35a1795bcaf61a979bf42013376034ffb3fe54b` |
+| Preview deployment | `5938349392`（Preview / `production_environment: false` / success） |
+| 環境 | **Vercel Preview**（Production ではない） |
+| 端末 | **iPhone 実機 / Safari** |
+| 記録日 | 2026-08-18 |
+| 結果 | **PASS**（1発話・2 Response で完走） |
+
+§21 の「1発話で `create_recipe → suggest_shopping_items` → 候補カード」は完走したが、
+そのために **3 Response** を要していた。1 Response の入力は実測で約 10,000〜11,000 tokens
+（§22.5）で、枯渇するのは `tokens` 枠である。ここで削るべきは応答の速さではなく
+**Response の本数**だった。
+
+### 23.1 実装したもの
+
+| SHA | 内容 |
+|---|---|
+| `fe6aeb8` | `create_recipe` / `revise_recipe` に候補生成を同梱。中間の continuation を不要にした |
+| `0a925a5` | 候補モードを `none` / `missing_only` / `include_staples` の enum 化。**書き込み identity と表示モードを分離** |
+| `46e7a0f` | `substitute_options` を公開 tool 入力から除外（§23.5 A3） |
+| `d35a179` | 不要な `get_inventory` 先行呼び出しを減らす prompt 境界（§23.5 B） |
+
+**結果の形**
+
+- 成功結果に `shopping_suggestions_handled: true` を載せる。
+  クライアントはこれだけを読んで「候補の半分は片付いた」と判定する
+- 候補の状態は **`shopping_suggestions.status = ok | empty | failed`**。
+  **候補専用オブジェクトの中**に置き、トップレベルには置かない
+- **候補計算の失敗はレシピ保存の失敗にしない。** レシピは先に確定しており、
+  候補計算だけを try/catch で囲む。例外を `describeToolFailure` へ到達させると
+  モデルには `create_recipe` が失敗したように見え、**同じレシピをもう一度作る**
+- 候補 0 件は `empty`。エラーではなく、カードも作らない（既存規則どおり）
+
+**Response の終端**
+
+- 統合結果を返した直後の `response.create` は **`tool_choice: 'none'`**。
+  「呼ばないでください」という依頼ではなく、**tool call を構造的に不可能にする**
+- 診断のため `metadata: { purpose: 'integrated_final' }` を付け、
+  通常の continuation と区別できるようにした
+- forced final とは**別の payload builder**（`src/lib/voice/integrated-final.ts`）。
+  forced final は予算切れの復旧で `canRetry` を false にする経路であり、
+  正常終了である統合最終に同じ指示を流用すると意味が変わる
+
+**維持したもの**
+
+- `suggest_shopping_items` **単独経路は変更していない**。
+  既存レシピの候補だけを求められたときは従来どおりこちらを使う
+- 候補生成は **`shopping_items` にも `inventory_items` にも書き込まない**
+- `supersedes_recipe_id` と card lineage による置換、カードの初期チェック全件 OFF、
+  `requestId` / at-most-once はいずれも未変更
+
+**同一レシピ内容で候補モードだけ変わった場合、レシピを再 INSERT しない**
+
+`argumentSignature` は引数オブジェクト全体を digest するため、
+**レシピ本体が同一でも候補モードが違えば別の digest** になる。そのままでは
+`decideRepeat` が両方 `execute` を返し、**同じレシピ行が 2 回 INSERT されうる**。
+サーバーの `runOnce` は `call_id` キーで、モデルは毎回新しい `call_id` を発行する。
+`recipes` に title の unique 制約も無い。止めるものが無かった。
+
+そこで identity を分けた。`writeSignature()` は**書き込みに影響しない引数**
+（`shopping_suggestions_mode`）を除いて digest する。repeat の記憶はこちらで引く。
+
+| 条件 | 判定 | 挙動 |
+|---|---|---|
+| write 未記録 | `execute` | 通常実行 |
+| write 一致・request 一致 | `replay` | 保存済み結果と候補を再利用 |
+| write 一致・request 相違 | `reuse` | **レシピを書かず**、既存 `recipe_id` で候補だけ再取得 |
+
+`reuse` の再取得は `suggest_shopping_items` を通す。**構造上 read-only なツール**なので、
+「レシピを書いてはいけない経路」が誤って到達しても書けない。
+
+**Realtime へ送る tools JSON の文字数**
+
+```text
+12,971 → 12,783 chars（差 -188 chars）
+```
+
+⚠️ **これは文字数であり、トークン数ではない。**
+`realtimeToolDefinitions()` の `JSON.stringify(...).length` を、変更前後の同じ生成物・
+同じシリアライズ方法で測った値。`TOOL_DEFINITIONS`（Chat Completions 形）でも
+`13,166 → 12,978` で差は同じ -188。両者の 195 文字差は function ラッパー分
+（1 ツールあたり 13 文字 × 15 ツール）であって、内容の差ではない。
+
+### 23.2 実機で観測した事実
+
+発話（1回のみ、追加発話なし）:
+
+> 肉じゃがのレシピを作って、足りない材料の買い物候補も出してください。
+
+**画面**
+
+| 観測項目 | 結果 |
+|---|---|
+| 追加発話なしで完了 | **PASS** |
+| 買い物候補パネル | **1枚** |
+| 候補 | **4件** |
+| 初期チェック | **全件 OFF** |
+| 最終回答の読み上げ | **最後まで完了** |
+| エラー・再試行UI | **非表示** |
+
+**トレース実測**
+
+```text
+Response 数: 2
+
+R1  create_recipe        input=10138  output=1122  total=11260  cached=0
+    tool: transport=ok / outcome=ok
+
+R2  purpose=integrated_final
+                         input=4929   output=860   total=5789   cached=0
+    status=completed
+
+合計                     input=15067  output=1982  total=17049  cached=0
+発話停止 → 最終 completed: 18.023 秒
+```
+
+トレースに**出ていない**もの:
+
+- `get_inventory`
+- standalone `suggest_shopping_items`
+- `invalid_arguments`
+- 通常の `purpose=continuation`
+- forced final
+- continuation guard
+- tool repeat（`tool_repeat_skipped` / `tool_repeat_reused`）
+- watchdog 発火
+- rate-limit 失敗
+
+### 23.3 前回観測との比較
+
+| 項目 | 前回（4 Response） | 今回 |
+|---|---:|---:|
+| Response 数 | 4 | **2** |
+| input | 38,612 | 15,067 |
+| output | 3,370 | 1,982 |
+| total | 41,982 | **17,049** |
+| 発話停止 → 完了 | 30.930 秒 | **18.023 秒** |
+
+合計トークンは **24,933 減、観測上 約 59.4%** である。
+
+⚠️ **厳密な性能比較ではない。** 別実行であり、キャッシュ・rolling window・
+生成内容（レシピの長さ、候補件数）がいずれも異なる。
+**恒常的な削減率として扱わないこと。**
+
+前回の 4 Response は「統合が効かなかった」のではない。内訳は
+`get_inventory`（1本・無駄）、`invalid_arguments` の再試行（1本・無駄）、
+`create_recipe`（1本）、`integrated_final`（1本）で、**統合自体は前回も 1 本削っていた**。
+今回消えた 2 本は §23.5 の A3 と B が狙った先行呼び出しと引数エラーである。
+
+### 23.4 DB 読み取り検証（SELECT のみ）
+
+baseline（QA 直前に取得）:
+
+```text
+2026-08-17T21:16:02.957Z
+recipes         = 31（全 id 記録）
+shopping_items  = 3（全 id 記録）
+inventory_items = 11（全 id 記録）
+```
+
+QA 後:
+
+```text
+recipes = 32
+新規行 = 1件
+  id         = 69470d8f-0ef1-48b5-9123-f2301f3eee95
+  title      = 肉じゃが
+  created_at = updated_at = 2026-08-18T15:51:08.597109Z
+```
+
+**件数ではなく baseline の 31 id との set 差分で判定した。**
+肉じゃがは DB 全体に 13 件あるため、タイトルの総数では判定できない。
+
+| 確認項目 | 結果 |
+|---|---|
+| baseline 31 id との差分 | **新規 1 件のみ**（削除 0 件） |
+| 既存レシピ 31 行 | **更新なし**（`updated_at > baseline` の行が 0 件） |
+| 新規行の ingredients | **11 件** |
+| `substituteOptions` / `substitute_options` キー | **どちらも存在しない**（実在キーは name / unit / amount / required の 4 つ） |
+| ingredients の schema 適合 | **11 件すべて `recipeIngredientSchema` に適合**（実際の zod を読み込んで検証） |
+| `ai_tool_calls` | **`create_recipe` 1 行のみ** |
+| 保存結果 | `shopping_suggestions_handled: true` / `status: ok` / `added: false` |
+| 候補 | 牛肉 / じゃがいも / にんじん / だし汁（4件） |
+| `get_inventory` | **0 回** |
+| standalone `suggest_shopping_items` | **0 回** |
+| `shopping_items` | **3 件不変**（id・全値・`updated_at` とも） |
+| `inventory_items` | **11 件不変**（同上） |
+| DB 書き込み | **`recipes` への INSERT 1 件以外なし** |
+
+候補の内容も在庫と整合している。じゃがいも・にんじん・だし汁は在庫に無く `absent`、
+牛肉は `expiry_date = 2026-08-13` で QA 時点は期限切れのため `expired`。
+`status: ok` は妥当である。
+
+⚠️ `updated_at` は全 4 テーブルで `BEFORE UPDATE` トリガ（`set_updated_at`）により
+自動更新される。したがって「`updated_at` が baseline 以前のまま」は、
+**アプリ経路によらず行が書き換えられていないことの証拠**になる。
+
+### 23.5 保証範囲
+
+**根拠の種類を混同しないこと。**
+
+#### A3（`substitute_options`）—— 構造的保証
+
+`substitute_options` は**公開 tool schema から削除**され、`toRecipeInput` でも
+**読み取られない**。したがってモデルが未知の同名フィールドを送っても
+**zod へ到達しない。このフィールドを原因とする zod 失敗は構造的に遮断されている。**
+
+失敗の実体は台帳に残っていた:
+
+```text
+2026-08-17T02:46:49Z  create_recipe  status=done
+  error   : invalid_arguments
+  field   : ingredients.0.substituteOptions.0
+  message : Invalid input: expected string, received object
+```
+
+宣言は `items: { type: 'string' }`、zod も `z.array(z.string())` で一致しており、
+モデルが宣言済み JSON Schema に違反した形だった。
+**オブジェクトから文字列への推測変換は採用していない**（レシピ内容の捏造になる）。
+
+⚠️ ただし**別フィールドによる `invalid_arguments` は依然として起こり得る。**
+音声経路ではインストール済み SDK の `RealtimeFunctionTool` に `strict` が無く、
+スキーマ遵守の構造的強制は使えないままである。
+
+#### B（`get_inventory` の抑制）—— 今回の実機観測 PASS
+
+事前 `get_inventory` が 0 回だったことは、トレースと DB 台帳の双方で確認した。
+**これは prompt による誘導であり、将来の tool 選択を構造的に禁止するものではない。**
+工程ゲート・在庫ゲートのような fail-closed の強制ではない。
+
+前回それを誘発していたのは次の 2 文で、削除ではなく境界を狭めた:
+
+- 「料理を提案する前に必ず在庫を確認してください」→ **提案（何を作るか選ぶ）に限定**。
+  ユーザーが料理名を指定した場合は提案ではない
+- 「在庫について答える前に必ず `get_inventory` を呼んでください」→
+  推測禁止は維持したまま、**根拠として【現在の在庫】を認める**
+
+最新在庫そのものを聞かれたとき、スナップショットが無いとき、ユーザーが明示的に
+最新確認を求めたときは従来どおり呼ぶ。**在庫の書き込み前の最新確認規則、
+`find_inventory_item` 経由の item_id 特定、`search_meal_candidates` の 2 回呼び出しは
+いずれも未変更。**
+
+#### 統合後の終端 —— 特定範囲の構造的保証
+
+**正しい引数で `create_recipe` または `revise_recipe` が成功し、統合候補が処理された後は、
+`tool_choice: 'none'` により 1 本の最終 Response で終端する。**
+
+⚠️ **ターン全体が常に 2 Response になる保証ではない。**
+モデルによる先行 tool 選択と、別フィールドの引数エラーは保証範囲外である。
+「1 発話 = 2 Response」はターンの下限であって、上限ではない。
+
+### 23.6 この QA で確認できていないこと
+
+- **`include_staples` の実機 QA は未実施**（「調味料も含めて」の経路）
+- **`revise_recipe` 統合後の 2 Response とカード置換は未実施**
+- **`shopping_suggestions_mode: 'none'` の実機 QA は未実施**
+- **`ok` 以外 —— `empty` / `failed` は自動テストのみ**が根拠。実機では未発火
+- **rate-limit 発生頻度への効果は 1 回の QA だけでは未確定。**
+  今回は rate-limit 失敗が起きなかったが、起きない条件を確かめたわけではない
+- **B の再現性に構造的保証は無い**（§23.5 B）
+- `reuse`（同一レシピ・別モード）経路は**実機で一度も発火していない**。
+  防御的経路であり、根拠は自動テストのみ
 
 **PHASE 10 は `IN_PROGRESS` を維持。** `docs/implementation-roadmap.md` は変更しない。
