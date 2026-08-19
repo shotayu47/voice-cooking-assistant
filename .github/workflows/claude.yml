@@ -1,0 +1,44 @@
+name: Claude Code
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --max-turns 10
+            --allowedTools "Bash(npm ci),Bash(npm run typecheck),Bash(npm run lint),Bash(npm test),Bash(npm run build),Bash(npm run check:migrations),Bash(npm run audit:rls)"
+            --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Follow the repository's existing scope and quality gates. Do not modify or reveal secrets. Do not merge branches. Never claim a test, migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
