@@ -59,7 +59,7 @@ jobs:
           claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
           label_trigger: agent-ready
           claude_args: |
-            --max-turns 10
+            --max-turns 20
             --allowedTools "Edit,Write,Bash(npm ci),Bash(npm run typecheck),Bash(npm run lint),Bash(npm test),Bash(npm run build),Bash(npm run check:migrations),Bash(npm run audit:rls)"
             --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the labeled issue body as the complete task specification. Follow the repository's existing scope and quality gates. If the task requires changes, make only the requested changes, run the required quality gates, commit them, and push the branch. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a test, migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
 
@@ -140,10 +140,12 @@ jobs:
 
           text = path.read_text(errors="replace").lower()
 
-          if any(s in text for s in ["invalid bearer", "could not resolve authentication", "authentication credentials", "unauthorized", "status code 401", "api error: 401"]):
-              category = "AUTHENTICATION"
+          if any(s in text for s in ["error_max_turns", "reached maximum number of turns", "maximum number of turns"]):
+              category = "MAX_TURNS"
           elif any(s in text for s in ["usage limit", "rate limit", "rate_limit", "quota", "too many requests", "status code 429", "api error: 429"]):
               category = "USAGE_OR_RATE_LIMIT"
+          elif any(s in text for s in ["invalid bearer", "could not resolve authentication", "authentication credentials", "unauthorized", "status code 401", "api error: 401"]):
+              category = "AUTHENTICATION"
           elif "model" in text and any(s in text for s in ["not found", "unavailable", "not available", "access", "unsupported"]):
               category = "MODEL_ACCESS"
           elif "permission" in text or "requires approval" in text:
