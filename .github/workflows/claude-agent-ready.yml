@@ -14,7 +14,7 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
-      actions: read
+      actions: write
 
     steps:
       - name: Checkout repository
@@ -60,8 +60,71 @@ jobs:
           label_trigger: agent-ready
           claude_args: |
             --max-turns 10
-            --allowedTools "Bash(npm ci),Bash(npm run typecheck),Bash(npm run lint),Bash(npm test),Bash(npm run build),Bash(npm run check:migrations),Bash(npm run audit:rls)"
-            --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the labeled issue body as the complete task specification. Follow the repository's existing scope and quality gates. Do not modify or reveal secrets. Do not merge branches. Never claim a test, migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
+            --allowedTools "Edit,Write,Bash(npm ci),Bash(npm run typecheck),Bash(npm run lint),Bash(npm test),Bash(npm run build),Bash(npm run check:migrations),Bash(npm run audit:rls)"
+            --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the labeled issue body as the complete task specification. Follow the repository's existing scope and quality gates. If the task requires changes, make only the requested changes, run the required quality gates, commit them, and push the branch. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a test, migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
+
+      - name: Create pull request when Claude pushed changes
+        id: pr
+        if: steps.claude.outcome == 'success' && steps.claude.outputs.branch_name != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          set -euo pipefail
+
+          if ! git ls-remote --exit-code --heads origin "refs/heads/${BRANCH_NAME}" >/dev/null 2>&1; then
+            echo "Claude did not push a remote branch; no PR to create."
+            exit 0
+          fi
+
+          git fetch --no-tags origin \
+            "main:refs/remotes/origin/main" \
+            "${BRANCH_NAME}:refs/remotes/origin/${BRANCH_NAME}"
+
+          if git diff --quiet "origin/main...origin/${BRANCH_NAME}"; then
+            echo "Claude branch has no changes relative to main; no PR to create."
+            exit 0
+          fi
+
+          existing_pr="$(gh pr list --state open --base main --head "${BRANCH_NAME}" --json number --jq '.[0].number // empty')"
+          if [ -n "${existing_pr}" ]; then
+            echo "Pull request #${existing_pr} already exists."
+            echo "number=${existing_pr}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          cat > /tmp/agent-pr-body.md <<EOF
+          Automated implementation for #${ISSUE_NUMBER}.
+
+          This pull request was created automatically after Claude Code pushed changes from an \`agent-ready\` issue.
+
+          - Source issue: #${ISSUE_NUMBER}
+          - Human merge remains required.
+          - CI is dispatched explicitly after PR creation.
+          EOF
+
+          pr_url="$(gh pr create \
+            --base main \
+            --head "${BRANCH_NAME}" \
+            --title "${ISSUE_TITLE}" \
+            --body-file /tmp/agent-pr-body.md)"
+
+          pr_number="$(gh pr view "${pr_url}" --json number --jq '.number')"
+          echo "Created pull request #${pr_number}: ${pr_url}"
+          echo "number=${pr_number}" >> "${GITHUB_OUTPUT}"
+
+      - name: Dispatch CI for the Claude branch
+        if: steps.pr.outputs.number != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+        run: |
+          gh workflow run ci.yml --ref "${BRANCH_NAME}"
+          echo "Dispatched CI for ${BRANCH_NAME}."
 
       - name: Classify Claude failure safely
         if: failure() && steps.claude.outcome == 'failure'
