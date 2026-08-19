@@ -33,6 +33,23 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Check OAuth secret format safely
+        shell: bash
+        env:
+          CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          token = os.environ.get("CLAUDE_TOKEN", "")
+          if not token:
+              raise SystemExit("CLAUDE_OAUTH_PREFLIGHT=FAIL_EMPTY")
+          if any(ch.isspace() for ch in token):
+              raise SystemExit("CLAUDE_OAUTH_PREFLIGHT=FAIL_WHITESPACE")
+          if not token.startswith("sk-ant-oat"):
+              raise SystemExit("CLAUDE_OAUTH_PREFLIGHT=FAIL_PREFIX")
+          print("CLAUDE_OAUTH_PREFLIGHT=PASS")
+          PY
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
@@ -42,3 +59,31 @@ jobs:
             --max-turns 10
             --allowedTools "Bash(npm ci),Bash(npm run typecheck),Bash(npm run lint),Bash(npm test),Bash(npm run build),Bash(npm run check:migrations),Bash(npm run audit:rls)"
             --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Follow the repository's existing scope and quality gates. Do not modify or reveal secrets. Do not merge branches. Never claim a test, migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
+
+      - name: Classify Claude failure safely
+        if: failure() && steps.claude.outcome == 'failure'
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("/home/runner/work/_temp/claude-execution-output.json")
+          if not path.exists():
+              print("CLAUDE_FAILURE_CATEGORY=NO_OUTPUT_FILE")
+              raise SystemExit(0)
+
+          text = path.read_text(errors="replace").lower()
+
+          if any(s in text for s in ["invalid bearer", "could not resolve authentication", "authentication credentials", "unauthorized", "status code 401", "api error: 401"]):
+              category = "AUTHENTICATION"
+          elif any(s in text for s in ["usage limit", "rate limit", "rate_limit", "quota", "too many requests", "status code 429", "api error: 429"]):
+              category = "USAGE_OR_RATE_LIMIT"
+          elif "model" in text and any(s in text for s in ["not found", "unavailable", "not available", "access", "unsupported"]):
+              category = "MODEL_ACCESS"
+          elif "permission" in text or "requires approval" in text:
+              category = "TOOL_PERMISSION"
+          else:
+              category = "UNKNOWN"
+
+          print(f"CLAUDE_FAILURE_CATEGORY={category}")
+          PY
