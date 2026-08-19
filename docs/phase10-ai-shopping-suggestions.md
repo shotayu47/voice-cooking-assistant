@@ -2040,8 +2040,8 @@ recipes = 32
 
 ### 23.6 この QA で確認できていないこと
 
-- **`include_staples` の実機 QA は未実施**（「調味料も含めて」の経路）
-- **`revise_recipe` 統合後の 2 Response とカード置換は未実施**
+- `include_staples` の実機 QA は**実施済み**（`22aa3c0` 上。定番品が候補化されることを確認）
+- `revise_recipe` 統合後の 2 Response とカード置換も**実施済み**（§24）
 - **`shopping_suggestions_mode: 'none'` の実機 QA は未実施**
 - **`ok` 以外 —— `empty` / `failed` は自動テストのみ**が根拠。実機では未発火
 - **rate-limit 発生頻度への効果は 1 回の QA だけでは未確定。**
@@ -2051,3 +2051,302 @@ recipes = 32
   防御的経路であり、根拠は自動テストのみ
 
 **PHASE 10 は `IN_PROGRESS` を維持。** `docs/implementation-roadmap.md` は変更しない。
+
+---
+
+## 24. 音声QA —— 多段レシピ改訂と候補カード lineage（`24e24bb`）
+
+| 項目 | 内容 |
+|---|---|
+| 対象 SHA | `24e24bb179f4d6a8311334a78dbc08a7a74853a4` |
+| Preview deployment | `5987262598`（Preview / `production_environment: false` / success） |
+| immutable host | `voice-cooking-assistant-focb-7p12v5owo-shotayu47s-projects.vercel.app` |
+| 環境 | **Vercel Preview**（Production ではない） |
+| 端末 | **iPhone 実機 / Safari** |
+| 記録日 | 2026-08-19 |
+| 結果 | **PASS**（3ターン・2回改訂後も候補パネルは1枚） |
+
+§22 で直したのは**1回目**の改訂だった。`eac0cfb` 以降、改訂後の候補は古いカードを置換する。
+ところが**2回目**の改訂で同じ失敗が戻る —— 変更済みの版の候補を載せた古いパネルが、
+最新のパネルと並んで残る。§23 の Response 統合とは無関係の、別の欠陥である。
+
+### 24.1 直したもの —— lineage の寿命
+
+カードのキーは `lineageRoot()` が revision chain を遡って決める。関数は正しく、
+`{r3→r2, r2→r1}` を渡せば `r3` から `r1` まで辿るテストも既にあった。
+壊れていたのは**渡される chain のほう**である。
+
+chain は音声 hook が持ち、`input_audio_buffer.committed` ごとに作り直されていた。
+つまり**1リンクしか保持できない。**
+
+```text
+turn1  chain {}          root(V1)=V1  → card key = V1
+turn2  chain {V2→V1}     root(V2)=V1  → key 一致、旧カードを置換 → 1枚
+turn3  chain {V3→V2}     root(V3)=V2  → 既存カードの key V1 と一致せず → 2枚
+       （V2→V1 は turn3 の committed で失われている）
+```
+
+**寿命の不一致が原因。** カードは `messages`（ChatView の state）にあり
+「新しい会話」まで残るのに、そのキーを決める chain は1発話で消えていた。
+
+修正（`24e24bb`）:
+
+- chain を **ChatView へ移設**し、カードと同じ寿命にした。
+  `startNewConversationAction` が成功したときだけ `setMessages([])` と同じ箇所で clear する。
+  action 失敗・catch では両方とも保持する。音声の通常 commit・切断・再接続では clear しない
+- 改訂の通知を**カード表示と切り離した**。`onSuggestions` は候補0件では呼ばれないため、
+  それに相乗りさせると `mode: 'none'`・`empty`・`failed` の改訂で edge が欠落する。
+  hook は `onRecipeRevision` で改訂そのものを通知し、**全サイトでカード表示より先に**呼ぶ
+  （通常経路・replay・reuse）。レシピ行を書かなかった改訂は通知しない
+- 累積は純粋関数 `withRevisionEdge()`（immutable・冪等・複数 lineage 可）
+
+テストは 981 → **1003 件**（+22）。既存 assertion は1件も変更していない。
+ターン境界を挟んだ多段改訂を、**実際と同じ「edge通知 → 累積 → カード適用」の順序**で
+再現している。旧挙動（ターンごとに chain を作り直す）へ差し戻すと **22件中7件が FAIL** する
+ことも確認済みで、テストが症状を実際に捉えることの裏づけになっている。
+
+⚠️ **ChatView が正しい箇所で clear/累積を呼ぶ配線そのものは自動テスト外。**
+このリポジトリは `environment: 'node'` かつ React Testing Library が無く、
+ChatView をレンダするテストが書けない。ロジックは純粋関数で検証済みだが、
+**呼び出し位置はコード読解による確認**である。
+
+### 24.2 ⚠️ 最初の3ターンQAは**修正前 build** で実施していた
+
+| 項目 | 内容 |
+|---|---|
+| host | `voice-cooking-assistant-focb-r655kgg31-shotayu47s-projects.vercel.app` |
+| deployment | `5966641298` |
+| SHA | `22aa3c0`（**修正前**） |
+
+このQAでは2回目の改訂後に**パネルが2枚**残った。これは §24.1 の機構がそのまま現れたもので、
+**修正前 build における既知バグの再現として PASS** である。
+
+```text
+22aa3c0 で既知バグを再現   : PASS
+24e24bb の受入判定に利用    : 不可
+24e24bb の回帰・修正失敗   : ではない
+```
+
+⚠️ **この結果を `24e24bb` の失敗として扱わないこと。** 使用 URL は Safari のアドレス欄から
+確認済みで、`r655kgg31` は修正前 deployment の immutable host である。
+
+なお、このQAで得た DB lineage（V1→V2→V3）・候補内容・tool順・副作用なしという観測は
+**`22aa3c0` 上の実測として有効**である。サーバー側の経路は両 build で同一で、
+差があるのはクライアントのカード表示だけだからである。
+
+### 24.3 正しい Preview の特定
+
+```text
+URL    : https://voice-cooking-assistant-focb-7p12v5owo-shotayu47s-projects.vercel.app/chat?voiceDebug=1
+host   : voice-cooking-assistant-focb-7p12v5owo-shotayu47s-projects.vercel.app
+deploy : 5987262598
+sha    : 24e24bb179f4d6a8311334a78dbc08a7a74853a4
+environment / production_environment / status : Preview / false / success
+```
+
+**build の識別は immutable host `7p12v5owo` で確定している。** deployment API を読み取り、
+host ↔ deployment ↔ SHA の対応を確認した。
+
+識別用に `qa=lineage-24e24bb` を付ける案もあったが、最終的な URL には付いていない。
+`/chat` が読む query key は `voiceDebug` だけ（`isVoiceDebugEnabled`）で、
+他のキーは無視されるため、**付けても付けなくても機能・状態・キャッシュ判定に影響しない。**
+
+### 24.4 実機で観測した事実（画面）
+
+発話は各ターン1回のみ、ターン間は無言で 65 秒以上待機。
+
+| | 候補 | キャプション | 初期チェック |
+|---|---|---|---|
+| ターン1 | 豆腐 150g / 白菜 100g / 水 400ml / 鶏ガラスープの素 1小さじ | 通常 | 全件 OFF |
+| ターン2 | 鮭 150g / しめじ 50g / 水 400ml / 鶏ガラスープの素 1小さじ | `REVISED_CARD_NOTICE` | 全件 OFF |
+| ターン3 | 豚肉 150g / 大根 100g / 水 400ml / 鶏ガラスープの素 1小さじ | `REVISED_CARD_NOTICE` | 全件 OFF |
+
+**ターン3完了後、チャットを上から下まで確認した結果:**
+
+```text
+買い物候補パネル総数 : 正確に 1 枚
+残っていたパネル    : 豚肉・大根の最新版のみ
+豆腐・白菜の旧パネル : 残存なし
+鮭・しめじの旧パネル : 残存なし
+```
+
+⚠️ **「候補4件」と「買い物候補パネル1枚」は別の数である。**
+1枚のパネルが4件の候補行を内包している。判定対象は**パネルの枚数**であり、
+「最新パネルの内容が正しい」ことだけでは PASS にしない。
+
+### 24.5 トレース実測（redacted・165 entries）
+
+原文から独立に再計算した。全 Response で `input + output == total` が成立する。
+
+```text
+session.start                 : 1 回
+response.created              : 10 本
+  completed                   : 6 本（R2 / R3 / R6 / R7 / R9 / R10）
+  cancelled                   : 4 本（R1 / R4 / R5 / R8）
+主要3ターンの成功区間          : 各ターン 2 completed Response
+purpose=integrated_final      : 3 回
+実行された tool               : create_recipe 1 回 / revise_recipe 2 回
+recipe_revised                : 2 回
+standalone suggest_shopping_items : 0 回
+get_inventory                 : 0 回
+invalid_arguments             : 0 回
+watchdog.arm / clear / fire   : 10 / 10 / 0
+continuation guard / forced final / repeat skip / replay / reuse : すべて 0
+rate-limit 失敗               : 0 件
+```
+
+| 区間 | input | output | total | cached |
+|---|---:|---:|---:|---:|
+| ターン1 R1–R3 | 25,196 | 3,107 | 28,303 | 10,048 |
+| ターン2 R4–R7 | 43,303 | 1,548 | 44,851 | 36,544 |
+| ターン3 R8–R10 | 21,209 | 1,522 | 22,731 | 19,840 |
+| セッション全体 | 89,708 | 6,177 | 95,885 | 66,432 |
+| うち completed 6本 | 54,564 | 6,085 | 60,649 | 46,336 |
+| うち cancelled 4本 | 35,144 | 92 | 35,236 | 20,096 |
+
+`cached` は input の内数であり、total へ別途加算していない。
+
+**cancelled 4本**
+
+```text
+R1  total=10,160  C1 の引数生成後に cancelled  calls_skipped  tool_start なし
+R4  total=13,343                               calls_skipped  tool_start なし
+R5  total=11,733  C3 の引数生成後に cancelled  calls_skipped  tool_start なし
+R8  total=0                                    calls_skipped  tool_start なし
+```
+
+**C1 と C3 は引数生成まで進んだが、`calls_skipped` により実行されていない。**
+DB にも対応する余分な tool 台帳行・recipe 行は存在しない（§24.6）。
+§15.1 で直した「cancelled な Response の function call を実行してしまう」欠陥に対する
+ガードが、**今回2回作動した**記録である。⚠️ 課金額はトレースからは断定しない。
+
+**待機と発話境界**
+
+```text
+ターン1完了 → 次の発話 : 131.514 秒
+ターン2完了 → 次の発話 :  93.795 秒     どちらも 65 秒条件を満たす
+
+ターン1  I1停止 → speech_started : 691ms
+ターン2  I3停止 → speech_started : 420ms
+         I4停止 → speech_started : 598ms
+ターン3  I6停止 → speech_started : 173ms
+```
+
+ターン2は**計画した1ターンが3つの committed item に分かれている。**
+⚠️ 原因が VAD・話し方・環境音のどれかは**トレースだけからは断定しない。**
+
+**rate limit**（`max=40000`・6 件）
+
+```text
+remaining : 26,384 → 31,795 → 13,891 → 10,916 → 21,283 → 16,793
+最小       : 10,916      失敗 : 0 件
+```
+
+### 24.6 DB 読み取り検証（SELECT のみ）
+
+fresh baseline（QA 直前）:
+
+```text
+2026-08-19T17:55:49.149Z
+recipes 37 / ai_tool_calls 136 / shopping_items 3 / inventory_items 11 / cooking_sessions 8
+```
+
+QA 後: `recipes 40` / `ai_tool_calls 139` / 他3テーブルは不変。
+
+**recipes** —— baseline 37 IDs との **set 差分**で判定した（同じ料理名が既に複数あるため、
+タイトルでは判定できない）。
+
+| 確認項目 | 結果 |
+|---|---|
+| 追加 | **ちょうど 3 件**／削除 0 件 |
+| baseline 37 行の `updated_at` 変化 | **0 件** |
+| baseline 37 行の `created_at == updated_at` | **維持**（既存レシピの in-place 更新なし） |
+| 新規 3 行の `created_at == updated_at` | **3/3 成立** |
+
+```text
+N1  98951e29…  豆腐と白菜のあっさり中華風スープ
+N2  976a5e46…  鮭としめじの中華風スープ
+N3  5699a299…  豚肉と大根の中華風スープ
+```
+
+**ingredients** —— 各 8 件、計 24 件すべて実 `recipeIngredientSchema` に適合。
+キー集合は `name` / `unit` / `amount` / `required` のみで、
+`substituteOptions`・`substitute_options`・想定外フィールドは**いずれも不在**（`46e7a0f` の効果）。
+
+```text
+N1  豆腐 required=true / 白菜 required=true   鮭・しめじ・豚肉・大根なし
+N2  鮭  required=true / しめじ required=true  豆腐・白菜・豚肉・大根なし
+N3  豚肉 required=true / 大根 required=true   豆腐・白菜・鮭・しめじなし
+```
+
+**ai_tool_calls** —— 136 → 139。追加は**ちょうど 3 件**で、順序は
+`create_recipe → revise_recipe → revise_recipe`。その他の tool は 0 件。
+全件 `status=done`、top-level error なし。
+
+**lineage** —— `supersedes_recipe_id` は recipes 本体ではなく **tool result 内**に保存される。
+実 ID で照合した。
+
+```text
+N2.supersedes_recipe_id == N1.recipe_id   ✓
+N3.supersedes_recipe_id == N2.recipe_id   ✓
+```
+
+カード payload の `sourceRecipes` も各ターン自分の recipe id 単独で、
+**クライアントが多段 lineage を解決するための入力は正しく揃っていた。**
+
+**候補結果** —— 3件とも `shopping_suggestions_handled: true` / `status: ok` / `added: false`、
+候補は**各 4 件**、`reason` は全件 `absent`、`already_on_list` は全件 false。
+画面とDBで候補名・数量・単位が完全に一致する。UI の「1小さじ」は
+DB の `quantity=1` と `unit=小さじ` を表示上つないだもので、**レシピの実値**である。
+結果 JSON に生の例外文・tool 引数・認証情報・内部テーブル名は含まれていない。
+
+**副作用**
+
+| テーブル | 結果 |
+|---|---|
+| `shopping_items` | **3 件のまま**。全 id・全列・`updated_at` 一致 |
+| `inventory_items` | **11 件のまま**。全 id・全列・`updated_at` 一致 |
+| `cooking_sessions` | **8 件のまま**。全行不変・`recipe_snapshot` present 8/8 維持 |
+
+**DB への手作業変更・復元は一切行っていない。** 書き込みは recipes への INSERT 3 件と、
+対応する `ai_tool_calls` 3 件だけである。
+
+### 24.7 受入判定
+
+```text
+24e24bb  複数回レシピ改訂時の候補カード lineage 実機受入 : PASS
+```
+
+根拠:
+
+- 正しい immutable Preview と SHA の対応（host `7p12v5owo` ↔ deployment `5987262598` ↔ `24e24bb`）
+- tool 順が `create_recipe → revise_recipe → revise_recipe`
+- DB lineage が `N1 → N2 → N3`
+- **2回目の改訂後も候補パネルは正確に 1 枚**
+- その1枚が最新の豚肉・大根の候補
+- 古い 2 版のパネルは**残存なし**
+- `shopping_items` / `inventory_items` / `cooking_sessions` に副作用なし
+- 既存 recipe の in-place 更新なし
+
+⚠️ **これは PHASE 10 全体の COMPLETE 判定ではない。**
+確認できたのは「複数回改訂したときカードが1枚に置換される」という**狭い範囲**だけである。
+
+**PHASE 10 は `IN_PROGRESS` を維持。** `docs/implementation-roadmap.md` は変更しない。
+
+### 24.8 この QA で確認できていないこと
+
+- **`shopping_suggestions_mode: 'none'` の実機確認**
+- **候補 `empty` / `failed` の実機発火**（根拠は自動テストのみ）
+- **replay / reuse 経路**（実機で一度も発火していない防御的経路）
+- 追加ボタンの素早い二重タップ
+- 部分失敗・`unknown`
+- 再読込後のカード消失
+- 音声終了後の録音中表示
+- 複数往復のキャッチボール
+- 「新しい会話」の同時二重タップ
+- **「新しい会話」直後に候補カードが届く組み合わせ。**
+  chain を ChatView へ移しても**この競合は解決していない** —— clear 後に旧会話の遅延結果が
+  届けば、新しい会話の chain と messages に入る。conversation epoch による遮断は別作業
+- `args=UNREADABLE` / `invalid_arguments` の根本原因
+- **rate-limit の発生頻度**
+- ChatView の配線そのものの自動テスト（§24.1 の ⚠️）
