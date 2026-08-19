@@ -176,13 +176,12 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
-      actions: read
     outputs:
       valid: ${{ steps.validate.outputs.valid }}
       failure_category: ${{ steps.validate.outputs.failure_category }}
       review_json: ${{ steps.validate.outputs.review_json }}
     steps:
-      - name: Checkout reviewed branch
+      - name: Checkout reviewed branch read-only
         uses: actions/checkout@v6
         with:
           ref: ${{ inputs.head_branch }}
@@ -234,49 +233,78 @@ jobs:
               output.write(f"token={token}\n")
           PY
 
+      - name: Install pinned Claude Code CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.236
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
       - name: Independent read-only Claude review
         id: reviewer
-        continue-on-error: true
-        uses: anthropics/claude-code-action@v1
-        with:
-          github_token: ${{ github.token }}
-          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
-          additional_permissions: |
-            actions: read
-          prompt: |
-            You are an independent, read-only reviewer. Do not modify files, create commits,
-            push branches, post GitHub comments, or run repository commands.
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ steps.oauth.outputs.token }}
+          DISABLE_AUTOUPDATER: "1"
+        run: |
+          set -uo pipefail
 
-            Review PR #${{ needs.discover.outputs.pr_number }} at SHA
-            ${{ needs.discover.outputs.head_sha }}.
+          cat > /tmp/reviewer-prompt.md <<'PROMPT'
+          You are an independent, read-only reviewer. Do not modify files, create commits,
+          push branches, post GitHub comments, or run shell commands.
 
-            Read .agent-review-context.md, .agent-review.diff, AGENTS.md, CLAUDE.md,
-            and docs/implementation-roadmap.md first. Then inspect only the surrounding files
-            needed to judge the change.
+          Read these files first:
+          - .agent-review-context.md
+          - .agent-review.diff
+          - AGENTS.md
+          - CLAUDE.md
+          - docs/implementation-roadmap.md
 
-            CI for this exact commit completed successfully. Do not re-run CI.
-            Judge whether the implementation satisfies the source issue and repository rules.
-            A blocking issue is a concrete correctness, security, data-loss, regression,
-            missing-required-test, or acceptance-criteria failure that should prevent merge.
-            Style preferences and optional improvements are non-blocking.
+          Then inspect only the surrounding repository files needed to judge the change.
+          CI for this exact commit completed successfully; do not re-run CI.
 
-            Return PASS only when blocking_issues is empty. Each blocking issue must be one
-            concise actionable string in the form `path[:line] — problem — required fix`.
-            Return at most 5 blocking issues and 5 non-blocking issues.
-          claude_args: |
-            --max-turns 16
-            --allowedTools "Read,Glob,Grep,LS"
-            --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch"
-            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","FAIL"]},"blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"non_blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1},"summary":{"type":"string"}},"required":["verdict","blocking_issues","non_blocking_issues","confidence","summary"]}'
+          Judge whether the implementation satisfies the source issue and repository rules.
+          A blocking issue is a concrete correctness, security, data-loss, regression,
+          missing-required-test, or acceptance-criteria failure that should prevent merge.
+          Style preferences and optional improvements are non-blocking.
+
+          Return PASS only when blocking_issues is empty. Each blocking issue must be one
+          concise actionable string in the form `path[:line] — problem — required fix`.
+          Return at most 5 blocking issues and 5 non-blocking issues.
+          PROMPT
+
+          schema='{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","FAIL"]},"blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"non_blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1},"summary":{"type":"string"}},"required":["verdict","blocking_issues","non_blocking_issues","confidence","summary"]}'
+
+          set +e
+          "$HOME/.local/bin/claude" -p "$(cat /tmp/reviewer-prompt.md)" \
+            --safe-mode \
+            --output-format json \
+            --no-session-persistence \
+            --max-turns 16 \
+            --tools "Read,Glob,Grep" \
+            --disallowedTools "mcp__*" \
+            --permission-mode dontAsk \
+            --json-schema "$schema" \
+            > /tmp/reviewer-result.json \
+            2> /tmp/reviewer-stderr.log
+          exit_code=$?
+          set -e
+
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
+          structured=""
+          if jq -e . /tmp/reviewer-result.json >/dev/null 2>&1; then
+            structured="$(jq -c '.structured_output // empty' /tmp/reviewer-result.json 2>/dev/null || true)"
+          fi
+          echo "structured_output=$structured" >> "$GITHUB_OUTPUT"
 
       - name: Validate and classify reviewer result
         id: validate
-        if: always()
         shell: bash
         env:
-          REVIEWER_OUTCOME: ${{ steps.reviewer.outcome }}
+          EXIT_CODE: ${{ steps.reviewer.outputs.exit_code }}
           RAW_REVIEW: ${{ steps.reviewer.outputs.structured_output }}
-          EXECUTION_FILE: ${{ steps.reviewer.outputs.execution_file }}
         run: |
           set -uo pipefail
 
@@ -284,21 +312,15 @@ jobs:
           echo "review_json=" >> "$GITHUB_OUTPUT"
           category="OK"
 
-          if [ "$REVIEWER_OUTCOME" != "success" ]; then
-            category="ACTION_FAILURE"
-
-            if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
-              result="$(jq -c '[.[] | select(.type == "result")] | last // {}' "$EXECUTION_FILE" 2>/dev/null || echo '{}')"
-              subtype="$(jq -r '.subtype // ""' <<<"$result" 2>/dev/null || true)"
-              is_error="$(jq -r '.is_error // ""' <<<"$result" 2>/dev/null || true)"
-
-              if [ "$subtype" = "success" ] && [ "$is_error" != "true" ]; then
-                category="ACTION_BOUNDARY_AFTER_SUCCESS"
-              elif [[ "$subtype" == *"max_turn"* ]]; then
-                category="MAX_TURNS"
-              elif [ "$is_error" = "true" ]; then
-                category="CLAUDE_RESULT_ERROR"
-              fi
+          if [ "${EXIT_CODE:-1}" != "0" ]; then
+            category="CLI_FAILURE"
+            combined="$(cat /tmp/reviewer-result.json /tmp/reviewer-stderr.log 2>/dev/null || true)"
+            if grep -Eiq 'authentication|invalid bearer|unauthorized|status code 401|api error: 401' <<<"$combined"; then
+              category="AUTHENTICATION"
+            elif grep -Eiq 'usage limit|rate limit|rate_limit|quota|too many requests|status code 429|api error: 429' <<<"$combined"; then
+              category="USAGE_OR_RATE_LIMIT"
+            elif grep -Eiq 'max[_ -]?turn|maximum number of turns' <<<"$combined"; then
+              category="MAX_TURNS"
             fi
           elif [ -z "${RAW_REVIEW:-}" ]; then
             category="EMPTY_STRUCTURED_OUTPUT"
@@ -328,10 +350,16 @@ jobs:
           echo "failure_category=$category" >> "$GITHUB_OUTPUT"
           echo "REVIEWER_RESULT_CATEGORY=$category"
 
-      - name: Remove generated context
+      - name: Remove generated review files
         if: always()
         shell: bash
-        run: rm -f .agent-review-context.md .agent-review.diff
+        run: |
+          rm -f \
+            .agent-review-context.md \
+            .agent-review.diff \
+            /tmp/reviewer-prompt.md \
+            /tmp/reviewer-result.json \
+            /tmp/reviewer-stderr.log
 
   publish:
     needs: [discover, review]
