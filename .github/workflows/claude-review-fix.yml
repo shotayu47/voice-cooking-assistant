@@ -98,7 +98,7 @@ jobs:
           fetch-depth: 0
           token: ${{ github.token }}
 
-      - name: Prepare fix context and safety hooks
+      - name: Prepare fix context and commit guard
         if: steps.meta.outputs.eligible == 'true'
         shell: bash
         env:
@@ -124,7 +124,7 @@ jobs:
           cat > .git/hooks/pre-commit <<'HOOK'
           #!/usr/bin/env bash
           set -euo pipefail
-          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$'
+          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$|^\.agent-'
           staged="$(git diff --cached --name-only)"
           if grep -Eiq "$protected_re" <<<"$staged"; then
             echo "Protected/high-risk path detected. Automated fixer may not commit this change." >&2
@@ -132,18 +132,6 @@ jobs:
           fi
           HOOK
           chmod +x .git/hooks/pre-commit
-
-          cat > .git/agent-safe-push.sh <<'PUSH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          branch="$(git branch --show-current)"
-          if [[ "$branch" != claude/* ]]; then
-            echo "Refusing to push a non-claude branch." >&2
-            exit 1
-          fi
-          git push origin "HEAD:refs/heads/${branch}"
-          PUSH
-          chmod +x .git/agent-safe-push.sh
 
       - name: Normalize OAuth secret safely
         if: steps.meta.outputs.eligible == 'true'
@@ -162,45 +150,71 @@ jobs:
               output.write(f"token={token}\n")
           PY
 
+      - name: Install pinned Claude Code CLI
+        if: steps.meta.outputs.eligible == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.236
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
       - name: Repair blocking findings with Claude
         if: steps.meta.outputs.eligible == 'true'
         id: fixer
-        uses: anthropics/claude-code-action@v1
-        with:
-          github_token: ${{ github.token }}
-          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
-          prompt: |
-            Repair the blocking findings from the independent review for PR
-            #${{ inputs.pr_number }} on the branch already checked out.
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ steps.oauth.outputs.token }}
+          DISABLE_AUTOUPDATER: "1"
+        run: |
+          set -uo pipefail
 
-            Read first:
-            - .agent-fix-context.json
-            - .agent-source-issue.md
-            - AGENTS.md
-            - CLAUDE.md
-            - docs/implementation-roadmap.md
-            Then inspect the relevant source files.
+          cat > /tmp/fixer-prompt.md <<'PROMPT'
+          Repair only the blocking findings in `.agent-fix-context.json` for the pull request
+          branch already checked out.
 
-            Address only the blocking_issues. Non-blocking notes are optional and should not
-            expand scope. Do not modify generated .agent-* context files.
-            Do not modify protected/high-risk paths, GitHub workflows, agent policy files,
-            auth/RLS/migrations/secrets/production infrastructure.
-            Do not run npm/npx quality gates; GitHub Actions CI owns deterministic verification.
+          Read first:
+          - .agent-fix-context.json
+          - .agent-source-issue.md
+          - AGENTS.md
+          - CLAUDE.md
+          - docs/implementation-roadmap.md
 
-            After making the smallest correct fix:
-            1. inspect git diff and git status,
-            2. stage only intended files,
-            3. commit with a concise message,
-            4. run .git/agent-safe-push.sh.
+          Then inspect the relevant source files. Address only `blocking_issues`.
+          Non-blocking notes are optional and must not expand scope.
 
-            Never force-push. If the blocking finding cannot be fixed safely under these
-            constraints, make no fabricated change and explain the blocker.
-          claude_args: |
-            --max-turns 20
-            --allowedTools "Edit,Write,Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(.git/agent-safe-push.sh)"
-            --disallowedTools "Bash(npm:*),Bash(npx:*),WebFetch,WebSearch"
+          Do not modify:
+          - `.agent-fix-context.json` or `.agent-source-issue.md`
+          - GitHub workflow files
+          - AGENTS.md or CLAUDE.md
+          - auth, middleware, RLS/policy files, migrations, secrets, or production infrastructure
 
-      - name: Route repair result
+          Do not run npm/npx quality gates. GitHub Actions CI owns deterministic verification.
+          Do not commit, push, merge, or perform any git operation. The workflow will inspect,
+          commit, and push the resulting file edits only after enforcing its safety rules.
+
+          Make the smallest correct edit that resolves the blocking findings. If the findings
+          cannot be fixed safely under these constraints, leave the repository unchanged.
+          PROMPT
+
+          set +e
+          "$HOME/.local/bin/claude" -p "$(cat /tmp/fixer-prompt.md)" \
+            --safe-mode \
+            --output-format json \
+            --no-session-persistence \
+            --max-turns 20 \
+            --tools "Read,Glob,Grep,Edit,Write" \
+            --allowedTools "Edit,Write" \
+            --disallowedTools "mcp__*" \
+            --permission-mode dontAsk \
+            > /tmp/fixer-result.json \
+            2> /tmp/fixer-stderr.log
+          exit_code=$?
+          set -e
+
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
+      - name: Validate, commit, push, and dispatch CI
         if: steps.meta.outputs.eligible == 'true'
         shell: bash
         env:
@@ -209,46 +223,80 @@ jobs:
           BRANCH_NAME: ${{ steps.meta.outputs.branch }}
           REVIEWED_SHA: ${{ inputs.reviewed_sha }}
           REVIEW_ATTEMPT: ${{ inputs.review_attempt }}
+          FIXER_EXIT_CODE: ${{ steps.fixer.outputs.exit_code }}
         run: |
           set -euo pipefail
 
-          remote_sha="$(git ls-remote origin "refs/heads/${BRANCH_NAME}" | awk '{print $1}')"
+          rm -f .agent-fix-context.json .agent-source-issue.md
 
-          if [ -z "$remote_sha" ] || [ "$remote_sha" = "$REVIEWED_SHA" ]; then
+          changed_files="$({
+            git diff --name-only
+            git ls-files --others --exclude-standard
+          } | sed '/^$/d' | sort -u)"
+
+          if [ -z "$changed_files" ]; then
             gh label create human-required \
               --color D93F0B \
               --description "Automated review/fix stopped; human judgment required" \
               --force
             gh pr edit "$PR_NUMBER" --add-label human-required
             gh pr comment "$PR_NUMBER" --body \
-              "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} result=NO_NEW_COMMIT -->
-              Automated fixer did not produce a new safe commit. Human review is required."
+              "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} result=NO_CHANGES -->
+              Automated fixer produced no safe file changes (CLI exit: ${FIXER_EXIT_CODE:-unknown}). Human review is required."
             exit 0
           fi
 
-          git fetch --no-tags origin "${BRANCH_NAME}:refs/remotes/origin/${BRANCH_NAME}"
-          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$'
-          repair_files="$(git diff --name-only "$REVIEWED_SHA" "$remote_sha")"
-
-          if grep -Eiq "$protected_re" <<<"$repair_files"; then
+          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$|^\.agent-'
+          if grep -Eiq "$protected_re" <<<"$changed_files"; then
             gh label create human-required \
               --color D93F0B \
               --description "Automated review/fix stopped; human judgment required" \
               --force
             gh pr edit "$PR_NUMBER" --add-label human-required
             gh pr comment "$PR_NUMBER" --body \
-              "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} to-sha=${remote_sha} result=PROTECTED_PATH -->
-              Automated fixer touched a protected/high-risk path. Further automation is stopped; human review is required."
+              "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} result=PROTECTED_PATH -->
+              Automated fixer attempted to change a protected/high-risk path. Nothing was pushed; human review is required."
             exit 0
+          fi
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            gh label create human-required \
+              --color D93F0B \
+              --description "Automated review/fix stopped; human judgment required" \
+              --force
+            gh pr edit "$PR_NUMBER" --add-label human-required
+            gh pr comment "$PR_NUMBER" --body \
+              "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} result=NO_STAGED_CHANGES -->
+              Automated fixer left no committable change. Human review is required."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: address automated review findings"
+          git push origin "HEAD:refs/heads/${BRANCH_NAME}"
+
+          remote_sha="$(git rev-parse HEAD)"
+          if [ "$remote_sha" = "$REVIEWED_SHA" ]; then
+            echo "Expected a new commit but SHA did not change." >&2
+            exit 1
           fi
 
           gh pr comment "$PR_NUMBER" --body \
             "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} to-sha=${remote_sha} result=FIX_PUSHED -->
-            Automated fixer pushed a new commit. CI has been dispatched; independent review will run again only if CI passes."
+            Automated fixer pushed a constrained repair commit. CI has been dispatched; independent review will run again only if CI passes."
 
           gh workflow run ci.yml --ref "$BRANCH_NAME"
 
-      - name: Remove generated context
+      - name: Remove temporary fixer files
         if: always() && steps.meta.outputs.eligible == 'true'
         shell: bash
-        run: rm -f .agent-fix-context.json .agent-source-issue.md
+        run: |
+          rm -f \
+            .agent-fix-context.json \
+            .agent-source-issue.md \
+            /tmp/fixer-prompt.md \
+            /tmp/fixer-result.json \
+            /tmp/fixer-stderr.log
