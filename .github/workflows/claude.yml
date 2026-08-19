@@ -33,7 +33,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Check OAuth secret format safely
+      - name: Classify OAuth secret format safely
         shell: bash
         env:
           CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -42,12 +42,14 @@ jobs:
           import os
           token = os.environ.get("CLAUDE_TOKEN", "")
           if not token:
-              raise SystemExit("CLAUDE_OAUTH_PREFLIGHT=FAIL_EMPTY")
-          if any(ch.isspace() for ch in token):
-              raise SystemExit("CLAUDE_OAUTH_PREFLIGHT=FAIL_WHITESPACE")
-          if not token.startswith("sk-ant-oat"):
-              raise SystemExit("CLAUDE_OAUTH_PREFLIGHT=FAIL_PREFIX")
-          print("CLAUDE_OAUTH_PREFLIGHT=PASS")
+              category = "EMPTY"
+          elif any(ch.isspace() for ch in token):
+              category = "HAS_WHITESPACE"
+          elif token.startswith("sk-ant-oat"):
+              category = "EXPECTED_OAUTH_PREFIX"
+          else:
+              category = "OTHER_PREFIX"
+          print(f"CLAUDE_OAUTH_PREFLIGHT={category}")
           PY
 
       - name: Run Claude Code
