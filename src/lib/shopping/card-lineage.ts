@@ -70,3 +70,62 @@ export function recipeIdsOf(
  */
 export const REVISED_CARD_NOTICE =
   'レシピを変更したため、買い物候補を更新しました。すでに追加済みの項目は買い物リストに残ります。';
+
+/** One recipe replacing another, as `revise_recipe` reports it. */
+export type RevisionEdge = {
+  recipeId: string;
+  supersedesRecipeId: string;
+};
+
+/** The chain a conversation starts with. Never mutated, so it can be shared. */
+export const NO_REVISIONS: RevisionChain = new Map();
+
+/**
+ * Add one revision to the chain, without touching the chain given.
+ *
+ * The chain used to be rebuilt every turn, which quietly capped it at one
+ * link: a second revision in a later turn knew only that R3 came from R2, so
+ * its card keyed on R2 while the card already on screen keyed on R1, and the
+ * two sat side by side — the stale one still showing the candidates for the
+ * version the user had just replaced. Accumulating instead is what lets
+ * `lineageRoot` walk R4 → R3 → R2 → R1 however many revisions it takes.
+ *
+ * Idempotent: re-applying an edge a replay or a re-read reports again returns
+ * a chain that says the same thing. A self-referential edge is not special
+ * cased — `lineageRoot` already stops on a cycle, and inventing a rule here
+ * that the tool result cannot produce would be guessing.
+ */
+export function withRevisionEdge(
+  chain: RevisionChain,
+  edge: RevisionEdge | null | undefined,
+): RevisionChain {
+  if (!edge) return chain;
+
+  const { recipeId, supersedesRecipeId } = edge;
+  if (!recipeId || !supersedesRecipeId) return chain;
+  if (chain.get(recipeId) === supersedesRecipeId) return chain;
+
+  const next = new Map(chain);
+  next.set(recipeId, supersedesRecipeId);
+  return next;
+}
+
+/**
+ * The revision a tool result reports, or null.
+ *
+ * Read from the structured result, never from what the assistant said. A
+ * failed `revise_recipe` returns an error and carries neither id, so nothing
+ * is recorded for it — the recipe it would have replaced is still current.
+ */
+export function revisionEdgeOf(result: unknown): RevisionEdge | null {
+  if (!result || typeof result !== 'object') return null;
+
+  const { recipe_id: recipeId, supersedes_recipe_id: supersedesRecipeId } = result as {
+    recipe_id?: unknown;
+    supersedes_recipe_id?: unknown;
+  };
+
+  return typeof recipeId === 'string' && typeof supersedesRecipeId === 'string'
+    ? { recipeId, supersedesRecipeId }
+    : null;
+}

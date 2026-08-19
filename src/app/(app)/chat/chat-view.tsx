@@ -7,6 +7,12 @@ import { useEffect, useRef, useState } from 'react';
 import { cn } from '@/lib/cn';
 import { VoicePanel } from '@/components/voice-panel';
 import {
+  NO_REVISIONS,
+  withRevisionEdge,
+  type RevisionChain,
+  type RevisionEdge,
+} from '@/lib/shopping/card-lineage';
+import {
   assistantMessage,
   hasSuggestionCard,
   withVoiceSuggestions,
@@ -49,6 +55,23 @@ export function ChatView({
   const [confirmingNew, setConfirmingNew] = useState(false);
   const [startingNew, setStartingNew] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  /*
+   * Which recipe each revision replaced, for as long as this conversation
+   * lasts.
+   *
+   * A ref rather than state, and read straight back in the same handler: the
+   * card for a revision is worked out from the edge that arrived a moment
+   * earlier in the same tool result, and waiting for a re-render would key it
+   * on the ancestor the page had not heard about yet.
+   *
+   * This used to live in the voice hook and was rebuilt on every utterance,
+   * which capped it at one link — a second revision in a later turn keyed its
+   * card on R2 while the card on screen keyed on R1, so both stayed up and the
+   * older one went on showing candidates for a version already replaced. The
+   * cards live in `messages`, so the lineage that keys them lives here too and
+   * the two are cleared together.
+   */
+  const revisionsRef = useRef<RevisionChain>(NO_REVISIONS);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
@@ -127,6 +150,10 @@ export function ChatView({
       }
 
       setMessages([]);
+      // Cleared with the messages, never before: the lineage only keys cards,
+      // so it is meaningless once they are gone — and if the action had
+      // failed, the old conversation and its cards would both still be up.
+      revisionsRef.current = NO_REVISIONS;
       setConfirmingNew(false);
       router.refresh();
     } catch {
@@ -252,7 +279,17 @@ export function ChatView({
            * candidates. Voice cannot operate a card mid-call, so the point is
            * that it is waiting on screen when the call ends.
            */
-          onSuggestions={({ callId, suggestions, chain, revised }) => {
+          /*
+           * The edge is recorded before the candidates are placed, and both
+           * arrive from the same tool result. Reading the chain here rather
+           * than inside the updater pins the card to the lineage as it stood
+           * when these candidates were produced.
+           */
+          onRecipeRevision={(edge: RevisionEdge) => {
+            revisionsRef.current = withRevisionEdge(revisionsRef.current, edge);
+          }}
+          onSuggestions={({ callId, suggestions, revised }) => {
+            const chain = revisionsRef.current;
             setMessages((current) =>
               withVoiceSuggestions(current, callId, suggestions, { chain, revised }),
             );

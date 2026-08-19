@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { revisionEdgeOf, type RevisionEdge } from '@/lib/shopping/card-lineage';
 import type { ShoppingSuggestion } from '@/lib/shopping/suggest';
 
 import {
@@ -116,12 +117,6 @@ export type ToolEffect = {
 export type VoiceSuggestions = {
   callId: string;
   suggestions: ShoppingSuggestion[];
-  /**
-   * Revisions seen in this turn: new recipe id → the one it replaced. Lets the
-   * page recognise candidates for a revised recipe as the same card, rather
-   * than a second one beside the now-stale original.
-   */
-  chain: Map<string, string>;
   /** True when a revision in this turn produced these candidates. */
   revised: boolean;
 };
@@ -240,6 +235,14 @@ export function useRealtimeVoice(options: {
    * text path.
    */
   onSuggestions?: (payload: VoiceSuggestions) => void;
+  /**
+   * Called when a revision saved a new recipe row, whether or not it produced
+   * a card. Reported separately from the candidates because a revision with
+   * no candidates to draw — mode 'none', an empty result, a failed candidate
+   * read — still has to be remembered, or the next revision loses the thread
+   * back to the recipe the card is keyed on.
+   */
+  onRecipeRevision?: (edge: RevisionEdge) => void;
 }) {
   const [state, setState] = useState<VoiceState>(INITIAL_STATE);
 
@@ -320,7 +323,7 @@ export function useRealtimeVoice(options: {
    * supersedes. Held only for the turn: correlating a later suggestion with an
    * earlier revision is the point, and nothing older is relevant.
    */
-  const revisionChainRef = useRef<Map<string, string>>(new Map());
+
   /** Whether a revision happened in this turn, for the card's wording. */
   const revisedThisTurnRef = useRef(false);
 
@@ -337,9 +340,13 @@ export function useRealtimeVoice(options: {
   }, [options.onToolEffect]);
 
   const onSuggestionsRef = useRef(options.onSuggestions);
+  const onRecipeRevisionRef = useRef(options.onRecipeRevision);
   useEffect(() => {
     onSuggestionsRef.current = options.onSuggestions;
   }, [options.onSuggestions]);
+  useEffect(() => {
+    onRecipeRevisionRef.current = options.onRecipeRevision;
+  }, [options.onRecipeRevision]);
 
   /** The rate-limit banner as the UI needs it, recomputed on each tick. */
   const rateLimitView = useCallback(() => {
@@ -647,7 +654,6 @@ export function useRealtimeVoice(options: {
           committedTurnRef.current += 1;
           turnTranscriptRef.current = null;
           advancesThisTurnRef.current = 0;
-          revisionChainRef.current = new Map();
           revisedThisTurnRef.current = false;
           rateLimitRef.current = NO_RATE_LIMIT;
           advance({ type: 'committed', at: Date.now() });
@@ -967,6 +973,10 @@ export function useRealtimeVoice(options: {
          * recipe row, which is what a repeat would really have cost, is never
          * written a second time because the tool does not run.
          */
+        // The stored result is the same successful revision, so the edge is
+        // reported again. Merging it is idempotent, and leaving it out would
+        // lose the link when the first report happened before a reset.
+        reportRevision(name, previous?.result, callId);
         showCard(callId, previous?.suggestions ?? null);
         deliverToolOutput(callId, replayedOutput(previous?.result), name);
         return;
@@ -985,6 +995,10 @@ export function useRealtimeVoice(options: {
           argsMatch,
           reason: 'suggestions_only',
         });
+
+        // Same revision, re-reported for the same reason as in the replay
+        // path: the row it recorded still exists whatever mode is asked for.
+        reportRevision(name, previous.result, callId);
 
         if (mode === 'none') {
           // Nothing new is being asked for at all. The stored answer is the
@@ -1079,18 +1093,7 @@ export function useRealtimeVoice(options: {
          * structured result, never from what the assistant said — is what lets
          * the next suggestion be recognised as the same card.
          */
-        if (name === 'revise_recipe') {
-          const revision = body.result as { recipe_id?: unknown; supersedes_recipe_id?: unknown };
-          if (
-            typeof revision?.recipe_id === 'string' &&
-            typeof revision?.supersedes_recipe_id === 'string'
-          ) {
-            revisionChainRef.current.set(revision.recipe_id, revision.supersedes_recipe_id);
-            revisedThisTurnRef.current = true;
-            logRef.current.add('internal', 'recipe_revised', { call: callId });
-          }
-        }
-
+        reportRevision(name, body.result, callId);
         showCard(callId, body.suggestions ?? null);
 
         if (body.effect) {
@@ -1164,10 +1167,32 @@ export function useRealtimeVoice(options: {
       onSuggestionsRef.current?.({
         callId,
         suggestions,
-        chain: new Map(revisionChainRef.current),
         revised: revisedThisTurnRef.current,
       });
       advance({ type: 'card_shown', at: Date.now() });
+    }
+
+    /**
+     * Tell the page that one recipe replaced another.
+     *
+     * Deliberately not tied to drawing a card. A revision saved with mode
+     * 'none', one whose candidates came back empty, and one whose candidate
+     * read failed all still wrote a new recipe row, and the next revision has
+     * to be able to trace the lineage back through them — otherwise its card
+     * keys on the wrong ancestor and appears beside the one already on screen.
+     *
+     * Called before `showCard` at every site, so the page has the edge in hand
+     * by the time it works out which card these candidates belong to.
+     */
+    function reportRevision(tool: string, result: unknown, callId: string) {
+      if (tool !== 'revise_recipe') return;
+
+      const edge = revisionEdgeOf(result);
+      if (!edge) return;
+
+      revisedThisTurnRef.current = true;
+      logRef.current.add('internal', 'recipe_revised', { call: callId });
+      onRecipeRevisionRef.current?.(edge);
     }
 
     /**

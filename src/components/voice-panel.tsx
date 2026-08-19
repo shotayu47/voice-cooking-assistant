@@ -3,6 +3,7 @@
 import { useState, useSyncExternalStore } from 'react';
 
 import { cn } from '@/lib/cn';
+import type { RevisionEdge } from '@/lib/shopping/card-lineage';
 import { isVoiceDebugEnabled } from '@/lib/voice/debug-flag';
 import {
   useRealtimeVoice,
@@ -24,14 +25,22 @@ const readDebugFlag = () => isVoiceDebugEnabled(window.location.search);
 export function VoicePanel({
   onToolEffect,
   onSuggestions,
+  onRecipeRevision,
 }: {
   onToolEffect: (effect: ToolEffect) => void;
   /** Structured candidates from a voice tool call, for the page to draw. */
   onSuggestions?: (payload: VoiceSuggestions) => void;
+  /**
+   * A revision that saved a new recipe row. Separate from `onSuggestions`
+   * because that one is not called when there is no card to draw, and the
+   * lineage still has to be recorded in that case.
+   */
+  onRecipeRevision?: (edge: RevisionEdge) => void;
 }) {
   const { state, connect, disconnect, retry, eventTrace, resetTrace } = useRealtimeVoice({
     onToolEffect,
     onSuggestions,
+    onRecipeRevision,
   });
 
   const live = state.status === 'live';
