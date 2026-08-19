@@ -33,30 +33,40 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Classify OAuth secret format safely
+      - name: Normalize OAuth secret safely
+        id: oauth
         shell: bash
         env:
-          CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_TOKEN_RAW: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           python - <<'PY'
           import os
-          token = os.environ.get("CLAUDE_TOKEN", "")
+
+          raw = os.environ.get("CLAUDE_TOKEN_RAW", "")
+          token = raw.strip()
+
           if not token:
               category = "EMPTY"
           elif any(ch.isspace() for ch in token):
-              category = "HAS_WHITESPACE"
+              category = "INTERNAL_WHITESPACE"
           elif token.startswith("sk-ant-oat"):
               category = "EXPECTED_OAUTH_PREFIX"
           else:
               category = "OTHER_PREFIX"
+
           print(f"CLAUDE_OAUTH_PREFLIGHT={category}")
+
+          if token:
+              print(f"::add-mask::{token}")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"token={token}\n")
           PY
 
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
           claude_args: |
             --max-turns 10
             --allowedTools "Bash(npm ci),Bash(npm run typecheck),Bash(npm run lint),Bash(npm test),Bash(npm run build),Bash(npm run check:migrations),Bash(npm run audit:rls)"
