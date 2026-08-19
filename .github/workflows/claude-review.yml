@@ -1,12 +1,23 @@
 name: Claude Independent Review
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
+  workflow_dispatch:
+    inputs:
+      head_branch:
+        description: Claude branch that passed CI
+        required: true
+        type: string
+      head_sha:
+        description: Exact commit SHA that passed CI
+        required: true
+        type: string
+      ci_run_url:
+        description: Successful CI run URL
+        required: true
+        type: string
 
 concurrency:
-  group: claude-review-${{ github.event.workflow_run.head_branch }}
+  group: claude-review-${{ inputs.head_branch }}
   cancel-in-progress: false
 
 env:
@@ -14,9 +25,7 @@ env:
 
 jobs:
   discover:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      startsWith(github.event.workflow_run.head_branch, 'claude/')
+    if: startsWith(inputs.head_branch, 'claude/')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -37,7 +46,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_BRANCH: ${{ inputs.head_branch }}
+          CI_HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
 
@@ -45,6 +55,11 @@ jobs:
           echo "risk=false" >> "$GITHUB_OUTPUT"
           echo "exhausted=false" >> "$GITHUB_OUTPUT"
           echo "source_issue=" >> "$GITHUB_OUTPUT"
+
+          if ! [[ "$CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid CI head SHA."
+            exit 1
+          fi
 
           pr_json="$(gh pr list \
             --state open \
@@ -64,6 +79,11 @@ jobs:
 
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+          if [ "$head_sha" != "$CI_HEAD_SHA" ]; then
+            echo "PR head moved after CI; stale review request ignored."
+            exit 0
+          fi
 
           comments="$(gh api \
             "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments?per_page=100" \
@@ -118,7 +138,6 @@ jobs:
           HEAD_SHA: ${{ needs.discover.outputs.head_sha }}
           ATTEMPT: ${{ needs.discover.outputs.attempt }}
           RISK: ${{ needs.discover.outputs.risk }}
-          EXHAUSTED: ${{ needs.discover.outputs.exhausted }}
         run: |
           set -euo pipefail
 
@@ -126,7 +145,6 @@ jobs:
             --color D93F0B \
             --description "Automated review/fix stopped; human judgment required" \
             --force
-
           gh pr edit "$PR_NUMBER" --add-label human-required
 
           if [ "$RISK" = "true" ]; then
@@ -165,7 +183,7 @@ jobs:
       - name: Checkout reviewed branch
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.workflow_run.head_branch }}
+          ref: ${{ inputs.head_branch }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -175,7 +193,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
           SOURCE_ISSUE: ${{ needs.discover.outputs.source_issue }}
-          CI_URL: ${{ github.event.workflow_run.html_url }}
+          CI_URL: ${{ inputs.ci_run_url }}
         run: |
           set -euo pipefail
 
@@ -237,7 +255,7 @@ jobs:
             - docs/implementation-roadmap.md
             Then inspect any relevant changed or surrounding source files.
 
-            The CI run for this exact branch completed successfully. Do not re-run CI.
+            The CI run for this exact commit completed successfully. Do not re-run CI.
             Judge whether the implementation satisfies the source issue and repository rules.
             A blocking issue is a concrete correctness, security, data-loss, regression,
             missing-required-test, or acceptance-criteria failure that should prevent merge.
