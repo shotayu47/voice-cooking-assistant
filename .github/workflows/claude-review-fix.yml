@@ -24,6 +24,9 @@ concurrency:
   group: claude-review-fix-pr-${{ inputs.pr_number }}
   cancel-in-progress: false
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   fix:
     runs-on: ubuntu-latest
