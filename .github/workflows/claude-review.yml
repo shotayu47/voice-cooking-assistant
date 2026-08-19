@@ -91,7 +91,7 @@ jobs:
             --jq '.[].body')"
 
           if grep -Fq "<!-- agent-review sha=${head_sha} " <<<"$comments"; then
-            echo "This commit SHA was already reviewed."
+            echo "This commit SHA was already reviewed or failed closed."
             exit 0
           fi
 
@@ -247,27 +247,24 @@ jobs:
             Review PR #${{ needs.discover.outputs.pr_number }} at SHA
             ${{ needs.discover.outputs.head_sha }}.
 
-            First read:
-            - .agent-review-context.md
-            - .agent-review.diff
-            - AGENTS.md
-            - CLAUDE.md
-            - docs/implementation-roadmap.md
-            Then inspect any relevant changed or surrounding source files.
+            Read .agent-review-context.md, .agent-review.diff, AGENTS.md, CLAUDE.md,
+            and docs/implementation-roadmap.md first. Then inspect only the surrounding files
+            needed to judge the change.
 
-            The CI run for this exact commit completed successfully. Do not re-run CI.
+            CI for this exact commit completed successfully. Do not re-run CI.
             Judge whether the implementation satisfies the source issue and repository rules.
             A blocking issue is a concrete correctness, security, data-loss, regression,
             missing-required-test, or acceptance-criteria failure that should prevent merge.
-            Do not mark style preferences or optional improvements as blocking.
+            Style preferences and optional improvements are non-blocking.
 
-            Return PASS only when blocking_issues is empty. Keep findings concise and actionable.
+            Return PASS only when blocking_issues is empty. Each blocking issue must be one
+            concise actionable string in the form `path[:line] — problem — required fix`.
             Return at most 5 blocking issues and 5 non-blocking issues.
           claude_args: |
-            --max-turns 12
+            --max-turns 16
             --allowedTools "Read,Glob,Grep,LS"
             --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch"
-            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","FAIL"]},"blocking_issues":{"type":"array","maxItems":5,"items":{"type":"object","properties":{"severity":{"type":"string","enum":["high","medium","low"]},"file":{"type":"string"},"line":{"type":["integer","null"]},"message":{"type":"string"},"fix":{"type":"string"}},"required":["severity","file","line","message","fix"],"additionalProperties":false}},"non_blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1},"summary":{"type":"string"}},"required":["verdict","blocking_issues","non_blocking_issues","confidence","summary"],"additionalProperties":false}'
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","FAIL"]},"blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"non_blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1},"summary":{"type":"string"}},"required":["verdict","blocking_issues","non_blocking_issues","confidence","summary"]}'
 
       - name: Validate reviewer contract fail-closed
         id: validate
@@ -349,7 +346,7 @@ jobs:
             {
               echo
               echo "#### Blocking issues"
-              jq -r '.blocking_issues[] | "- **[\(.severity)]** `\(.file)`" + (if .line == null then "" else " line \(.line|tostring)" end) + ": \(.message)\n  - Fix: \(.fix)"' <<<"$REVIEW_JSON"
+              jq -r '.blocking_issues[] | "- " + .' <<<"$REVIEW_JSON"
             } >> /tmp/review-comment.md
           fi
 
