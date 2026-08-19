@@ -9,6 +9,9 @@ concurrency:
   group: claude-review-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   discover:
     if: >-
