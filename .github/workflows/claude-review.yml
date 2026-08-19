@@ -178,6 +178,8 @@ jobs:
       issues: read
       actions: read
     outputs:
+      valid: ${{ steps.validate.outputs.valid }}
+      failure_category: ${{ steps.validate.outputs.failure_category }}
       review_json: ${{ steps.validate.outputs.review_json }}
     steps:
       - name: Checkout reviewed branch
@@ -234,6 +236,7 @@ jobs:
 
       - name: Independent read-only Claude review
         id: reviewer
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           github_token: ${{ github.token }}
@@ -266,29 +269,64 @@ jobs:
             --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch"
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","FAIL"]},"blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"non_blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1},"summary":{"type":"string"}},"required":["verdict","blocking_issues","non_blocking_issues","confidence","summary"]}'
 
-      - name: Validate reviewer contract fail-closed
+      - name: Validate and classify reviewer result
         id: validate
+        if: always()
         shell: bash
         env:
+          REVIEWER_OUTCOME: ${{ steps.reviewer.outcome }}
           RAW_REVIEW: ${{ steps.reviewer.outputs.structured_output }}
+          EXECUTION_FILE: ${{ steps.reviewer.outputs.execution_file }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          compact="$(jq -ce '
-            .verdict as $v |
-            select($v == "PASS" or $v == "FAIL") |
-            select((.blocking_issues | type) == "array") |
-            select((.non_blocking_issues | type) == "array") |
-            select((.confidence | type) == "number") |
-            select((.summary | type) == "string") |
-            if $v == "PASS" then
-              select((.blocking_issues | length) == 0)
+          echo "valid=false" >> "$GITHUB_OUTPUT"
+          echo "review_json=" >> "$GITHUB_OUTPUT"
+          category="OK"
+
+          if [ "$REVIEWER_OUTCOME" != "success" ]; then
+            category="ACTION_FAILURE"
+
+            if [ -n "${EXECUTION_FILE:-}" ] && [ -f "$EXECUTION_FILE" ]; then
+              result="$(jq -c '[.[] | select(.type == "result")] | last // {}' "$EXECUTION_FILE" 2>/dev/null || echo '{}')"
+              subtype="$(jq -r '.subtype // ""' <<<"$result" 2>/dev/null || true)"
+              is_error="$(jq -r '.is_error // ""' <<<"$result" 2>/dev/null || true)"
+
+              if [ "$subtype" = "success" ] && [ "$is_error" != "true" ]; then
+                category="ACTION_BOUNDARY_AFTER_SUCCESS"
+              elif [[ "$subtype" == *"max_turn"* ]]; then
+                category="MAX_TURNS"
+              elif [ "$is_error" = "true" ]; then
+                category="CLAUDE_RESULT_ERROR"
+              fi
+            fi
+          elif [ -z "${RAW_REVIEW:-}" ]; then
+            category="EMPTY_STRUCTURED_OUTPUT"
+          else
+            compact="$(jq -ce '
+              .verdict as $v |
+              select($v == "PASS" or $v == "FAIL") |
+              select((.blocking_issues | type) == "array") |
+              select((.non_blocking_issues | type) == "array") |
+              select((.confidence | type) == "number") |
+              select((.summary | type) == "string") |
+              if $v == "PASS" then
+                select((.blocking_issues | length) == 0)
+              else
+                select((.blocking_issues | length) > 0)
+              end
+            ' <<<"$RAW_REVIEW" 2>/dev/null || true)"
+
+            if [ -z "$compact" ]; then
+              category="INVALID_CONTRACT"
             else
-              select((.blocking_issues | length) > 0)
-            end
-          ' <<<"$RAW_REVIEW")"
+              echo "valid=true" >> "$GITHUB_OUTPUT"
+              echo "review_json=$compact" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
-          echo "review_json=$compact" >> "$GITHUB_OUTPUT"
+          echo "failure_category=$category" >> "$GITHUB_OUTPUT"
+          echo "REVIEWER_RESULT_CATEGORY=$category"
 
       - name: Remove generated context
         if: always()
@@ -312,11 +350,11 @@ jobs:
           PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
           HEAD_SHA: ${{ needs.discover.outputs.head_sha }}
           ATTEMPT: ${{ needs.discover.outputs.attempt }}
+          REVIEW_VALID: ${{ needs.review.outputs.valid }}
+          FAILURE_CATEGORY: ${{ needs.review.outputs.failure_category }}
           REVIEW_JSON: ${{ needs.review.outputs.review_json }}
         run: |
           set -euo pipefail
-
-          verdict="$(jq -r '.verdict' <<<"$REVIEW_JSON")"
 
           gh label create agent-review-pass \
             --color 0E8A16 \
@@ -330,6 +368,20 @@ jobs:
             --color D93F0B \
             --description "Automated review/fix stopped; human judgment required" \
             --force
+
+          if [ "$REVIEW_VALID" != "true" ]; then
+            gh pr edit "$PR_NUMBER" --add-label human-required
+            gh pr comment "$PR_NUMBER" --body \
+              "<!-- agent-review sha=${HEAD_SHA} attempt=${ATTEMPT} verdict=REVIEW_ERROR -->
+              ### Automated reviewer failed closed
+
+              Safe diagnostic category: \`${FAILURE_CATEGORY}\`.
+
+              No raw model output or secrets were exposed. Human review is required and no automated merge was attempted."
+            exit 0
+          fi
+
+          verdict="$(jq -r '.verdict' <<<"$REVIEW_JSON")"
 
           {
             echo "<!-- agent-review sha=${HEAD_SHA} attempt=${ATTEMPT} verdict=${verdict} -->"
@@ -383,37 +435,3 @@ jobs:
             -f review_attempt="$ATTEMPT" \
             -f reviewed_sha="$HEAD_SHA" \
             -f review_json="$REVIEW_JSON"
-
-  review-failure:
-    needs: [discover, review]
-    if: >-
-      always() &&
-      needs.discover.outputs.eligible == 'true' &&
-      needs.discover.outputs.risk != 'true' &&
-      needs.discover.outputs.exhausted != 'true' &&
-      needs.review.result == 'failure'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      pull-requests: write
-      issues: write
-    steps:
-      - name: Fail closed on reviewer infrastructure failure
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
-          HEAD_SHA: ${{ needs.discover.outputs.head_sha }}
-          ATTEMPT: ${{ needs.discover.outputs.attempt }}
-        run: |
-          set -euo pipefail
-
-          gh label create human-required \
-            --color D93F0B \
-            --description "Automated review/fix stopped; human judgment required" \
-            --force
-          gh pr edit "$PR_NUMBER" --add-label human-required
-
-          gh pr comment "$PR_NUMBER" --body \
-            "<!-- agent-review sha=${HEAD_SHA} attempt=${ATTEMPT} verdict=REVIEW_ERROR -->
-            Automated reviewer failed to produce a valid verdict. The workflow fails closed and requires human review. No automated merge was attempted."
