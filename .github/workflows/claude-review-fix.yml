@@ -1,0 +1,254 @@
+name: Claude Review Fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to repair
+        required: true
+        type: string
+      review_attempt:
+        description: Review attempt that produced the blocking findings
+        required: true
+        type: string
+      reviewed_sha:
+        description: Exact PR head SHA that was reviewed
+        required: true
+        type: string
+      review_json:
+        description: Validated independent-review JSON
+        required: true
+        type: string
+
+concurrency:
+  group: claude-review-fix-pr-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - name: Validate PR and reviewed SHA
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_ATTEMPT: ${{ inputs.review_attempt }}
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+        run: |
+          set -euo pipefail
+
+          echo "eligible=false" >> "$GITHUB_OUTPUT"
+
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "Invalid PR number."
+            exit 1
+          fi
+
+          if ! [[ "$REVIEW_ATTEMPT" =~ ^[12]$ ]]; then
+            echo "Fix dispatch is allowed only after review attempt 1 or 2."
+            exit 1
+          fi
+
+          pr_json="$(gh pr view "$PR_NUMBER" \
+            --json state,baseRefName,headRefName,headRefOid,isCrossRepository,body)"
+
+          state="$(jq -r '.state' <<<"$pr_json")"
+          base="$(jq -r '.baseRefName' <<<"$pr_json")"
+          branch="$(jq -r '.headRefName' <<<"$pr_json")"
+          current_sha="$(jq -r '.headRefOid' <<<"$pr_json")"
+          cross_repo="$(jq -r '.isCrossRepository' <<<"$pr_json")"
+
+          if [ "$state" != "OPEN" ] || [ "$base" != "main" ] || [ "$cross_repo" != "false" ]; then
+            echo "PR is not an eligible same-repository open PR against main."
+            exit 0
+          fi
+
+          if [[ "$branch" != claude/* ]]; then
+            echo "Only claude/* branches are eligible for automated repair."
+            exit 0
+          fi
+
+          if [ "$current_sha" != "$REVIEWED_SHA" ]; then
+            echo "PR head changed after review; stale repair request ignored."
+            exit 0
+          fi
+
+          source_issue="$(sed -nE 's/.*Source issue: #([0-9]+).*/\1/p' <<<"$(jq -r '.body // ""' <<<"$pr_json")" | head -n1)"
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "source_issue=$source_issue" >> "$GITHUB_OUTPUT"
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR branch
+        if: steps.meta.outputs.eligible == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.meta.outputs.branch }}
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Prepare fix context and safety hooks
+        if: steps.meta.outputs.eligible == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SOURCE_ISSUE: ${{ steps.meta.outputs.source_issue }}
+          REVIEW_JSON: ${{ inputs.review_json }}
+        run: |
+          set -euo pipefail
+
+          jq -ce . <<<"$REVIEW_JSON" > .agent-fix-context.json
+
+          {
+            echo "# Generated source issue context"
+            if [ -n "$SOURCE_ISSUE" ]; then
+              gh issue view "$SOURCE_ISSUE" --json number,title,body,url
+            else
+              echo "No source issue could be resolved from the PR body."
+              gh pr view "$PR_NUMBER" --json number,title,body,url
+            fi
+          } > .agent-source-issue.md
+
+          cat > .git/hooks/pre-commit <<'HOOK'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$'
+          staged="$(git diff --cached --name-only)"
+          if grep -Eiq "$protected_re" <<<"$staged"; then
+            echo "Protected/high-risk path detected. Automated fixer may not commit this change." >&2
+            exit 1
+          fi
+          HOOK
+          chmod +x .git/hooks/pre-commit
+
+          cat > .git/agent-safe-push.sh <<'PUSH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          branch="$(git branch --show-current)"
+          if [[ "$branch" != claude/* ]]; then
+            echo "Refusing to push a non-claude branch." >&2
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/${branch}"
+          PUSH
+          chmod +x .git/agent-safe-push.sh
+
+      - name: Normalize OAuth secret safely
+        if: steps.meta.outputs.eligible == 'true'
+        id: oauth
+        shell: bash
+        env:
+          CLAUDE_TOKEN_RAW: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          token = os.environ.get("CLAUDE_TOKEN_RAW", "").strip()
+          if not token:
+              raise SystemExit("CLAUDE_CODE_OAUTH_TOKEN is empty")
+          print(f"::add-mask::{token}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"token={token}\n")
+          PY
+
+      - name: Repair blocking findings with Claude
+        if: steps.meta.outputs.eligible == 'true'
+        id: fixer
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
+          prompt: |
+            Repair the blocking findings from the independent review for PR
+            #${{ inputs.pr_number }} on the branch already checked out.
+
+            Read first:
+            - .agent-fix-context.json
+            - .agent-source-issue.md
+            - AGENTS.md
+            - CLAUDE.md
+            - docs/implementation-roadmap.md
+            Then inspect the relevant source files.
+
+            Address only the blocking_issues. Non-blocking notes are optional and should not
+            expand scope. Do not modify generated .agent-* context files.
+            Do not modify protected/high-risk paths, GitHub workflows, agent policy files,
+            auth/RLS/migrations/secrets/production infrastructure.
+            Do not run npm/npx quality gates; GitHub Actions CI owns deterministic verification.
+
+            After making the smallest correct fix:
+            1. inspect git diff and git status,
+            2. stage only intended files,
+            3. commit with a concise message,
+            4. run .git/agent-safe-push.sh.
+
+            Never force-push. If the blocking finding cannot be fixed safely under these
+            constraints, make no fabricated change and explain the blocker.
+          claude_args: |
+            --max-turns 20
+            --allowedTools "Edit,Write,Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(.git/agent-safe-push.sh)"
+            --disallowedTools "Bash(npm:*),Bash(npx:*),WebFetch,WebSearch"
+
+      - name: Route repair result
+        if: steps.meta.outputs.eligible == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BRANCH_NAME: ${{ steps.meta.outputs.branch }}
+          REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+          REVIEW_ATTEMPT: ${{ inputs.review_attempt }}
+        run: |
+          set -euo pipefail
+
+          remote_sha="$(git ls-remote origin "refs/heads/${BRANCH_NAME}" | awk '{print $1}')"
+
+          if [ -z "$remote_sha" ] || [ "$remote_sha" = "$REVIEWED_SHA" ]; then
+            gh label create human-required \
+              --color D93F0B \
+              --description "Automated review/fix stopped; human judgment required" \
+              --force
+            gh pr edit "$PR_NUMBER" --add-label human-required
+            gh pr comment "$PR_NUMBER" --body \
+              "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} result=NO_NEW_COMMIT -->
+              Automated fixer did not produce a new safe commit. Human review is required."
+            exit 0
+          fi
+
+          git fetch --no-tags origin "${BRANCH_NAME}:refs/remotes/origin/${BRANCH_NAME}"
+          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$'
+          repair_files="$(git diff --name-only "$REVIEWED_SHA" "$remote_sha")"
+
+          if grep -Eiq "$protected_re" <<<"$repair_files"; then
+            gh label create human-required \
+              --color D93F0B \
+              --description "Automated review/fix stopped; human judgment required" \
+              --force
+            gh pr edit "$PR_NUMBER" --add-label human-required
+            gh pr comment "$PR_NUMBER" --body \
+              "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} to-sha=${remote_sha} result=PROTECTED_PATH -->
+              Automated fixer touched a protected/high-risk path. Further automation is stopped; human review is required."
+            exit 0
+          fi
+
+          gh pr comment "$PR_NUMBER" --body \
+            "<!-- agent-fix review-attempt=${REVIEW_ATTEMPT} from-sha=${REVIEWED_SHA} to-sha=${remote_sha} result=FIX_PUSHED -->
+            Automated fixer pushed a new commit. CI has been dispatched; independent review will run again only if CI passes."
+
+          gh workflow run ci.yml --ref "$BRANCH_NAME"
+
+      - name: Remove generated context
+        if: always() && steps.meta.outputs.eligible == 'true'
+        shell: bash
+        run: rm -f .agent-fix-context.json .agent-source-issue.md

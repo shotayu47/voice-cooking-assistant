@@ -1,0 +1,404 @@
+name: Claude Independent Review
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+concurrency:
+  group: claude-review-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  discover:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'claude/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      eligible: ${{ steps.meta.outputs.eligible }}
+      pr_number: ${{ steps.meta.outputs.pr_number }}
+      head_sha: ${{ steps.meta.outputs.head_sha }}
+      attempt: ${{ steps.meta.outputs.attempt }}
+      risk: ${{ steps.meta.outputs.risk }}
+      exhausted: ${{ steps.meta.outputs.exhausted }}
+      source_issue: ${{ steps.meta.outputs.source_issue }}
+    steps:
+      - name: Discover automated PR and review state
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          echo "eligible=false" >> "$GITHUB_OUTPUT"
+          echo "risk=false" >> "$GITHUB_OUTPUT"
+          echo "exhausted=false" >> "$GITHUB_OUTPUT"
+          echo "source_issue=" >> "$GITHUB_OUTPUT"
+
+          pr_json="$(gh pr list \
+            --state open \
+            --base main \
+            --head "$HEAD_BRANCH" \
+            --json number,body,headRefOid \
+            --jq '.[0] // empty')"
+
+          if [ -z "$pr_json" ]; then
+            echo "No open PR found for $HEAD_BRANCH."
+            exit 0
+          fi
+
+          pr_number="$(jq -r '.number' <<<"$pr_json")"
+          head_sha="$(jq -r '.headRefOid' <<<"$pr_json")"
+          pr_body="$(jq -r '.body // ""' <<<"$pr_json")"
+
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+          comments="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/issues/${pr_number}/comments?per_page=100" \
+            --paginate \
+            --jq '.[].body')"
+
+          if grep -Fq "<!-- agent-review sha=${head_sha} " <<<"$comments"; then
+            echo "This commit SHA was already reviewed."
+            exit 0
+          fi
+
+          review_count="$(grep -c '^<!-- agent-review sha=' <<<"$comments" || true)"
+          attempt="$((review_count + 1))"
+          echo "attempt=$attempt" >> "$GITHUB_OUTPUT"
+
+          if [ "$attempt" -gt 3 ]; then
+            echo "exhausted=true" >> "$GITHUB_OUTPUT"
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          source_issue="$(sed -nE 's/.*Source issue: #([0-9]+).*/\1/p' <<<"$pr_body" | head -n1)"
+          if [ -n "$source_issue" ]; then
+            echo "source_issue=$source_issue" >> "$GITHUB_OUTPUT"
+          fi
+
+          changed_files="$(gh pr diff "$pr_number" --name-only)"
+          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$'
+
+          if grep -Eiq "$protected_re" <<<"$changed_files"; then
+            echo "risk=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+
+  human-gate:
+    needs: discover
+    if: >-
+      needs.discover.outputs.eligible == 'true' &&
+      (needs.discover.outputs.risk == 'true' || needs.discover.outputs.exhausted == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Mark human review required
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.discover.outputs.head_sha }}
+          ATTEMPT: ${{ needs.discover.outputs.attempt }}
+          RISK: ${{ needs.discover.outputs.risk }}
+          EXHAUSTED: ${{ needs.discover.outputs.exhausted }}
+        run: |
+          set -euo pipefail
+
+          gh label create human-required \
+            --color D93F0B \
+            --description "Automated review/fix stopped; human judgment required" \
+            --force
+
+          gh pr edit "$PR_NUMBER" --add-label human-required
+
+          if [ "$RISK" = "true" ]; then
+            reason="Protected/high-risk files are present in this PR, so automated repair is disabled."
+          else
+            reason="The maximum of 3 automated review calls has been reached."
+          fi
+
+          cat > /tmp/comment.md <<EOF
+          <!-- agent-review sha=${HEAD_SHA} attempt=${ATTEMPT} verdict=HUMAN_REQUIRED -->
+          ### Automated review stopped
+
+          ${reason}
+
+          No automated merge was attempted.
+          EOF
+
+          gh pr comment "$PR_NUMBER" --body-file /tmp/comment.md
+
+  review:
+    needs: discover
+    if: >-
+      needs.discover.outputs.eligible == 'true' &&
+      needs.discover.outputs.risk != 'true' &&
+      needs.discover.outputs.exhausted != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: read
+    outputs:
+      review_json: ${{ steps.validate.outputs.review_json }}
+    steps:
+      - name: Checkout reviewed branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare read-only review context
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
+          SOURCE_ISSUE: ${{ needs.discover.outputs.source_issue }}
+          CI_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin main:refs/remotes/origin/main
+
+          {
+            echo "# Generated review context"
+            echo
+            echo "PR:"
+            gh pr view "$PR_NUMBER" --json number,title,body,url,headRefName,headRefOid,baseRefName
+            echo
+            echo "CI result: success"
+            echo "CI run: $CI_URL"
+            if [ -n "$SOURCE_ISSUE" ]; then
+              echo
+              echo "Source issue:"
+              gh issue view "$SOURCE_ISSUE" --json number,title,body,url
+            fi
+          } > .agent-review-context.md
+
+          git diff --no-ext-diff --unified=80 origin/main...HEAD > .agent-review.diff
+
+      - name: Normalize OAuth secret safely
+        id: oauth
+        shell: bash
+        env:
+          CLAUDE_TOKEN_RAW: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          token = os.environ.get("CLAUDE_TOKEN_RAW", "").strip()
+          if not token:
+              raise SystemExit("CLAUDE_CODE_OAUTH_TOKEN is empty")
+          print(f"::add-mask::{token}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"token={token}\n")
+          PY
+
+      - name: Independent read-only Claude review
+        id: reviewer
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
+          additional_permissions: |
+            actions: read
+          prompt: |
+            You are an independent, read-only reviewer. Do not modify files, create commits,
+            push branches, post GitHub comments, or run repository commands.
+
+            Review PR #${{ needs.discover.outputs.pr_number }} at SHA
+            ${{ needs.discover.outputs.head_sha }}.
+
+            First read:
+            - .agent-review-context.md
+            - .agent-review.diff
+            - AGENTS.md
+            - CLAUDE.md
+            - docs/implementation-roadmap.md
+            Then inspect any relevant changed or surrounding source files.
+
+            The CI run for this exact branch completed successfully. Do not re-run CI.
+            Judge whether the implementation satisfies the source issue and repository rules.
+            A blocking issue is a concrete correctness, security, data-loss, regression,
+            missing-required-test, or acceptance-criteria failure that should prevent merge.
+            Do not mark style preferences or optional improvements as blocking.
+
+            Return PASS only when blocking_issues is empty. Keep findings concise and actionable.
+            Return at most 5 blocking issues and 5 non-blocking issues.
+          claude_args: |
+            --max-turns 12
+            --allowedTools "Read,Glob,Grep,LS"
+            --disallowedTools "Edit,Write,Bash,WebFetch,WebSearch"
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","FAIL"]},"blocking_issues":{"type":"array","maxItems":5,"items":{"type":"object","properties":{"severity":{"type":"string","enum":["high","medium","low"]},"file":{"type":"string"},"line":{"type":["integer","null"]},"message":{"type":"string"},"fix":{"type":"string"}},"required":["severity","file","line","message","fix"],"additionalProperties":false}},"non_blocking_issues":{"type":"array","maxItems":5,"items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1},"summary":{"type":"string"}},"required":["verdict","blocking_issues","non_blocking_issues","confidence","summary"],"additionalProperties":false}'
+
+      - name: Validate reviewer contract fail-closed
+        id: validate
+        shell: bash
+        env:
+          RAW_REVIEW: ${{ steps.reviewer.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+
+          compact="$(jq -ce '
+            .verdict as $v |
+            select($v == "PASS" or $v == "FAIL") |
+            select((.blocking_issues | type) == "array") |
+            select((.non_blocking_issues | type) == "array") |
+            select((.confidence | type) == "number") |
+            select((.summary | type) == "string") |
+            if $v == "PASS" then
+              select((.blocking_issues | length) == 0)
+            else
+              select((.blocking_issues | length) > 0)
+            end
+          ' <<<"$RAW_REVIEW")"
+
+          echo "review_json=$compact" >> "$GITHUB_OUTPUT"
+
+      - name: Remove generated context
+        if: always()
+        shell: bash
+        run: rm -f .agent-review-context.md .agent-review.diff
+
+  publish:
+    needs: [discover, review]
+    if: needs.review.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+      actions: write
+    steps:
+      - name: Publish verdict and route next action
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.discover.outputs.head_sha }}
+          ATTEMPT: ${{ needs.discover.outputs.attempt }}
+          REVIEW_JSON: ${{ needs.review.outputs.review_json }}
+        run: |
+          set -euo pipefail
+
+          verdict="$(jq -r '.verdict' <<<"$REVIEW_JSON")"
+
+          gh label create agent-review-pass \
+            --color 0E8A16 \
+            --description "Independent automated review passed" \
+            --force
+          gh label create agent-review-fail \
+            --color B60205 \
+            --description "Independent automated review found blocking issues" \
+            --force
+          gh label create human-required \
+            --color D93F0B \
+            --description "Automated review/fix stopped; human judgment required" \
+            --force
+
+          {
+            echo "<!-- agent-review sha=${HEAD_SHA} attempt=${ATTEMPT} verdict=${verdict} -->"
+            echo "### Independent automated review — ${verdict}"
+            echo
+            jq -r '.summary' <<<"$REVIEW_JSON"
+            echo
+            echo "- Review attempt: ${ATTEMPT}/3"
+            echo "- Confidence: $(jq -r '.confidence' <<<"$REVIEW_JSON")"
+            echo "- Reviewed SHA: \`${HEAD_SHA}\`"
+          } > /tmp/review-comment.md
+
+          if [ "$verdict" = "FAIL" ]; then
+            {
+              echo
+              echo "#### Blocking issues"
+              jq -r '.blocking_issues[] | "- **[\(.severity)]** `\(.file)`" + (if .line == null then "" else " line \(.line|tostring)" end) + ": \(.message)\n  - Fix: \(.fix)"' <<<"$REVIEW_JSON"
+            } >> /tmp/review-comment.md
+          fi
+
+          non_blocking_count="$(jq '.non_blocking_issues | length' <<<"$REVIEW_JSON")"
+          if [ "$non_blocking_count" -gt 0 ]; then
+            {
+              echo
+              echo "#### Non-blocking notes"
+              jq -r '.non_blocking_issues[] | "- " + .' <<<"$REVIEW_JSON"
+            } >> /tmp/review-comment.md
+          fi
+
+          gh pr comment "$PR_NUMBER" --body-file /tmp/review-comment.md
+
+          if [ "$verdict" = "PASS" ]; then
+            gh pr edit "$PR_NUMBER" --add-label agent-review-pass
+            gh pr edit "$PR_NUMBER" --remove-label agent-review-fail 2>/dev/null || true
+            gh pr edit "$PR_NUMBER" --remove-label human-required 2>/dev/null || true
+            exit 0
+          fi
+
+          gh pr edit "$PR_NUMBER" --add-label agent-review-fail
+          gh pr edit "$PR_NUMBER" --remove-label agent-review-pass 2>/dev/null || true
+
+          if [ "$ATTEMPT" -ge 3 ]; then
+            gh pr edit "$PR_NUMBER" --add-label human-required
+            gh pr comment "$PR_NUMBER" \
+              --body "Automated repair stopped after 3 review calls. Human review is required. No automated merge was attempted."
+            exit 0
+          fi
+
+          gh workflow run claude-review-fix.yml \
+            -f pr_number="$PR_NUMBER" \
+            -f review_attempt="$ATTEMPT" \
+            -f reviewed_sha="$HEAD_SHA" \
+            -f review_json="$REVIEW_JSON"
+
+  review-failure:
+    needs: [discover, review]
+    if: >-
+      always() &&
+      needs.discover.outputs.eligible == 'true' &&
+      needs.discover.outputs.risk != 'true' &&
+      needs.discover.outputs.exhausted != 'true' &&
+      needs.review.result == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Fail closed on reviewer infrastructure failure
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.discover.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.discover.outputs.head_sha }}
+          ATTEMPT: ${{ needs.discover.outputs.attempt }}
+        run: |
+          set -euo pipefail
+
+          gh label create human-required \
+            --color D93F0B \
+            --description "Automated review/fix stopped; human judgment required" \
+            --force
+          gh pr edit "$PR_NUMBER" --add-label human-required
+
+          gh pr comment "$PR_NUMBER" --body \
+            "<!-- agent-review sha=${HEAD_SHA} attempt=${ATTEMPT} verdict=REVIEW_ERROR -->
+            Automated reviewer failed to produce a valid verdict. The workflow fails closed and requires human review. No automated merge was attempted."
