@@ -27,9 +27,11 @@ describe('realtimeToolDefinitions', () => {
   });
 
   it('covers the SPEC §8 tools plus the §14 name resolver', () => {
-    // 12 through PHASE 7, plus adjust_recipe_amounts (PHASE 8).
-    expect(realtime).toHaveLength(13);
+    // 12 through PHASE 7, plus adjust_recipe_amounts (PHASE 8),
+    // plus add_selected_shopping_candidates (PHASE 10.3b2).
+    expect(realtime).toHaveLength(14);
     expect(realtime.map((tool) => tool.name)).toContain('find_inventory_item');
+    expect(realtime.map((tool) => tool.name)).toContain('add_selected_shopping_candidates');
   });
 });
 
