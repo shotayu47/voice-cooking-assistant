@@ -46,9 +46,11 @@ import {
   STAPLE_SEASONINGS,
   surplusItems,
 } from '@/lib/meals/classification';
-import { evaluateCandidates, MISSING_REASON_LABELS } from '@/lib/meals/evaluate';
+import { evaluateCandidates, MISSING_REASON_LABELS, MISSING_REASONS } from '@/lib/meals/evaluate';
 import { missingIngredientsToShoppingCandidates } from '@/lib/shopping/candidates';
-import type { InventoryItem, Recipe } from '@/types/domain';
+import { addSelectedShoppingCandidates } from '@/lib/shopping/add-candidates';
+import { parseSelectedShoppingCandidates } from '@/lib/shopping/selected-candidates';
+import type { InventoryItem, Recipe, ShoppingItem } from '@/types/domain';
 
 /**
  * Tool definitions (SPEC §8).
@@ -469,6 +471,46 @@ intent で「やった」のか「飛ばした」のかを区別する:
           status: { type: 'string', enum: ['completed', 'cancelled', 'paused'] },
         },
         required: ['session_id', 'status'],
+        additionalProperties: false,
+      },
+    },
+  },
+  // PHASE 10.3b2. Writes only the candidates the user explicitly picked —
+  // never called to merely suggest or display candidates, and never derives
+  // a selection on its own from search_meal_candidates' shopping_candidates.
+  {
+    type: 'function',
+    function: {
+      name: 'add_selected_shopping_candidates',
+      description:
+        `ユーザーが明示的に選んだ買い物候補だけを買い物リストに追加する。
+候補を提案・表示するだけの場合は呼ばないこと。ユーザーが「それ買っておいて」
+「卵と牛乳を追加して」のように選択を確定させたときだけ呼ぶこと。
+selected にはユーザーが選んだ候補だけを入れ、選ばれなかった候補は入れないこと。
+1件も選ばれていない場合は selected を空配列にして呼ぶこと。`,
+      parameters: {
+        type: 'object',
+        properties: {
+          selected: {
+            type: 'array',
+            description: 'ユーザーが選んだ買い物候補。選ばれていないものは入れないこと。',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: '食材名' },
+                reason: {
+                  type: 'string',
+                  enum: [...MISSING_REASONS],
+                  description: '不足していた理由',
+                },
+                is_staple: { type: 'boolean', description: '調味料など常備品かどうか' },
+              },
+              required: ['name', 'reason', 'is_staple'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['selected'],
         additionalProperties: false,
       },
     },
@@ -1058,6 +1100,23 @@ async function dispatch(
       };
     }
 
+    case 'add_selected_shopping_candidates': {
+      const selected = parseSelectedShoppingCandidates(args.selected);
+      const added = await addSelectedShoppingCandidates(ctx, selected);
+      return {
+        result: {
+          added: added.map(({ candidate, item, duplicates }) => ({
+            name: candidate.name,
+            reason: candidate.reason,
+            reason_label: MISSING_REASON_LABELS[candidate.reason],
+            is_staple: candidate.isStaple,
+            item: publicShoppingItem(item),
+            duplicates: duplicates.map(publicShoppingItem),
+          })),
+        },
+      };
+    }
+
     default:
       return { result: { error: 'unknown_tool', message: `未知のツール: ${name}` } };
   }
@@ -1087,6 +1146,17 @@ function publicItem(item: InventoryItem) {
           expiry_is_estimated: freshness.estimated,
         }
       : {}),
+  };
+}
+
+/** What the model is allowed to see about a shopping list row. */
+function publicShoppingItem(item: ShoppingItem) {
+  return {
+    id: item.id,
+    name: item.name,
+    quantity: item.quantity,
+    unit: item.unit,
+    checked: item.checked,
   };
 }
 
