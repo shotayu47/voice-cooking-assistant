@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { selectExecutableCalls, type RealtimeFunctionCall } from './select-calls';
+import { resolveToolEffect, type ToolEffect } from './tool-effect';
 
 /**
  * WebRTC client for the OpenAI Realtime API (SPEC §21.2).
@@ -35,10 +36,7 @@ export type VoiceState = {
   error: string | null;
 };
 
-export type ToolEffect = {
-  effect: 'inventory_changed' | 'session_changed' | null;
-  sessionId: string | null;
-};
+export type { ToolEffect };
 
 const INITIAL_STATE: VoiceState = {
   status: 'idle',
@@ -338,8 +336,9 @@ export function useRealtimeVoice(options: {
         });
         send({ type: 'response.create' });
 
-        if (body.effect) {
-          onToolEffectRef.current?.({ effect: body.effect, sessionId: body.session_id });
+        const toolEffect = resolveToolEffect(body);
+        if (toolEffect) {
+          onToolEffectRef.current?.(toolEffect);
         }
       } catch {
         // Timed out or offline. Tell the model so it can say something rather
