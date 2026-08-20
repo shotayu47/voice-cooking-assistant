@@ -799,7 +799,7 @@ Test F を再実施して判断すること。** 通知は今の設計に対す�
 
 ## 次に実装する PHASE
 
-**PHASE 10 — AI 買い物候補提案**（PHASE 6・7・8・9 はいずれも COMPLETE。PHASE 10 自体は IN_PROGRESS — 下記の小段階のうち書き込みまでは実装済みだが、AI tool 配線が残っているため COMPLETE にしていない）
+**PHASE 10 — AI 買い物候補提案**（PHASE 6・7・8・9 はいずれも COMPLETE。PHASE 10 自体は IN_PROGRESS — 10.3a で `search_meal_candidates` が読み取り専用の買い物候補を返すようになったが、選択・書き込みを呼ぶ経路と prompt/UI 配線が残っているため COMPLETE にしていない）
 
 着手前に読むもの: `docs/phase9-shopping-list.md` の §2「PHASE 10〜12 との境界」。
 PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツールのまま）。
@@ -812,10 +812,16 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 | --- | --- | --- |
 | 10.1 | `src/lib/shopping/candidates.ts` — `MissingIngredient[]` から重複を畳んだ候補リストを作る純粋関数。I/O なし、書き込みなし | ✅ 完了（#50 / PR #51） |
 | 10.2 | `src/lib/shopping/add-candidates-core.ts` + `add-candidates.ts` — **明示的に選択された候補だけ**を `createShoppingItem` 経由で書き込む境界。`MissingIngredient[]` から自動で書く経路はない | ✅ 完了（#52） |
-| 10.3以降 | AI tool 定義・prompt・UI・chat/voice 配線（未着手） | NOT_STARTED |
+| 10.3a | `search_meal_candidates` の2回目（`candidates` あり）の各 `evaluated_candidates` に、その候補の `verdict.missing` を 10.1 の `missingIngredientsToShoppingCandidates()` に通した `shopping_candidates` を追加。読み取り専用（書き込みなし）。tool 数は13のまま | ✅ 完了（#54） |
+| 10.3以降 | 買い物候補の選択・書き込みを AI tool から呼ぶ経路、prompt、UI、chat/voice 配線（未着手） | NOT_STARTED |
 
 10.2 は「選択」の中身（誰が・どうやって選ぶか）には関与しない。選択された
 `ShoppingCandidate[]` を受け取って書くだけで、候補生成（10.1）や選択 UI/AI
 配線（10.3 以降）とは独立している。`shopping_items` への独自 insert は無く、
 既存 `createShoppingItem` の validation・normalize・duplicate 検出をそのまま経由する。
+
+10.3a は `search_meal_candidates` の結果を拡張しただけで、`createShoppingItem` /
+`addSelectedShoppingCandidates` はまだどこからも呼ばれていない。source of truth は
+サーバーが実在庫と照合した `verdict.missing`（`src/lib/meals/evaluate.ts`）のみで、
+モデルから別の `MissingIngredient[]` を受け取る引数は追加していない。
 
