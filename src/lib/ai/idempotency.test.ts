@@ -82,6 +82,23 @@ describe('runOnce', () => {
     expect(retry).toMatchObject({ duplicate: false, value: { result: 'ok' } });
   });
 
+  it('runs a shopping-effect outcome once and replays the stored effect for the same call_id', async () => {
+    // PHASE 10.5b: the route nulls the effect on replay, but runOnce itself
+    // must keep executing exactly once and hand back the same stored
+    // ToolOutcome (including its effect) for a duplicate call_id.
+    const { ctx } = setup();
+    const run = vi
+      .fn()
+      .mockResolvedValue({ result: { added: [{ name: '卵' }] }, effect: 'shopping_changed' });
+
+    const first = await runOnce(ctx, 'call_shopping', 'add_selected_shopping_candidates', run);
+    const second = await runOnce(ctx, 'call_shopping', 'add_selected_shopping_candidates', run);
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(first).toMatchObject({ duplicate: false, value: { effect: 'shopping_changed' } });
+    expect(second).toMatchObject({ duplicate: true, value: { effect: 'shopping_changed' } });
+  });
+
   it('does not let one user replay another user’s call_id', async () => {
     const { client, tables } = createFakeSupabase({ ai_tool_calls: [] });
     const userOne: ServiceContext = { supabase: client, userId: 'user-1' };
