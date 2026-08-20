@@ -9,6 +9,17 @@ import { VoicePanel } from '@/components/voice-panel';
 
 type Message = { id: string; role: 'user' | 'assistant'; content: string };
 
+/**
+ * The server booleans are the only source of truth for whether a refresh is
+ * warranted — candidate suggestions being shown in the reply text is not.
+ */
+export function shouldRefreshAfterTurn(result: {
+  inventoryChanged: boolean;
+  shoppingChanged: boolean;
+}): boolean {
+  return result.inventoryChanged || result.shoppingChanged;
+}
+
 const SUGGESTIONS = [
   '今あるもので何作れる？',
   '20分以内で',
@@ -69,6 +80,7 @@ export function ChatView({
         reply: string;
         cookingSessionId: string | null;
         inventoryChanged: boolean;
+        shoppingChanged: boolean;
       };
 
       setMessages((current) => [
@@ -76,8 +88,8 @@ export function ChatView({
         { id: `reply-${current.length}`, role: 'assistant', content: result.reply },
       ]);
       if (result.cookingSessionId) setSessionId(result.cookingSessionId);
-      // The inventory pages are server-rendered; pull fresh data after a write.
-      if (result.inventoryChanged) router.refresh();
+      // The inventory/shopping pages are server-rendered; pull fresh data after a write.
+      if (shouldRefreshAfterTurn(result)) router.refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : '通信に失敗しました');
     } finally {
