@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { UnauthorizedError, getServiceContext } from '@/lib/supabase/server';
 import { executeTool, type ToolOutcome } from '@/lib/ai/tools';
 import { runOnce } from '@/lib/ai/idempotency';
+import { serializeToolResponse } from './serialize-tool-response';
 
 /** A hung tool call would leave the voice assistant waiting silently. */
 export const maxDuration = 30;
@@ -48,12 +49,5 @@ export async function POST(request: Request) {
     executeTool(ctx, name, args, 'ai_voice'),
   );
 
-  return NextResponse.json({
-    result: value.result,
-    // A replayed call must not re-trigger the UI refresh that its original
-    // already caused.
-    effect: duplicate ? null : (value.effect ?? null),
-    session_id: value.sessionId ?? null,
-    duplicate,
-  });
+  return NextResponse.json(serializeToolResponse(value, duplicate));
 }

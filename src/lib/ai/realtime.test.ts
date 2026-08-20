@@ -33,6 +33,11 @@ describe('realtimeToolDefinitions', () => {
     expect(realtime.map((tool) => tool.name)).toContain('find_inventory_item');
     expect(realtime.map((tool) => tool.name)).toContain('add_selected_shopping_candidates');
   });
+
+  it('exposes add_selected_shopping_candidates exactly once (PHASE 10.5b)', () => {
+    const matches = realtime.filter((tool) => tool.name === 'add_selected_shopping_candidates');
+    expect(matches).toHaveLength(1);
+  });
 });
 
 describe('buildSystemPrompt voice mode', () => {
