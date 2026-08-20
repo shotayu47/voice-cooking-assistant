@@ -381,9 +381,10 @@ const MUTATING_TOOLS = new Set([
   'create_recipe',
   'start_cooking_session',
   'finish_cooking_session',
+  'add_selected_shopping_candidates',
 ]);
 
-function isMutation(name: string): boolean {
+export function isMutation(name: string): boolean {
   return MUTATING_TOOLS.has(name);
 }
 
