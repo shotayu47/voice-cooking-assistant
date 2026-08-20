@@ -89,9 +89,10 @@ const TOOL_LABELS: Record<string, string> = {
   advance_cooking_step: '次の工程へ',
   previous_cooking_step: '前の工程へ',
   finish_cooking_session: '調理を終了',
+  add_selected_shopping_candidates: '買い物リストに追加',
 };
 
-function toolLabel(name: string): string {
+export function toolLabel(name: string): string {
   return TOOL_LABELS[name] ?? name;
 }
 
