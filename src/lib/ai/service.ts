@@ -12,7 +12,7 @@ import { getOpenSession, getSession } from '@/lib/cooking/service';
 import type { CookingSession, Profile } from '@/types/domain';
 import { CHAT_MODEL, getOpenAI } from './openai';
 import { buildSystemPrompt, type InventorySnapshotItem } from './prompt';
-import { TOOL_DEFINITIONS, executeTool } from './tools';
+import { TOOL_DEFINITIONS, executeTool, type ToolOutcome } from './tools';
 
 /** Hard ceiling on tool round-trips per user message. */
 const MAX_TOOL_ITERATIONS = 8;
@@ -202,9 +202,20 @@ export type TurnResult = {
   /** Tool names invoked, in order. Useful for tests and debugging. */
   toolsUsed: string[];
   inventoryChanged: boolean;
+  shoppingChanged: boolean;
   /** The cooking session the turn ended on, if any. */
   cookingSessionId: string | null;
 };
+
+/**
+ * True only when a tool actually wrote to the shopping list — never just
+ * because a shopping tool was called by name. A zero-result execution,
+ * an error result, or a duplicate-suppressed replay all carry no `effect`,
+ * so they correctly report false here.
+ */
+export function outcomeChangedShopping(outcome: Pick<ToolOutcome, 'effect'>): boolean {
+  return outcome.effect === 'shopping_changed';
+}
 
 /**
  * Run one user turn: persist the message, let the model call tools until it
@@ -243,6 +254,7 @@ export async function runTurn(
   const openai = getOpenAI();
   const toolsUsed: string[] = [];
   let inventoryChanged = false;
+  let shoppingChanged = false;
   let cookingSessionId = session?.id ?? null;
 
   // Backend guards, not prompt requests: one utterance may move the step at
@@ -267,9 +279,9 @@ export async function runTurn(
       // inventory silently moved, and a retry would apply it a second time.
       // Report what actually happened instead.
       if (toolsUsed.length > 0) {
-        const reply = describeCompletedWork(toolsUsed, inventoryChanged);
+        const reply = describeCompletedWork(toolsUsed, inventoryChanged, shoppingChanged);
         await persistMessage(ctx, input.conversationId, { role: 'assistant', content: reply });
-        return { reply, toolsUsed, inventoryChanged, cookingSessionId };
+        return { reply, toolsUsed, inventoryChanged, shoppingChanged, cookingSessionId };
       }
       throw error;
     }
@@ -296,6 +308,7 @@ export async function runTurn(
         reply: choice.content?.trim() || '…',
         toolsUsed,
         inventoryChanged,
+        shoppingChanged,
         cookingSessionId,
       };
     }
@@ -331,6 +344,7 @@ export async function runTurn(
       }
 
       if (outcome.effect === 'inventory_changed') inventoryChanged = true;
+      if (outcomeChangedShopping(outcome)) shoppingChanged = true;
       if (outcome.sessionId) cookingSessionId = outcome.sessionId;
 
       const content = JSON.stringify(outcome.result);
@@ -345,28 +359,33 @@ export async function runTurn(
 
   const fallback = 'うまくまとめられませんでした。もう一度、短く言い直してもらえますか。';
   await persistMessage(ctx, input.conversationId, { role: 'assistant', content: fallback });
-  return { reply: fallback, toolsUsed, inventoryChanged, cookingSessionId };
+  return { reply: fallback, toolsUsed, inventoryChanged, shoppingChanged, cookingSessionId };
 }
 
 /**
  * Plain-language account of what a turn managed to do before the model call
- * failed. Deliberately concrete about the inventory: the point is that the
- * user knows not to say it again.
+ * failed. Only reports a category as done when its own flag says so — a tool
+ * name appearing in `toolsUsed` is not evidence of a write (it may have
+ * no-opped, errored, or been duplicate-suppressed).
  */
-function describeCompletedWork(toolsUsed: string[], inventoryChanged: boolean): string {
-  if (inventoryChanged) {
-    return [
-      '在庫の変更は反映されましたが、返答の生成に失敗しました。',
-      '同じ操作をもう一度言うと二重に反映されるので、在庫画面で結果を確認してください。',
-    ].join('\n');
+export function describeCompletedWork(
+  toolsUsed: string[],
+  inventoryChanged: boolean,
+  shoppingChanged: boolean,
+): string {
+  const completed: string[] = [];
+  if (inventoryChanged) completed.push('在庫の変更');
+  if (shoppingChanged) completed.push('買い物リストへの追加');
+  if (toolsUsed.some(isStepMove)) completed.push('工程の移動');
+
+  if (completed.length === 0) {
+    return '返答の生成に失敗しました。もう一度お試しください。在庫は変更されていません。';
   }
 
-  const stepMoved = toolsUsed.some(isStepMove);
-  if (stepMoved) {
-    return '工程は進みましたが、返答の生成に失敗しました。画面を再読み込みしてください。';
-  }
-
-  return '返答の生成に失敗しました。もう一度お試しください。在庫は変更されていません。';
+  return [
+    `${completed.join('・')}は反映されましたが、返答の生成に失敗しました。`,
+    '同じ操作をもう一度言うと二重に反映される場合があるので、画面で結果を確認してください。',
+  ].join('\n');
 }
 
 function isStepMove(name: string): boolean {
