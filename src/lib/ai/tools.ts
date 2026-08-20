@@ -47,6 +47,7 @@ import {
   surplusItems,
 } from '@/lib/meals/classification';
 import { evaluateCandidates, MISSING_REASON_LABELS } from '@/lib/meals/evaluate';
+import { missingIngredientsToShoppingCandidates } from '@/lib/shopping/candidates';
 import type { InventoryItem, Recipe } from '@/types/domain';
 
 /**
@@ -810,11 +811,22 @@ async function dispatch(
               on_hand: verdict.onHand,
               uses_expiring: verdict.usesExpiring,
               expiring_used: verdict.expiringUsed,
+              // Read-only shopping suggestions derived from the same
+              // server-confirmed `missing` list above — nothing is written.
+              shopping_candidates: missingIngredientsToShoppingCandidates(
+                verdict.missing,
+              ).map((candidate) => ({
+                name: candidate.name,
+                reason: candidate.reason,
+                reason_label: MISSING_REASON_LABELS[candidate.reason],
+                is_staple: candidate.isStaple,
+              })),
             })),
             note:
               'この分類と不足材料はサーバーが実在庫と照合して確定したものです。' +
               'そのまま伝えてください。数え直したり、別の分類を付けたりしないでください。' +
-              'not_feasible の候補は提案しないでください。並び順は提案順の推奨です。',
+              'not_feasible の候補は提案しないでください。並び順は提案順の推奨です。' +
+              'shopping_candidates は買い物候補の提案であり、まだ買い物リストには追加されていません。',
           },
         };
       }
