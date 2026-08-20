@@ -84,6 +84,17 @@ jobs:
             echo "$body"
           } > /tmp/agent-issue.md
 
+      - name: Publish run URL for observability
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "<!-- implementation-run id=${GITHUB_RUN_ID} -->
+            Direct CLI implementation run started: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
       - name: Ensure clean implementation branch
         shell: bash
         env:
@@ -138,16 +149,19 @@ jobs:
         run: |
           set -uo pipefail
 
-          cat > /tmp/implementation-prompt.md <<'PROMPT'
+          {
+            cat <<'PROMPT'
           You are the implementation agent in a bounded autonomous development pipeline.
 
-          Read these first:
-          - /tmp/agent-issue.md
+          Read these repository instructions first:
           - AGENTS.md
           - CLAUDE.md
           - docs/implementation-roadmap.md
 
-          Then inspect only the repository files needed to implement the issue correctly.
+          The complete GitHub issue specification follows below.
+          PROMPT
+            cat /tmp/agent-issue.md
+            cat <<'PROMPT'
 
           Requirements:
           - Implement exactly the supplied issue and no later PHASE.
@@ -162,6 +176,7 @@ jobs:
 
           Finish by returning a concise summary of what you changed and any manual QA still required.
           PROMPT
+          } > /tmp/implementation-prompt.md
 
           set +e
           "$HOME/.local/bin/claude" -p "$(cat /tmp/implementation-prompt.md)" \
@@ -284,12 +299,25 @@ jobs:
           set -euo pipefail
           gh workflow run ci.yml --ref "$BRANCH_NAME"
 
-      - name: Mark issue implementation started
+      - name: Report successful implementation handoff
         if: success()
+        continue-on-error: true
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           PR_URL: ${{ steps.pr.outputs.url }}
         run: |
-          gh issue comment "$ISSUE_NUMBER" --body "Direct CLI implementation completed and a PR was created: ${PR_URL}. CI and independent review continue automatically; no merge was attempted."
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "Direct CLI implementation completed and a PR was created: ${PR_URL}. CI and independent review continue automatically; no merge was attempted."
+
+      - name: Report failed implementation run safely
+        if: failure() && steps.issue.outputs.number != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "Direct CLI implementation run failed safely before PR handoff. View the run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. No automated merge was attempted."
