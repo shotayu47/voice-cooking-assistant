@@ -65,6 +65,20 @@ describe('add_selected_shopping_candidates — definition', () => {
     expect(itemSchema.additionalProperties).toBe(false);
     expect(itemSchema.properties.reason.enum).toEqual(['absent', 'out_of_stock', 'expired']);
   });
+
+  it('instructs not calling the tool on zero selection, matching the shared prompt contract, in both text and Realtime definitions', () => {
+    expect(definition?.type).toBe('function');
+    if (definition?.type !== 'function') return;
+
+    const realtimeDescription = realtimeToolDefinitions().find(
+      (tool) => tool.name === 'add_selected_shopping_candidates',
+    )?.description;
+
+    for (const description of [definition.function.description, realtimeDescription]) {
+      expect(description).toContain('1件も選ばれていない場合はこのツールを呼ばないこと');
+      expect(description).not.toContain('空配列にして呼ぶ');
+    }
+  });
 });
 
 describe('add_selected_shopping_candidates — execution', () => {
