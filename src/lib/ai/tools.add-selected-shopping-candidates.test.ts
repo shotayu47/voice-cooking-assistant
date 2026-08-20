@@ -85,16 +85,17 @@ describe('add_selected_shopping_candidates — execution', () => {
   it('selected: [] is a successful no-op with zero shopping rows', async () => {
     const { ctx, tables } = setup();
 
-    const { result } = await call(ctx, { selected: [] });
+    const { result, effect } = await call(ctx, { selected: [] });
 
     expect(result).toEqual({ added: [] });
+    expect(effect).toBeUndefined();
     expect(rows(tables)).toHaveLength(0);
   });
 
   it('writes only the candidates present in selected', async () => {
     const { ctx, tables } = setup();
 
-    const { result } = await call(ctx, {
+    const { result, effect } = await call(ctx, {
       selected: [
         { name: '卵', reason: 'absent', is_staple: false },
         { name: '醤油', reason: 'out_of_stock', is_staple: true },
@@ -103,6 +104,7 @@ describe('add_selected_shopping_candidates — execution', () => {
 
     expect(rows(tables).map((r) => r.name)).toEqual(['卵', '醤油']);
     expect((result as { added: unknown[] }).added).toHaveLength(2);
+    expect(effect).toBe('shopping_changed');
   });
 
   it('retains candidate fields, public item, and public duplicates on each entry', async () => {
