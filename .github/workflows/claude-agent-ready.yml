@@ -10,6 +10,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: claude-agent-ready-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
 jobs:
   claude:
     if: >-
@@ -30,7 +34,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          fetch-depth: 1
+          ref: main
+          fetch-depth: 0
 
       - name: Resolve issue context
         id: issue
@@ -65,19 +70,40 @@ jobs:
 
           title="$(jq -r '.title' <<<"$issue_json")"
           body="$(jq -r '.body // ""' <<<"$issue_json")"
+          branch="claude/issue-${issue_number}"
 
           echo "number=$issue_number" >> "$GITHUB_OUTPUT"
           echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
           {
-            echo "prompt<<__AGENT_PROMPT__"
-            echo "Implement GitHub issue #${issue_number} exactly as specified."
+            echo "# GitHub issue #${issue_number}"
             echo
-            echo "Issue title: ${title}"
+            echo "Title: ${title}"
             echo
-            echo "Issue body:"
             echo "$body"
-            echo "__AGENT_PROMPT__"
-          } >> "$GITHUB_OUTPUT"
+          } > /tmp/agent-issue.md
+
+      - name: Ensure clean implementation branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ steps.issue.outputs.branch }}
+        run: |
+          set -euo pipefail
+
+          existing_pr="$(gh pr list --state open --base main --head "$BRANCH_NAME" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing_pr" ]; then
+            echo "An open implementation PR already exists: #${existing_pr}."
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --heads origin "refs/heads/${BRANCH_NAME}" >/dev/null 2>&1; then
+            echo "Remote branch ${BRANCH_NAME} already exists without an open PR; refusing to overwrite it."
+            exit 1
+          fi
+
+          git switch -c "$BRANCH_NAME" origin/main
 
       - name: Normalize OAuth secret safely
         id: oauth
@@ -87,163 +113,183 @@ jobs:
         run: |
           python - <<'PY'
           import os
-
-          raw = os.environ.get("CLAUDE_TOKEN_RAW", "")
-          token = raw.strip()
-
+          token = os.environ.get("CLAUDE_TOKEN_RAW", "").strip()
           if not token:
-              category = "EMPTY"
-          elif any(ch.isspace() for ch in token):
-              category = "INTERNAL_WHITESPACE"
-          elif token.startswith("sk-ant-oat"):
-              category = "EXPECTED_OAUTH_PREFIX"
-          else:
-              category = "OTHER_PREFIX"
-
-          print(f"CLAUDE_OAUTH_PREFLIGHT={category}")
-
-          if token:
-              print(f"::add-mask::{token}")
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write(f"token={token}\n")
+              raise SystemExit("CLAUDE_CODE_OAUTH_TOKEN is empty")
+          print(f"::add-mask::{token}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"token={token}\n")
           PY
 
-      - name: Run Claude Code from label event
-        id: claude_event
-        if: github.event_name == 'issues'
-        uses: anthropics/claude-code-action@v1
-        with:
-          github_token: ${{ github.token }}
-          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
-          label_trigger: agent-ready
-          claude_args: |
-            --max-turns 32
-            --allowedTools "Edit,Write"
-            --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the labeled issue body as the complete task specification. Make only the requested changes, then commit and push the branch. Deterministic repository quality gates are owned by the GitHub Actions CI job that runs after the pull request is created; do not spend agent turns running npm quality-gate commands yourself, and report those checks as pending CI rather than claiming they passed. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
+      - name: Install pinned Claude Code CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.237
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
 
-      - name: Run Claude Code from autonomous dispatch
-        id: claude_dispatch
-        if: github.event_name == 'workflow_dispatch'
-        uses: anthropics/claude-code-action@v1
-        with:
-          github_token: ${{ github.token }}
-          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
-          prompt: ${{ steps.issue.outputs.prompt }}
-          claude_args: |
-            --max-turns 32
-            --allowedTools "Edit,Write"
-            --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the supplied GitHub issue body as the complete task specification. Make only the requested changes, then commit and push the branch. Deterministic repository quality gates are owned by the GitHub Actions CI job that runs after the pull request is created; do not spend agent turns running npm quality-gate commands yourself, and report those checks as pending CI rather than claiming they passed. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
-
-      - name: Normalize Claude branch output
-        id: claude
-        if: always()
+      - name: Implement issue with direct Claude CLI
+        id: implement
         shell: bash
         env:
-          EVENT_BRANCH: ${{ steps.claude_event.outputs.branch_name }}
-          DISPATCH_BRANCH: ${{ steps.claude_dispatch.outputs.branch_name }}
-          EVENT_OUTCOME: ${{ steps.claude_event.outcome }}
-          DISPATCH_OUTCOME: ${{ steps.claude_dispatch.outcome }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ steps.oauth.outputs.token }}
+          DISABLE_AUTOUPDATER: "1"
+        run: |
+          set -uo pipefail
+
+          cat > /tmp/implementation-prompt.md <<'PROMPT'
+          You are the implementation agent in a bounded autonomous development pipeline.
+
+          Read these first:
+          - /tmp/agent-issue.md
+          - AGENTS.md
+          - CLAUDE.md
+          - docs/implementation-roadmap.md
+
+          Then inspect only the repository files needed to implement the issue correctly.
+
+          Requirements:
+          - Implement exactly the supplied issue and no later PHASE.
+          - You may read, search, edit, and create repository files.
+          - Do not run shell commands, git commands, npm commands, tests, builds, network calls, or GitHub operations.
+          - GitHub Actions owns validation, commit, push, PR creation, CI, and review after you finish editing.
+          - Do not modify .github/workflows, AGENTS.md, CLAUDE.md, .claude, auth, middleware, RLS/policies, migrations, secrets, environment files, destructive data operations, or production infrastructure.
+          - If the requested implementation unexpectedly requires a protected/high-risk change, make no protected change and explain the blocker in your final result.
+          - Add or update deterministic tests required by the issue, but do not execute them.
+          - Never claim tests, deployment, migration, production behavior, or manual QA passed unless that was actually verified externally.
+          - Keep the implementation minimal and consistent with existing architecture.
+
+          Finish by returning a concise summary of what you changed and any manual QA still required.
+          PROMPT
+
+          set +e
+          "$HOME/.local/bin/claude" -p "$(cat /tmp/implementation-prompt.md)" \
+            --output-format json \
+            --no-session-persistence \
+            --max-turns 32 \
+            --tools "Read,Glob,Grep,Edit,Write" \
+            --disallowedTools "Bash,WebSearch,WebFetch,mcp__*" \
+            --permission-mode dontAsk \
+            > /tmp/implementation-result.json \
+            2> /tmp/implementation-stderr.log
+          exit_code=$?
+          set -e
+
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+
+      - name: Validate implementation result and changed paths
+        id: validate
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.implement.outputs.exit_code }}
         run: |
           set -euo pipefail
 
-          branch="${EVENT_BRANCH:-${DISPATCH_BRANCH:-}}"
-          echo "branch_name=$branch" >> "$GITHUB_OUTPUT"
-
-          if [ "$EVENT_OUTCOME" = "failure" ] || [ "$DISPATCH_OUTCOME" = "failure" ]; then
-            echo "failed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "failed=false" >> "$GITHUB_OUTPUT"
+          if [ "${EXIT_CODE:-1}" != "0" ]; then
+            category="CLI_FAILURE"
+            combined="$(cat /tmp/implementation-result.json /tmp/implementation-stderr.log 2>/dev/null || true)"
+            if grep -Eiq 'authentication|invalid bearer|unauthorized|status code 401|api error: 401' <<<"$combined"; then
+              category="AUTHENTICATION"
+            elif grep -Eiq 'usage limit|rate limit|rate_limit|quota|too many requests|status code 429|api error: 429' <<<"$combined"; then
+              category="USAGE_OR_RATE_LIMIT"
+            elif grep -Eiq 'max[_ -]?turn|maximum number of turns|error_max_turns' <<<"$combined"; then
+              category="MAX_TURNS"
+            fi
+            echo "IMPLEMENTATION_FAILURE_CATEGORY=$category"
+            exit 1
           fi
 
-      - name: Create pull request when Claude pushed changes
-        id: pr
-        if: steps.claude.outputs.branch_name != ''
+          if git diff --quiet && [ -z "$(git status --porcelain)" ]; then
+            echo "Claude completed without repository changes."
+            exit 1
+          fi
+
+          changed_files="$(git status --porcelain=v1 | sed -E 's/^.. //' | sed -E 's/.* -> //' )"
+          protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$'
+
+          if grep -Eiq "$protected_re" <<<"$changed_files"; then
+            echo "Claude attempted to modify a protected/high-risk path."
+            git status --short
+            exit 1
+          fi
+
+          if grep -Eiq '(^|/)(\.env($|\.)|.*secret.*|.*credential.*)' <<<"$changed_files"; then
+            echo "Potential secret-bearing path detected."
+            exit 1
+          fi
+
+          echo "Changed files:"
+          printf '%s\n' "$changed_files"
+
+      - name: Commit and push implementation
+        id: push
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+          BRANCH_NAME: ${{ steps.issue.outputs.branch }}
           ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           ISSUE_TITLE: ${{ steps.issue.outputs.title }}
         run: |
           set -euo pipefail
 
-          if ! git ls-remote --exit-code --heads origin "refs/heads/${BRANCH_NAME}" >/dev/null 2>&1; then
-            echo "Claude did not push a remote branch; no PR to create."
-            exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No staged implementation changes."
+            exit 1
           fi
 
-          git fetch --no-tags origin \
-            "main:refs/remotes/origin/main" \
-            "${BRANCH_NAME}:refs/remotes/origin/${BRANCH_NAME}"
+          git commit -m "feat: implement issue #${ISSUE_NUMBER}" \
+            -m "${ISSUE_TITLE}"
+          git push origin "HEAD:${BRANCH_NAME}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-          if git diff --quiet "origin/main...origin/${BRANCH_NAME}"; then
-            echo "Claude branch has no changes relative to main; no PR to create."
-            exit 0
-          fi
-
-          existing_pr="$(gh pr list --state open --base main --head "${BRANCH_NAME}" --json number --jq '.[0].number // empty')"
-          if [ -n "${existing_pr}" ]; then
-            echo "Pull request #${existing_pr} already exists."
-            echo "number=${existing_pr}" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
+      - name: Create pull request
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ steps.issue.outputs.branch }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
+        run: |
+          set -euo pipefail
 
           cat > /tmp/agent-pr-body.md <<EOF
           Automated implementation for #${ISSUE_NUMBER}.
 
-          This pull request was created automatically after Claude Code pushed changes from an \`agent-ready\` issue.
-
           - Source issue: #${ISSUE_NUMBER}
+          - Implementation used the bounded direct Claude Code CLI path.
+          - GitHub Actions owns deterministic CI and independent review.
           - Human merge remains required.
-          - CI is dispatched explicitly after PR creation.
           EOF
 
           pr_url="$(gh pr create \
             --base main \
-            --head "${BRANCH_NAME}" \
-            --title "${ISSUE_TITLE}" \
+            --head "$BRANCH_NAME" \
+            --title "$ISSUE_TITLE" \
             --body-file /tmp/agent-pr-body.md)"
+          pr_number="$(gh pr view "$pr_url" --json number --jq '.number')"
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "url=$pr_url" >> "$GITHUB_OUTPUT"
 
-          pr_number="$(gh pr view "${pr_url}" --json number --jq '.number')"
-          echo "Created pull request #${pr_number}: ${pr_url}"
-          echo "number=${pr_number}" >> "${GITHUB_OUTPUT}"
-
-      - name: Dispatch CI for the Claude branch
-        if: steps.pr.outputs.number != ''
+      - name: Dispatch CI for implementation branch
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
+          BRANCH_NAME: ${{ steps.issue.outputs.branch }}
         run: |
-          gh workflow run ci.yml --ref "${BRANCH_NAME}"
-          echo "Dispatched CI for ${BRANCH_NAME}."
+          set -euo pipefail
+          gh workflow run ci.yml --ref "$BRANCH_NAME"
 
-      - name: Classify Claude failure safely
-        if: always() && steps.claude.outputs.failed == 'true'
+      - name: Mark issue implementation started
+        if: success()
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          PR_URL: ${{ steps.pr.outputs.url }}
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("/home/runner/work/_temp/claude-execution-output.json")
-          if not path.exists():
-              print("CLAUDE_FAILURE_CATEGORY=NO_OUTPUT_FILE")
-              raise SystemExit(0)
-
-          text = path.read_text(errors="replace").lower()
-
-          if any(s in text for s in ["error_max_turns", "reached maximum number of turns", "maximum number of turns", "exceeding the configured maximum"]):
-              category = "MAX_TURNS"
-          elif any(s in text for s in ["usage limit", "rate limit", "rate_limit", "quota", "too many requests", "status code 429", "api error: 429"]):
-              category = "USAGE_OR_RATE_LIMIT"
-          elif any(s in text for s in ["invalid bearer", "could not resolve authentication", "authentication credentials", "unauthorized", "status code 401", "api error: 401"]):
-              category = "AUTHENTICATION"
-          elif "model" in text and any(s in text for s in ["not found", "unavailable", "not available", "access", "unsupported"]):
-              category = "MODEL_ACCESS"
-          elif "permission" in text or "requires approval" in text:
-              category = "TOOL_PERMISSION"
-          else:
-              category = "UNKNOWN"
-
-          print(f"CLAUDE_FAILURE_CATEGORY={category}")
-          PY
+          gh issue comment "$ISSUE_NUMBER" --body "Direct CLI implementation completed and a PR was created: ${PR_URL}. CI and independent review continue automatically; no merge was attempted."
