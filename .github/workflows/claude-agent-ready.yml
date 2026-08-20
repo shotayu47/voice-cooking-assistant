@@ -3,10 +3,20 @@ name: Claude Agent Ready
 on:
   issues:
     types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Open agent-ready issue number to implement
+        required: true
+        type: string
 
 jobs:
   claude:
-    if: github.event.issue.state == 'open' && github.event.label.name == 'agent-ready'
+    if: >-
+      (github.event_name == 'issues' &&
+       github.event.issue.state == 'open' &&
+       github.event.label.name == 'agent-ready') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -21,6 +31,53 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
+
+      - name: Resolve issue context
+        id: issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          INPUT_ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            issue_number="$INPUT_ISSUE_NUMBER"
+          else
+            issue_number="$EVENT_ISSUE_NUMBER"
+          fi
+
+          if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
+            echo "Invalid issue number." >&2
+            exit 1
+          fi
+
+          issue_json="$(gh issue view "$issue_number" --json number,title,body,state,labels,url)"
+          state="$(jq -r '.state' <<<"$issue_json")"
+          has_agent_ready="$(jq -r '[.labels[].name] | index("agent-ready") != null' <<<"$issue_json")"
+
+          if [ "$state" != "OPEN" ] || [ "$has_agent_ready" != "true" ]; then
+            echo "Issue #${issue_number} is not an open agent-ready issue." >&2
+            exit 1
+          fi
+
+          title="$(jq -r '.title' <<<"$issue_json")"
+          body="$(jq -r '.body // ""' <<<"$issue_json")"
+
+          echo "number=$issue_number" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          {
+            echo "prompt<<__AGENT_PROMPT__"
+            echo "Implement GitHub issue #${issue_number} exactly as specified."
+            echo
+            echo "Issue title: ${title}"
+            echo
+            echo "Issue body:"
+            echo "$body"
+            echo "__AGENT_PROMPT__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Normalize OAuth secret safely
         id: oauth
@@ -51,8 +108,9 @@ jobs:
                   output.write(f"token={token}\n")
           PY
 
-      - name: Run Claude Code
-        id: claude
+      - name: Run Claude Code from label event
+        id: claude_event
+        if: github.event_name == 'issues'
         uses: anthropics/claude-code-action@v1
         with:
           github_token: ${{ github.token }}
@@ -63,15 +121,49 @@ jobs:
             --allowedTools "Edit,Write"
             --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the labeled issue body as the complete task specification. Make only the requested changes, then commit and push the branch. Deterministic repository quality gates are owned by the GitHub Actions CI job that runs after the pull request is created; do not spend agent turns running npm quality-gate commands yourself, and report those checks as pending CI rather than claiming they passed. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
 
+      - name: Run Claude Code from autonomous dispatch
+        id: claude_dispatch
+        if: github.event_name == 'workflow_dispatch'
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
+          prompt: ${{ steps.issue.outputs.prompt }}
+          claude_args: |
+            --max-turns 20
+            --allowedTools "Edit,Write"
+            --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the supplied GitHub issue body as the complete task specification. Make only the requested changes, then commit and push the branch. Deterministic repository quality gates are owned by the GitHub Actions CI job that runs after the pull request is created; do not spend agent turns running npm quality-gate commands yourself, and report those checks as pending CI rather than claiming they passed. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
+
+      - name: Normalize Claude branch output
+        id: claude
+        if: always()
+        shell: bash
+        env:
+          EVENT_BRANCH: ${{ steps.claude_event.outputs.branch_name }}
+          DISPATCH_BRANCH: ${{ steps.claude_dispatch.outputs.branch_name }}
+          EVENT_OUTCOME: ${{ steps.claude_event.outcome }}
+          DISPATCH_OUTCOME: ${{ steps.claude_dispatch.outcome }}
+        run: |
+          set -euo pipefail
+
+          branch="${EVENT_BRANCH:-${DISPATCH_BRANCH:-}}"
+          echo "branch_name=$branch" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT_OUTCOME" = "failure" ] || [ "$DISPATCH_OUTCOME" = "failure" ]; then
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create pull request when Claude pushed changes
         id: pr
-        if: steps.claude.outcome == 'success' && steps.claude.outputs.branch_name != ''
+        if: steps.claude.outputs.branch_name != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH_NAME: ${{ steps.claude.outputs.branch_name }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.issue.outputs.title }}
         run: |
           set -euo pipefail
 
@@ -127,7 +219,7 @@ jobs:
           echo "Dispatched CI for ${BRANCH_NAME}."
 
       - name: Classify Claude failure safely
-        if: failure() && steps.claude.outcome == 'failure'
+        if: always() && steps.claude.outputs.failed == 'true'
         shell: bash
         run: |
           python - <<'PY'

@@ -1,0 +1,380 @@
+name: Autonomous Phase Dispatcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 * * * *"
+
+concurrency:
+  group: autonomous-phase-dispatcher
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      actions: write
+
+    steps:
+      - name: Checkout main read-only
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Select next phase and deduplicate
+        id: preflight
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          text = Path("docs/implementation-roadmap.md").read_text(encoding="utf-8")
+          rows = []
+          row_re = re.compile(r"^\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|", re.MULTILINE)
+          for match in row_re.finditer(text):
+              phase = int(match.group(1))
+              title = match.group(2).strip()
+              status = match.group(3).replace("**", "").strip()
+              rows.append((phase, title, status))
+
+          locked = [(n, t, s) for n, t, s in rows if "IN_PROGRESS" in s]
+          target = next(((n, t, s) for n, t, s in rows if "NOT_STARTED" in s), None)
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as f:
+              if locked:
+                  n, t, _ = locked[0]
+                  f.write("eligible=false\n")
+                  f.write("reason=in_progress_lock\n")
+                  f.write(f"phase={n}\n")
+                  f.write(f"title={t}\n")
+              elif target is None:
+                  f.write("eligible=false\n")
+                  f.write("reason=no_not_started_phase\n")
+              else:
+                  n, t, _ = target
+                  f.write("eligible=true\n")
+                  f.write("reason=ready\n")
+                  f.write(f"phase={n}\n")
+                  f.write(f"title={t}\n")
+          PY
+
+          if [ "${{ steps.preflight.outputs.eligible }}" = "false" ]; then
+            exit 0
+          fi
+
+          phase="$(python - <<'PY'
+          import re
+          from pathlib import Path
+          text = Path('docs/implementation-roadmap.md').read_text(encoding='utf-8')
+          m = re.search(r'^\|\s*(\d+)\s*\|\s*(.*?)\s*\|\s*NOT_STARTED\s*\|', text, re.MULTILINE)
+          print(m.group(1) if m else '')
+          PY
+          )"
+
+          if [ -z "$phase" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no_not_started_phase" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          marker="<!-- autonomous-phase phase=${phase} -->"
+          existing="$(gh issue list --state open --limit 100 --json number,body --jq ".[] | select((.body // \"\") | contains(\"${marker}\")) | .number" | head -n1)"
+          if [ -n "$existing" ]; then
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "reason=existing_phase_issue" >> "$GITHUB_OUTPUT"
+            echo "existing_issue=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+      - name: Normalize OAuth secret safely
+        id: oauth
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: bash
+        env:
+          CLAUDE_TOKEN_RAW: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          token = os.environ.get("CLAUDE_TOKEN_RAW", "").strip()
+          if not token:
+              raise SystemExit("CLAUDE_CODE_OAUTH_TOKEN is empty")
+          print(f"::add-mask::{token}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"token={token}\n")
+          PY
+
+      - name: Install pinned Claude Code CLI
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.236
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/claude" --version
+
+      - name: Plan the selected phase read-only
+        id: planner
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: bash
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ steps.oauth.outputs.token }}
+          DISABLE_AUTOUPDATER: "1"
+          PHASE_NUMBER: ${{ steps.preflight.outputs.phase }}
+          PHASE_TITLE: ${{ steps.preflight.outputs.title }}
+        run: |
+          set -uo pipefail
+
+          cat > /tmp/planner-prompt.md <<'PROMPT'
+          You are the read-only planning stage of an autonomous development pipeline.
+          Do not edit files, create commits, push branches, open issues, or run shell commands.
+
+          Read first:
+          - AGENTS.md
+          - CLAUDE.md
+          - docs/implementation-roadmap.md
+
+          Then inspect the relevant design docs, source files, and tests needed to plan exactly the
+          selected PHASE. The selected PHASE number and title are supplied in the environment and
+          are authoritative. Do not plan a later PHASE and do not rebuild COMPLETE work.
+
+          Produce the smallest implementation-ready specification that another Claude Code agent
+          can execute without guessing. Acceptance criteria must be observable and testable.
+          Separate deterministic automated checks from real-device/manual QA.
+
+          Set high_risk=true if the phase requires or is likely to require any of these:
+          - GitHub workflow or agent-policy changes
+          - auth or middleware changes
+          - RLS/policy changes
+          - database migration/schema changes
+          - secrets/environment handling
+          - destructive data operations
+          - production infrastructure changes
+
+          If the repository evidence is insufficient to plan safely, set high_risk=true and explain why.
+          PROMPT
+
+          schema='{"type":"object","properties":{"phase_number":{"type":"integer"},"phase_title":{"type":"string"},"issue_title":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"string"}},"implementation_notes":{"type":"array","maxItems":12,"items":{"type":"string"}},"test_requirements":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"string"}},"manual_qa":{"type":"array","maxItems":8,"items":{"type":"string"}},"likely_files":{"type":"array","maxItems":20,"items":{"type":"string"}},"requires_migration":{"type":"boolean"},"high_risk":{"type":"boolean"},"risk_reasons":{"type":"array","maxItems":8,"items":{"type":"string"}},"confidence":{"type":"number","minimum":0,"maximum":1}},"required":["phase_number","phase_title","issue_title","objective","acceptance_criteria","implementation_notes","test_requirements","manual_qa","likely_files","requires_migration","high_risk","risk_reasons","confidence"]}'
+
+          set +e
+          "$HOME/.local/bin/claude" -p "$(cat /tmp/planner-prompt.md)\n\nSelected PHASE: ${PHASE_NUMBER} — ${PHASE_TITLE}" \
+            --safe-mode \
+            --output-format json \
+            --no-session-persistence \
+            --max-turns 20 \
+            --tools "Read,Glob,Grep" \
+            --disallowedTools "mcp__*" \
+            --permission-mode dontAsk \
+            --json-schema "$schema" \
+            > /tmp/planner-result.json \
+            2> /tmp/planner-stderr.log
+          exit_code=$?
+          set -e
+
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          structured=""
+          if jq -e . /tmp/planner-result.json >/dev/null 2>&1; then
+            structured="$(jq -c '.structured_output // empty' /tmp/planner-result.json 2>/dev/null || true)"
+          fi
+          echo "structured_output=$structured" >> "$GITHUB_OUTPUT"
+
+      - name: Validate plan and classify risk
+        id: validate
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.planner.outputs.exit_code }}
+          RAW_PLAN: ${{ steps.planner.outputs.structured_output }}
+          PHASE_NUMBER: ${{ steps.preflight.outputs.phase }}
+          PHASE_TITLE: ${{ steps.preflight.outputs.title }}
+        run: |
+          set -euo pipefail
+
+          echo "valid=false" >> "$GITHUB_OUTPUT"
+          echo "risk=true" >> "$GITHUB_OUTPUT"
+          category="OK"
+
+          if [ "${EXIT_CODE:-1}" != "0" ]; then
+            category="CLI_FAILURE"
+            combined="$(cat /tmp/planner-result.json /tmp/planner-stderr.log 2>/dev/null || true)"
+            if grep -Eiq 'authentication|invalid bearer|unauthorized|status code 401|api error: 401' <<<"$combined"; then
+              category="AUTHENTICATION"
+            elif grep -Eiq 'usage limit|rate limit|rate_limit|quota|too many requests|status code 429|api error: 429' <<<"$combined"; then
+              category="USAGE_OR_RATE_LIMIT"
+            elif grep -Eiq 'max[_ -]?turn|maximum number of turns' <<<"$combined"; then
+              category="MAX_TURNS"
+            fi
+          elif [ -z "${RAW_PLAN:-}" ]; then
+            category="EMPTY_STRUCTURED_OUTPUT"
+          else
+            compact="$(jq -ce --argjson phase "$PHASE_NUMBER" --arg title "$PHASE_TITLE" '
+              select(.phase_number == $phase) |
+              select(.phase_title == $title) |
+              select((.issue_title | type) == "string" and (.issue_title | length) > 0) |
+              select((.objective | type) == "string" and (.objective | length) > 0) |
+              select((.acceptance_criteria | type) == "array" and (.acceptance_criteria | length) > 0) |
+              select((.test_requirements | type) == "array" and (.test_requirements | length) > 0) |
+              select((.likely_files | type) == "array") |
+              select((.requires_migration | type) == "boolean") |
+              select((.high_risk | type) == "boolean") |
+              select((.risk_reasons | type) == "array") |
+              select((.confidence | type) == "number")
+            ' <<<"$RAW_PLAN" 2>/dev/null || true)"
+
+            if [ -z "$compact" ]; then
+              category="INVALID_CONTRACT"
+            else
+              protected_re='(^|/)(AGENTS\.md|CLAUDE\.md|\.mcp\.json)$|^\.github/workflows/|^\.claude/|^supabase/migrations/|(^|/)(auth|middleware)(/|\.|$)|(^|/)(rls|polic(y|ies))(/|\.|$)|(^|/)\.env|(^|/)vercel\.json$'
+              files="$(jq -r '.likely_files[]?' <<<"$compact")"
+              risk="$(jq -r '(.high_risk or .requires_migration)' <<<"$compact")"
+              if grep -Eiq "$protected_re" <<<"$files"; then
+                risk=true
+              fi
+
+              echo "valid=true" >> "$GITHUB_OUTPUT"
+              echo "risk=$risk" >> "$GITHUB_OUTPUT"
+              echo "plan_json=$compact" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          echo "category=$category" >> "$GITHUB_OUTPUT"
+          echo "PLANNER_RESULT_CATEGORY=$category"
+
+      - name: Publish implementation-ready issue
+        id: issue
+        if: steps.preflight.outputs.eligible == 'true' && steps.validate.outputs.valid == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_JSON: ${{ steps.validate.outputs.plan_json }}
+          RISK: ${{ steps.validate.outputs.risk }}
+          PHASE_NUMBER: ${{ steps.preflight.outputs.phase }}
+        run: |
+          set -euo pipefail
+
+          gh label create autonomous-phase --color 1D76DB --description "Generated by the autonomous phase dispatcher" --force
+          gh label create agent-ready --color 0E8A16 --description "Ready for Claude implementation" --force
+          gh label create human-required --color D93F0B --description "Human judgment required before automation continues" --force
+
+          title="$(jq -r '.issue_title' <<<"$PLAN_JSON")"
+          {
+            echo "<!-- autonomous-phase phase=${PHASE_NUMBER} -->"
+            echo "## Autonomous PHASE task"
+            echo
+            echo "### Objective"
+            jq -r '.objective' <<<"$PLAN_JSON"
+            echo
+            echo "### Acceptance criteria"
+            jq -r '.acceptance_criteria[] | "- " + .' <<<"$PLAN_JSON"
+            echo
+            echo "### Implementation guidance"
+            jq -r '.implementation_notes[]? | "- " + .' <<<"$PLAN_JSON"
+            echo
+            echo "### Deterministic verification"
+            jq -r '.test_requirements[] | "- " + .' <<<"$PLAN_JSON"
+            echo "- Repository CI owns typecheck, lint, test, and build after the PR is created."
+            echo
+            echo "### Manual / real-device QA"
+            if [ "$(jq '.manual_qa | length' <<<"$PLAN_JSON")" -eq 0 ]; then
+              echo "- None identified by the planner."
+            else
+              jq -r '.manual_qa[] | "- " + .' <<<"$PLAN_JSON"
+            fi
+            echo
+            echo "### Safety constraints"
+            echo "- Implement exactly this PHASE only; do not start later PHASEs."
+            echo "- Read AGENTS.md, CLAUDE.md, docs/implementation-roadmap.md, and relevant design docs before editing."
+            echo "- Do not modify GitHub workflows or agent-policy files."
+            echo "- Do not touch auth, middleware, RLS/policies, migrations, secrets, destructive data operations, or production infrastructure unless this issue explicitly requires it."
+            echo "- If a protected/high-risk change becomes necessary unexpectedly, stop and report it instead of guessing."
+            echo "- Do not merge. Human merge remains required."
+            echo
+            echo "### Planner metadata"
+            echo "- Confidence: $(jq -r '.confidence' <<<"$PLAN_JSON")"
+            echo "- Requires migration: $(jq -r '.requires_migration' <<<"$PLAN_JSON")"
+            echo "- High risk: $(jq -r '.high_risk' <<<"$PLAN_JSON")"
+            if [ "$(jq '.risk_reasons | length' <<<"$PLAN_JSON")" -gt 0 ]; then
+              echo "- Risk reasons:"
+              jq -r '.risk_reasons[] | "  - " + .' <<<"$PLAN_JSON"
+            fi
+          } > /tmp/autonomous-issue.md
+
+          issue_url="$(gh issue create --title "$title" --body-file /tmp/autonomous-issue.md --label autonomous-phase)"
+          issue_number="$(gh issue view "$issue_url" --json number --jq '.number')"
+          echo "number=$issue_number" >> "$GITHUB_OUTPUT"
+          echo "url=$issue_url" >> "$GITHUB_OUTPUT"
+
+          if [ "$RISK" = "true" ]; then
+            gh issue edit "$issue_number" --add-label human-required
+            echo "Created high-risk issue #${issue_number}; implementation was not dispatched."
+          else
+            gh issue edit "$issue_number" --add-label agent-ready
+            echo "Created agent-ready issue #${issue_number}."
+          fi
+
+      - name: Dispatch implementation workflow explicitly
+        if: steps.issue.outputs.number != '' && steps.validate.outputs.risk == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+        run: |
+          set -euo pipefail
+          gh workflow run claude-agent-ready.yml -f issue_number="$ISSUE_NUMBER"
+          echo "Dispatched Claude implementation for issue #${ISSUE_NUMBER}."
+
+      - name: Fail closed when planner contract fails
+        if: steps.preflight.outputs.eligible == 'true' && steps.validate.outputs.valid != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE_NUMBER: ${{ steps.preflight.outputs.phase }}
+          PHASE_TITLE: ${{ steps.preflight.outputs.title }}
+          CATEGORY: ${{ steps.validate.outputs.category }}
+        run: |
+          set -euo pipefail
+
+          marker="<!-- autonomous-phase phase=${PHASE_NUMBER} -->"
+          gh label create autonomous-phase --color 1D76DB --description "Generated by the autonomous phase dispatcher" --force
+          gh label create human-required --color D93F0B --description "Human judgment required before automation continues" --force
+
+          cat > /tmp/planner-failure.md <<EOF
+          ${marker}
+          ## Autonomous planner stopped safely
+
+          PHASE ${PHASE_NUMBER} — ${PHASE_TITLE} was selected, but the planner did not produce a valid implementation contract.
+
+          Safe diagnostic category: \`${CATEGORY:-UNKNOWN}\`.
+
+          No implementation agent was dispatched, no application files were changed, and no automated merge was attempted.
+          EOF
+
+          gh issue create \
+            --title "PHASE ${PHASE_NUMBER} — planner requires human review" \
+            --body-file /tmp/planner-failure.md \
+            --label autonomous-phase \
+            --label human-required
+
+      - name: Remove temporary planner files
+        if: always()
+        shell: bash
+        run: |
+          rm -f \
+            /tmp/planner-prompt.md \
+            /tmp/planner-result.json \
+            /tmp/planner-stderr.log \
+            /tmp/autonomous-issue.md \
+            /tmp/planner-failure.md
