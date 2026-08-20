@@ -548,7 +548,7 @@ const candidateSubmissionSchema = z.array(
 export type ToolOutcome = {
   result: unknown;
   /** Set when the tool changed persistent state, so the UI can refresh. */
-  effect?: 'inventory_changed' | 'session_changed';
+  effect?: 'inventory_changed' | 'session_changed' | 'shopping_changed';
   /** Set by start_cooking_session so the chat can link straight into cooking. */
   sessionId?: string;
 };
@@ -1114,6 +1114,7 @@ async function dispatch(
             duplicates: duplicates.map(publicShoppingItem),
           })),
         },
+        effect: added.length > 0 ? 'shopping_changed' : undefined,
       };
     }
 
