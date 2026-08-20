@@ -84,6 +84,27 @@ const TOOL_USAGE_RULES = `【ツールの使い方】
   良い例: 「玉ねぎを薄切りにする」「鶏肉を一口大に切る」「フライパンを中火で温める」`;
 
 /**
+ * PHASE 10.4a. One contract shared by text and voice so the model cannot
+ * treat a read-only suggestion as a write. shopping_candidates are returned
+ * by search_meal_candidates on every meal-planning turn — merely returning
+ * or describing them must never touch shopping_items.
+ */
+const SHOPPING_CANDIDATE_RULES = `【買い物候補の提案と追加】
+- search_meal_candidates が返す shopping_candidates は提案にすぎません。候補を提示した・
+  読み上げた・ユーザーに見せただけでは、買い物リスト（shopping_items）には何も書き込まれません。
+- 不足食材や候補が存在するというだけの理由で add_selected_shopping_candidates を呼ばないでください。
+- add_selected_shopping_candidates を呼んでよいのは、ユーザーが候補の一部を明示的に選んだとき、
+  または「全部買っておいて」のように今表示している候補すべてを買うと明確に言ったときだけです。
+  どれを指しているか曖昧な場合は、確認の質問をしてください。曖昧なまま書き込まないでください。
+- selected に入れる各候補は、直前にサーバーが返した shopping_candidates の部分集合にしてください。
+  name・reason・is_staple はその候補にあった値をそのまま使い、記憶で作り直したり
+  新しい候補をでっち上げたりしないでください。
+- ユーザーが選んだ候補が0件の場合は add_selected_shopping_candidates を呼ばないでください。
+- 実行後は、実際のツール結果で「追加された」と返った項目についてだけ「追加しました」と伝えてください。
+  duplicates が返った項目は重複として事実どおり説明してください。エラーや無効な結果のときは
+  成功したと言わないでください。`;
+
+/**
  * PHASE 7. Only used while a session is open — see `buildSystemPrompt`.
  *
  * The ordering rule is the point of this block. When something is burning the
@@ -208,7 +229,12 @@ export function buildSystemPrompt(options: {
   inventory?: InventorySnapshotItem[];
 }): string {
   // Amount rules apply everywhere: writing a recipe, planning, and cooking.
-  const parts = [BASE_SYSTEM_PROMPT, TOOL_USAGE_RULES, AMOUNT_RULES];
+  const parts = [
+    BASE_SYSTEM_PROMPT,
+    TOOL_USAGE_RULES,
+    SHOPPING_CANDIDATE_RULES,
+    AMOUNT_RULES,
+  ];
 
   if (options.mode === 'voice') {
     parts.push(VOICE_STYLE_RULES);

@@ -813,7 +813,8 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 | 10.1 | `src/lib/shopping/candidates.ts` — `MissingIngredient[]` から重複を畳んだ候補リストを作る純粋関数。I/O なし、書き込みなし | ✅ 完了（#50 / PR #51） |
 | 10.2 | `src/lib/shopping/add-candidates-core.ts` + `add-candidates.ts` — **明示的に選択された候補だけ**を `createShoppingItem` 経由で書き込む境界。`MissingIngredient[]` から自動で書く経路はない | ✅ 完了（#52） |
 | 10.3a | `search_meal_candidates` の2回目（`candidates` あり）の各 `evaluated_candidates` に、その候補の `verdict.missing` を 10.1 の `missingIngredientsToShoppingCandidates()` に通した `shopping_candidates` を追加。読み取り専用（書き込みなし）。tool 数は13のまま | ✅ 完了（#54） |
-| 10.3以降 | 買い物候補の選択・書き込みを AI tool から呼ぶ経路、prompt、UI、chat/voice 配線（未着手） | NOT_STARTED |
+| 10.4a | `src/lib/ai/prompt.ts` に `SHOPPING_CANDIDATE_RULES` を追加し、text/voice 共通の resolved instructions で「shopping_candidates は提案のみ・存在するだけでは add を呼ばない・明示選択／全件確定のときだけ書き込む・サーバー提供値の部分集合をそのまま使う・0件なら呼ばない・結果は事実どおり説明する」を明示。tool 定義・service 実行は無変更 | ✅ 完了（#66） |
+| 10.4b 以降 | 買い物候補選択の UI、chat/voice 配線（未着手） | NOT_STARTED |
 
 10.2 は「選択」の中身（誰が・どうやって選ぶか）には関与しない。選択された
 `ShoppingCandidate[]` を受け取って書くだけで、候補生成（10.1）や選択 UI/AI
