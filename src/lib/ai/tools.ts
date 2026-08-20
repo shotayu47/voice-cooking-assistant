@@ -46,9 +46,11 @@ import {
   STAPLE_SEASONINGS,
   surplusItems,
 } from '@/lib/meals/classification';
-import { evaluateCandidates, MISSING_REASON_LABELS } from '@/lib/meals/evaluate';
+import { evaluateCandidates, MISSING_REASON_LABELS, MISSING_REASONS } from '@/lib/meals/evaluate';
+import { addSelectedShoppingCandidates } from '@/lib/shopping/add-candidates';
 import { missingIngredientsToShoppingCandidates } from '@/lib/shopping/candidates';
-import type { InventoryItem, Recipe } from '@/types/domain';
+import { parseSelectedShoppingCandidates } from '@/lib/shopping/selected-candidates';
+import type { InventoryItem, Recipe, ShoppingItem } from '@/types/domain';
 
 /**
  * Tool definitions (SPEC §8).
@@ -469,6 +471,40 @@ intent で「やった」のか「飛ばした」のかを区別する:
           status: { type: 'string', enum: ['completed', 'cancelled', 'paused'] },
         },
         required: ['session_id', 'status'],
+        additionalProperties: false,
+      },
+    },
+  },
+  // PHASE 10.3b2. Separate from search_meal_candidates on purpose: that tool
+  // only ever suggests shopping_candidates, it never decides which of them the
+  // user actually wants bought. This tool is the only write path, and it
+  // writes exactly what selected names — nothing derived, nothing inferred.
+  {
+    type: 'function',
+    function: {
+      name: 'add_selected_shopping_candidates',
+      description:
+        '買い物リストに候補を追加する。selected に入れた候補だけを書き込む。' +
+        'これらはユーザーがすでに明示的に選んだ候補であること。候補の提案や表示だけの目的では呼ばないこと。',
+      parameters: {
+        type: 'object',
+        properties: {
+          selected: {
+            type: 'array',
+            description: 'ユーザーが明示的に選んだ買い物候補。ここに入れたものだけが書き込まれる。',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: '食材名' },
+                reason: { type: 'string', enum: [...MISSING_REASONS] },
+                is_staple: { type: 'boolean' },
+              },
+              required: ['name', 'reason', 'is_staple'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['selected'],
         additionalProperties: false,
       },
     },
@@ -1058,6 +1094,26 @@ async function dispatch(
       };
     }
 
+    case 'add_selected_shopping_candidates': {
+      // parseSelectedShoppingCandidates is the only thing standing between
+      // args.selected and the write boundary — nothing here re-derives a
+      // selection from a MissingIngredient[] or any other source.
+      const selected = parseSelectedShoppingCandidates(args.selected);
+      const added = await addSelectedShoppingCandidates(ctx, selected);
+
+      return {
+        result: {
+          added: added.map(({ candidate, item, duplicates }) => ({
+            name: candidate.name,
+            reason: candidate.reason,
+            is_staple: candidate.isStaple,
+            item: publicShoppingItem(item),
+            duplicates: duplicates.map(publicShoppingItem),
+          })),
+        },
+      };
+    }
+
     default:
       return { result: { error: 'unknown_tool', message: `未知のツール: ${name}` } };
   }
@@ -1087,6 +1143,17 @@ function publicItem(item: InventoryItem) {
           expiry_is_estimated: freshness.estimated,
         }
       : {}),
+  };
+}
+
+/** What the model is allowed to see about a shopping-list row. */
+function publicShoppingItem(item: ShoppingItem) {
+  return {
+    id: item.id,
+    name: item.name,
+    quantity: item.quantity,
+    unit: item.unit,
+    checked: item.checked,
   };
 }
 
