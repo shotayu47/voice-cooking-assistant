@@ -167,7 +167,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 7 | 調理中のトラブル対応 | **COMPLETE** | `bfa1dbe` | yes | なし | — |
 | 8 | 分量の自動調整 | **COMPLETE** | `4bdf619` | no | なし | — |
 | 9 | 買い物リスト | **COMPLETE** | `014329b`..`ce4c627` | yes | `0005_shopping_list.sql` | ✅ 適用済み |
-| 10 | AI 買い物候補提案 | IN_PROGRESS（10.1・10.2 完了、AI tool 配線は未着手） | — | — | なし | — |
+| 10 | AI 買い物候補提案 | IN_PROGRESS（10.1〜10.5b 実装済み・共有 text/voice 契約は自動テストで担保。iPhone 実機 Preview QA が未実施のため COMPLETE にしていない） | — | — | なし | — |
 | 11 | レシート読み込み | NOT_STARTED | — | — | — | — |
 | 12 | 購入履歴 | NOT_STARTED | — | — | — | — |
 | 13 | 献立計画 | NOT_STARTED | — | — | — | — |
@@ -799,7 +799,7 @@ Test F を再実施して判断すること。** 通知は今の設計に対す�
 
 ## 次に実装する PHASE
 
-**PHASE 10 — AI 買い物候補提案**（PHASE 6・7・8・9 はいずれも COMPLETE。PHASE 10 自体は IN_PROGRESS — 10.3a で `search_meal_candidates` が読み取り専用の買い物候補を返すようになったが、選択・書き込みを呼ぶ経路と prompt/UI 配線が残っているため COMPLETE にしていない）
+**PHASE 10 — AI 買い物候補提案**（PHASE 6・7・8・9 はいずれも COMPLETE。PHASE 10 自体は **IN_PROGRESS** — 10.3〜10.5b で候補生成・選択・書き込み・text/voice 共有 prompt 契約・Realtime 側の重複排除まで実装され、共有契約は自動テストで担保されているが、iPhone 実機での Preview QA が未実施のため COMPLETE にしていない）
 
 着手前に読むもの: `docs/phase9-shopping-list.md` の §2「PHASE 10〜12 との境界」。
 PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツールのまま）。
@@ -813,8 +813,15 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 | 10.1 | `src/lib/shopping/candidates.ts` — `MissingIngredient[]` から重複を畳んだ候補リストを作る純粋関数。I/O なし、書き込みなし | ✅ 完了（#50 / PR #51） |
 | 10.2 | `src/lib/shopping/add-candidates-core.ts` + `add-candidates.ts` — **明示的に選択された候補だけ**を `createShoppingItem` 経由で書き込む境界。`MissingIngredient[]` から自動で書く経路はない | ✅ 完了（#52） |
 | 10.3a | `search_meal_candidates` の2回目（`candidates` あり）の各 `evaluated_candidates` に、その候補の `verdict.missing` を 10.1 の `missingIngredientsToShoppingCandidates()` に通した `shopping_candidates` を追加。読み取り専用（書き込みなし）。tool 数は13のまま | ✅ 完了（#54） |
+| 10.3b2 | `src/lib/ai/tools.ts` に AI 向けツール `add_selected_shopping_candidates` を追加。中身は 10.2 の書き込み境界（`add-candidates-core.ts` / `add-candidates.ts`）をそのまま呼ぶだけで、`MissingIngredient[]` からの自動導出は無い。text 用 `TOOL_DEFINITIONS` と voice 用 `realtimeToolDefinitions()` の両方に同じ定義が乗る（tool 数 12→13→14、`realtime.test.ts` で text と voice の定義が同一であることをピン留め） | ✅ 完了 |
+| 10.3b2-R | `add_selected_shopping_candidates` 単体のツールテスト（`tools.add-selected-shopping-candidates.test.ts`）。10.2 の書き込み境界を再検証し、候補の一部欠落・重複・0件選択などの境界を tool 経由でも保証する | ✅ 完了 |
+| 10.3b3a | `src/lib/ai/service.ts` の `isMutation()` に `add_selected_shopping_candidates` を永続的な書き込みとして分類。text ターンの既存二重実行ガード（PHASE 2 由来）がこのツールにもそのまま効くようにした（`mutation-policy.test.ts`） | ✅ 完了 |
 | 10.4a | `src/lib/ai/prompt.ts` に `SHOPPING_CANDIDATE_RULES` を追加し、text/voice 共通の resolved instructions で「shopping_candidates は提案のみ・存在するだけでは add を呼ばない・明示選択／全件確定のときだけ書き込む・サーバー提供値の部分集合をそのまま使う・0件なら呼ばない・結果は事実どおり説明する」を明示。tool 定義・service 実行は無変更 | ✅ 完了（#66） |
-| 10.4b 以降 | 買い物候補選択の UI、chat/voice 配線（未着手） | NOT_STARTED |
+| 10.4b2 | `src/lib/ai/service.ts` に `outcomeChangedShopping()` / `describeCompletedWork()` を追加。text ターンの `shoppingChanged` は「実行された `ToolOutcome` の `effect` が `'shopping_changed'` であること」だけを見る。ツール名の出現・0件結果・エラー・重複抑制されたリプレイ（`effect` なし）では真にならない（`service.test.ts`）。`chat-view.tsx` はこれを見て `router.refresh()` を呼ぶ | ✅ 完了 |
+| 10.5a | Realtime（voice）側で `add_selected_shopping_candidates` を含む14ツールを text と同一定義で公開し、`realtime.test.ts` で「voice ツール一覧に1回だけ登場する」ことをピン留め。`chat-view.tsx` の `VoicePanel onToolEffect` が `effect: 'shopping_changed'` を受けたときだけ `router.refresh()` を呼ぶ配線も、text 側の `shouldRefreshAfterTurn` と同じ判定軸（実行された effect のみ）を使う | ✅ 完了 |
+| 10.5b | `src/app/api/realtime/tool/serialize-tool-response.ts` に `duplicate ? null : value.effect` の規則を実装。voice の同一 `call_id` リプレイでは `runOnce` は実行を1回に保ちつつ（`idempotency.test.ts`）、ルートは2回目以降の `effect` を `null` にして返す（`serialize-tool-response.test.ts`）。これにより買い物リストへの書き込みは高々1回、クライアント側のリフレッシュ通知も高々1回になる | ✅ 完了 |
+
+これらの実装は #78（PR #81・commit `70725f7`）と #79（PR #82・commit `b822a16`）で merge された。両 PR の間での正確なコミット単位の切り分けは追跡していない（コードコメント上の PHASE タグと自動テストで存在を確認したのみ）。
 
 10.2 は「選択」の中身（誰が・どうやって選ぶか）には関与しない。選択された
 `ShoppingCandidate[]` を受け取って書くだけで、候補生成（10.1）や選択 UI/AI
@@ -825,4 +832,34 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 `addSelectedShoppingCandidates` はまだどこからも呼ばれていない。source of truth は
 サーバーが実在庫と照合した `verdict.missing`（`src/lib/meals/evaluate.ts`）のみで、
 モデルから別の `MissingIngredient[]` を受け取る引数は追加していない。
+
+10.3b2 以降は `addSelectedShoppingCandidates` を実際に呼ぶ経路（AI tool）が入った。
+書き込みが起きるのは常に「ユーザーが明示的に選んだ候補」からのみで、`shopping_candidates`
+の存在だけから自動で書く経路は無い（10.2 の設計をそのまま維持）。
+
+### 共有 text/voice 契約は実装済み・自動テストで担保されている
+
+「候補を提示しただけでは書き込まない」「明示選択のときだけ書き込む」というルールは
+`src/lib/ai/prompt.ts` の `SHOPPING_CANDIDATE_RULES` 一箇所にあり、`buildSystemPrompt()`
+が text/voice のどちらのモードでも同じ文言を resolved instructions に含める
+（`shopping-candidate-prompt.test.ts`）。ツール定義そのものも `TOOL_DEFINITIONS` と
+`realtimeToolDefinitions()` で同一であることを `realtime.test.ts` がピン留めしている。
+「リストが二重に更新されない」という下支えは、text 側は `service.ts` の
+`outcomeChangedShopping()`、voice 側は Realtime ルートの `duplicate ? null : effect`
+という**別の実装だが同じ判定軸**（実行された `shopping_changed` effect のみを見る）で
+担保されている。これらはすべて自動テストの対象であり、以下の実機 QA とは独立している。
+
+### 残っている実機 QA（iPhone 実物・未実施）
+
+以下は自動テストでは検証できない、Preview 環境の iPhone 実機での確認が必須の項目。
+**未実施。** Production PASS も物理デバイス PASS も、実施して結果を記録するまで宣言しない。
+
+- マイク権限の許可と接続
+- 音声の再生と割り込み（interruption）挙動
+- 明示的な音声での候補選択が、買い物リストの表示を**1回だけ**更新すること
+- 提案のみで終わった音声ターン（候補を読み上げただけ）が、書き込みとして扱われず
+  リフレッシュも起きないこと
+- 重複／リプレイが UI 上で2回観測されないこと（同一 `call_id` の再送で二重追加や
+  二重リフレッシュが見えないこと）
+- 音声 UX 全体の使用感
 
