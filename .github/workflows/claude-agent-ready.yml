@@ -184,8 +184,9 @@ jobs:
             --no-session-persistence \
             --max-turns 32 \
             --tools "Read,Glob,Grep,Edit,Write" \
+            --allowedTools "Read,Glob,Grep,Edit,Write" \
             --disallowedTools "Bash,WebSearch,WebFetch,mcp__*" \
-            --permission-mode dontAsk \
+            --permission-mode acceptEdits \
             > /tmp/implementation-result.json \
             2> /tmp/implementation-stderr.log
           exit_code=$?
