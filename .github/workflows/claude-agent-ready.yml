@@ -117,7 +117,7 @@ jobs:
           claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
           label_trigger: agent-ready
           claude_args: |
-            --max-turns 20
+            --max-turns 32
             --allowedTools "Edit,Write"
             --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the labeled issue body as the complete task specification. Make only the requested changes, then commit and push the branch. Deterministic repository quality gates are owned by the GitHub Actions CI job that runs after the pull request is created; do not spend agent turns running npm quality-gate commands yourself, and report those checks as pending CI rather than claiming they passed. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
 
@@ -130,7 +130,7 @@ jobs:
           claude_code_oauth_token: ${{ steps.oauth.outputs.token }}
           prompt: ${{ steps.issue.outputs.prompt }}
           claude_args: |
-            --max-turns 20
+            --max-turns 32
             --allowedTools "Edit,Write"
             --system-prompt "Before modifying code, read AGENTS.md, CLAUDE.md, and docs/implementation-roadmap.md. Treat the supplied GitHub issue body as the complete task specification. Make only the requested changes, then commit and push the branch. Deterministic repository quality gates are owned by the GitHub Actions CI job that runs after the pull request is created; do not spend agent turns running npm quality-gate commands yourself, and report those checks as pending CI rather than claiming they passed. Do not modify or reveal secrets. Do not modify GitHub workflow files. Do not merge branches. Never claim a migration, deployment, or manual verification succeeded unless it was actually verified. If a task requires an external or manual step, report it clearly instead of guessing."
 
