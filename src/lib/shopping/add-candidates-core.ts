@@ -9,16 +9,20 @@
  * matching the DI pattern in `actions-core.ts`.
  */
 
-import type { ShoppingCandidate } from './candidates';
+import type { SelectedShoppingCandidate } from './selected-candidates';
 import type { CreateShoppingItemResult } from './service';
 
 export type AddCandidatesDeps = {
-  create: (input: { name: string }) => Promise<CreateShoppingItemResult>;
+  create: (input: {
+    name: string;
+    quantity?: number;
+    unit?: string;
+  }) => Promise<CreateShoppingItemResult>;
 };
 
 /** One candidate's write result, still paired with the candidate it came from. */
 export type AddedShoppingCandidate = CreateShoppingItemResult & {
-  candidate: ShoppingCandidate;
+  candidate: SelectedShoppingCandidate;
 };
 
 /**
@@ -31,12 +35,16 @@ export type AddedShoppingCandidate = CreateShoppingItemResult & {
  */
 export async function addSelectedShoppingCandidates(
   deps: AddCandidatesDeps,
-  selected: readonly ShoppingCandidate[],
+  selected: readonly SelectedShoppingCandidate[],
 ): Promise<AddedShoppingCandidate[]> {
   const results: AddedShoppingCandidate[] = [];
 
   for (const candidate of selected) {
-    const { item, duplicates } = await deps.create({ name: candidate.name });
+    const { item, duplicates } = await deps.create({
+      name: candidate.name,
+      ...(candidate.quantity === undefined ? {} : { quantity: candidate.quantity }),
+      ...(candidate.unit === undefined ? {} : { unit: candidate.unit }),
+    });
     results.push({ candidate, item, duplicates });
   }
 

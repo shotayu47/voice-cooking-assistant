@@ -167,7 +167,7 @@ OPENAI_REALTIME_MODEL           （任意 / 既定 gpt-realtime）
 | 7 | 調理中のトラブル対応 | **COMPLETE** | `bfa1dbe` | yes | なし | — |
 | 8 | 分量の自動調整 | **COMPLETE** | `4bdf619` | no | なし | — |
 | 9 | 買い物リスト | **COMPLETE** | `014329b`..`ce4c627` | yes | `0005_shopping_list.sql` | ✅ 適用済み |
-| 10 | AI 買い物候補提案 | IN_PROGRESS（10.1〜10.5b 実装済み・共有 text/voice 契約は自動テストで担保。iPhone 実機 Preview QA が未実施のため COMPLETE にしていない） | — | — | なし | — |
+| 10 | AI 買い物候補提案 | IN_PROGRESS（10.1〜10.5c 実装済み・共有 text/voice 契約は自動テストで担保。10.5c の iPhone 実機 Preview 再QAが必要なため COMPLETE にしていない） | — | — | なし | — |
 | 11 | レシート読み込み | NOT_STARTED | — | — | — | — |
 | 12 | 購入履歴 | NOT_STARTED | — | — | — | — |
 | 13 | 献立計画 | NOT_STARTED | — | — | — | — |
@@ -799,7 +799,7 @@ Test F を再実施して判断すること。** 通知は今の設計に対す�
 
 ## 次に実装する PHASE
 
-**PHASE 10 — AI 買い物候補提案**（PHASE 6・7・8・9 はいずれも COMPLETE。PHASE 10 自体は **IN_PROGRESS** — 10.3〜10.5b で候補生成・選択・書き込み・text/voice 共有 prompt 契約・Realtime 側の重複排除まで実装され、共有契約は自動テストで担保されているが、iPhone 実機での Preview QA が未実施のため COMPLETE にしていない）
+**PHASE 10 — AI 買い物候補提案**（PHASE 6・7・8・9 はいずれも COMPLETE。PHASE 10 自体は **IN_PROGRESS** — 10.3〜10.5c で候補生成・選択・明示された数量・単位の書き込み・text/voice 共有 prompt 契約・Realtime 側の重複排除まで実装され、共有契約は自動テストで担保されているが、10.5c の iPhone 実機 Preview 再QAが必要なため COMPLETE にしていない）
 
 着手前に読むもの: `docs/phase9-shopping-list.md` の §2「PHASE 10〜12 との境界」。
 PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツールのまま）。
@@ -822,6 +822,7 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 | 10.4b3 | text chat が `/api/chat` の `shoppingChanged` を受け取り、`inventoryChanged || shoppingChanged` のときだけ既存 `router.refresh()` を呼ぶ。候補表示だけでは更新しない判定を `shouldRefreshAfterTurn` の純粋テストで固定 | ✅ 完了（#73 / PR #77 / `299f299`） |
 | 10.5a | browser の voice client が既存 Realtime tool response の `'shopping_changed'` を受理し、非 null effect だけを既存 `onToolEffect` callback へ伝播。null/no-effect は通知せず、`VoicePanel` に「買い物リストに追加」ラベルを追加し、既存 ChatView の refresh 経路を再利用 | ✅ 完了（#78 / PR #81 / `9e3352f`） |
 | 10.5b | `src/app/api/realtime/tool/serialize-tool-response.ts` に `duplicate ? null : value.effect` の規則を実装。同一 `call_id` replay では `runOnce` が実行を1回に保ち、2回目以降の effect を `null` にしてクライアント通知も抑止することを `idempotency.test.ts` / `serialize-tool-response.test.ts` で固定 | ✅ 完了（#79 / PR #82 / `d337caa`） |
+| 10.5c | `add_selected_shopping_candidates` が、ユーザーが選択時に明示した正の `quantity` と対応する `unit` を任意で受理し、既存 `createShoppingItem` 境界まで保持。未発話の値は推測せず、unit 単独は fail-closed。Realtime の入力文字起こしには料理・買い物の数量／単位コンテキストを追加 | ✅ 実装・自動テスト完了（この作業ブランチ。iPhone Preview 再QA待ち） |
 
 上記の commit は、各実装 PR を `main` へ取り込んだ merge commit の短縮SHA。
 
@@ -864,4 +865,3 @@ PHASE 9 は `src/lib/ai/tools.ts` を**一切変更していない**（13 ツー
 - 重複／リプレイが UI 上で2回観測されないこと（同一 `call_id` の再送で二重追加や
   二重リフレッシュが見えないこと）
 - 音声 UX 全体の使用感
-

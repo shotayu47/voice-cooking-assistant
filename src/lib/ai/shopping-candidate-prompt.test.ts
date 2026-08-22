@@ -39,6 +39,13 @@ describe('shopping candidate rules in the system prompt', () => {
     expect(prompt).toContain('新しい候補をでっち上げたり');
   });
 
+  it('allows only user-stated quantity/unit and requires clarification instead of inference', () => {
+    const prompt = buildSystemPrompt({ ...base, mode: 'text' });
+    expect(prompt).toContain('数量・単位を明示した場合だけ');
+    expect(prompt).toContain('明示されていない数量・単位を候補や常識から推測しないでください');
+    expect(prompt).toContain('ツールを呼ぶ前に数量を確認してください');
+  });
+
   it('forbids calling the add tool when zero candidates are selected', () => {
     const prompt = buildSystemPrompt({ ...base, mode: 'text' });
     expect(prompt).toContain(

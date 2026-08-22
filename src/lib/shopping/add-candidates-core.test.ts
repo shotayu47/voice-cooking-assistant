@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ShoppingItem } from '@/types/domain';
 
 import { addSelectedShoppingCandidates, type AddCandidatesDeps } from './add-candidates-core';
-import type { ShoppingCandidate } from './candidates';
+import type { SelectedShoppingCandidate } from './selected-candidates';
 
 function item(overrides: Partial<ShoppingItem> = {}): ShoppingItem {
   return {
@@ -21,7 +21,10 @@ function item(overrides: Partial<ShoppingItem> = {}): ShoppingItem {
   };
 }
 
-function candidate(name: string, overrides: Partial<ShoppingCandidate> = {}): ShoppingCandidate {
+function candidate(
+  name: string,
+  overrides: Partial<SelectedShoppingCandidate> = {},
+): SelectedShoppingCandidate {
   return { name, reason: 'absent', isStaple: false, ...overrides };
 }
 
@@ -48,6 +51,21 @@ describe('addSelectedShoppingCandidates', () => {
     expect(create).toHaveBeenCalledTimes(2);
     expect(create).toHaveBeenNthCalledWith(1, { name: '卵' });
     expect(create).toHaveBeenNthCalledWith(2, { name: '牛乳' });
+  });
+
+  it('passes through only the quantity and unit the user supplied', async () => {
+    const create = vi.fn(async ({ name }: { name: string }) => ({
+      item: item({ name }),
+      duplicates: [],
+    }));
+
+    await addSelectedShoppingCandidates(
+      { create },
+      [candidate('味噌', { quantity: 1, unit: '個' }), candidate('酢')],
+    );
+
+    expect(create).toHaveBeenNthCalledWith(1, { name: '味噌', quantity: 1, unit: '個' });
+    expect(create).toHaveBeenNthCalledWith(2, { name: '酢' });
   });
 
   it('does not write a candidate that was not selected', async () => {

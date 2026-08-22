@@ -487,6 +487,8 @@ intent で「やった」のか「飛ばした」のかを区別する:
 候補を提案・表示するだけの場合は呼ばないこと。ユーザーが「それ買っておいて」
 「卵と牛乳を追加して」のように選択を確定させたときだけ呼ぶこと。
 selected にはユーザーが選んだ候補だけを入れ、選ばれなかった候補は入れないこと。
+ユーザーが数量・単位を明示した場合だけ quantity・unit に入れること。明示されていない
+数量・単位は推測せず省略すること。unit を入れる場合は quantity も必須。
 1件も選ばれていない場合はこのツールを呼ばないこと。`,
       parameters: {
         type: 'object',
@@ -504,6 +506,16 @@ selected にはユーザーが選んだ候補だけを入れ、選ばれなか�
                   description: '不足していた理由',
                 },
                 is_staple: { type: 'boolean', description: '調味料など常備品かどうか' },
+                quantity: {
+                  type: 'number',
+                  exclusiveMinimum: 0,
+                  description: 'ユーザーが明示した数量。明示されていなければ省略すること。',
+                },
+                unit: {
+                  type: 'string',
+                  description:
+                    'ユーザーが数量と一緒に明示した単位。明示されていなければ省略すること。',
+                },
               },
               required: ['name', 'reason', 'is_staple'],
               additionalProperties: false,

@@ -6,7 +6,7 @@ import {
   addSelectedShoppingCandidates as addSelected,
   type AddedShoppingCandidate,
 } from './add-candidates-core';
-import type { ShoppingCandidate } from './candidates';
+import type { SelectedShoppingCandidate } from './selected-candidates';
 import { createShoppingItem } from './service';
 
 export type { AddedShoppingCandidate } from './add-candidates-core';
@@ -21,7 +21,7 @@ export type { AddedShoppingCandidate } from './add-candidates-core';
  */
 export async function addSelectedShoppingCandidates(
   ctx: ServiceContext,
-  selected: readonly ShoppingCandidate[],
+  selected: readonly SelectedShoppingCandidate[],
 ): Promise<AddedShoppingCandidate[]> {
   return addSelected({ create: (input) => createShoppingItem(ctx, input) }, selected);
 }

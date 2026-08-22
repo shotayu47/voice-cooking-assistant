@@ -7,6 +7,7 @@ import { isAvailable } from '@/lib/inventory/quantity';
 import { freshnessOf } from '@/lib/inventory/freshness';
 import { buildSystemPrompt } from '@/lib/ai/prompt';
 import { realtimeToolDefinitions } from '@/lib/ai/tools';
+import { REALTIME_INPUT_TRANSCRIPTION } from '@/lib/voice/transcription-config';
 import type { Profile } from '@/types/domain';
 
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
@@ -82,7 +83,7 @@ export async function POST() {
         tools: realtimeToolDefinitions(),
         audio: {
           input: {
-            transcription: { model: 'gpt-4o-mini-transcribe', language: 'ja' },
+            transcription: REALTIME_INPUT_TRANSCRIPTION,
           },
           output: { voice: 'marin' },
         },
